@@ -1,0 +1,27 @@
+{
+  "name": "US Stocks",
+  "region": "US",
+  "asset_type": "stock",
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL",
+    "META",
+    "TSLA",
+    "AVGO",
+    "JPM",
+    "V",
+    "MA",
+    "LLY",
+    "WMT",
+    "COST",
+    "NFLX",
+    "AMD",
+    "ORCL",
+    "CRM",
+    "ADBE",
+    "QCOM"
+  ]
+}

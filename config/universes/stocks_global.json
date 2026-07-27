@@ -1,0 +1,27 @@
+{
+  "name": "Global Stocks",
+  "region": "GLOBAL",
+  "asset_type": "stock",
+  "tickers": [
+    "SAP.DE",
+    "SIE.DE",
+    "ALV.DE",
+    "ASML.AS",
+    "MC.PA",
+    "SU.PA",
+    "NESN.SW",
+    "NOVO-B.CO",
+    "AZN.L",
+    "SHEL.L",
+    "TM",
+    "SONY",
+    "TSM",
+    "HMC",
+    "BABA",
+    "SHOP",
+    "RY",
+    "TD",
+    "BHP",
+    "CBA.AX"
+  ]
+}
