@@ -1,19 +1,22 @@
 """Entry point for AI-Stock-Radar."""
 
-from src.data.download_stock import download_stock_data, save_stock_data
+from config.watchlist import WATCHLIST
+from src.data.download_stock import download_and_save
 
 
 def main() -> None:
-    """Download one year of AAPL data, save it, and preview the result."""
-    ticker = "AAPL"
+    """Download one year of daily data for every symbol in the watchlist."""
     period = "1y"
+    total = len(WATCHLIST)
 
-    data = download_stock_data(ticker, period=period)
-    output_path = save_stock_data(data, ticker)
-    print(f"Saved {ticker} data to {output_path}")
+    print(f"Downloading {total} symbols ({period} daily data)...\n")
 
-    print(f"\nFirst 5 rows of {ticker} ({period}):")
-    print(data.head())
+    for index, ticker in enumerate(WATCHLIST, start=1):
+        print(f"[{index}/{total}] Downloading {ticker}...")
+        output_path = download_and_save(ticker, period=period)
+        print(f"  Saved to {output_path}\n")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
