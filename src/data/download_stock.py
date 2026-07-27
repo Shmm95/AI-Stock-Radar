@@ -20,9 +20,19 @@ def ensure_raw_data_dir() -> Path:
 
 def download_stock_data(ticker: str, period: str = "1y") -> pd.DataFrame:
     """Fetch daily OHLCV history for a ticker over the given period."""
-    data = yf.download(ticker, period=period, interval="1d", progress=False)
+    data = yf.download(
+        ticker,
+        period=period,
+        interval="1d",
+        progress=False,
+    )
+
     if data.empty:
         raise ValueError(f"No data returned for ticker '{ticker}'.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
     return data
 
 
