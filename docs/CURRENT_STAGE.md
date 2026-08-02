@@ -1,10 +1,21 @@
 # Current Stage
 
 - Current stage: **Portfolio Trade Timing Attribution V1**.
-- Current stated sub-stage: **Entry Statistics**.
+- Completed sub-stage: **Entry Statistics**.
+- Current sub-stage: **Forward Return Statistics**.
+- Following planned sub-stage: **MFE / MAE and holding-path attribution**.
 
-The repository already contains entry-state, slot-opportunity, and entry-score code and generated research artifacts. These must be treated as existing research artifacts only. They do not independently define the current task, authorize implementation, or permit the approved pathway to be reordered.
+Entry Statistics V1 is complete as observational research. Its official source
+is Entry Statistics stamp `20260802_103007`, derived from Trade Timing
+Attribution stamp `20260802_085312`, source stop-walk-forward stamp
+`20260802_081449`, and frozen snapshot `20260802_081049_d93145cb1dcf`. The
+population was 256 completed `FIXED_BASELINE` trades across 13 independently
+reset out-of-sample windows.
 
-The exact Entry Statistics specification and its acceptance criteria will be supplied separately.
+Existing entry-state, slot-opportunity, entry-score, and Entry Statistics
+artifacts are research artifacts. They are not authority to reorder the
+approved pathway or to change the active baseline.
 
-Do not implement Entry Statistics until that specification is provided and explicit implementation approval is granted.
+The exact Forward Return Statistics specification and acceptance criteria must
+be supplied and approved separately. Do not implement Forward Return Statistics
+until that approval is given.
