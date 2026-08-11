@@ -22,9 +22,11 @@ from src.backtest.run_portfolio_execution_slippage_stress import (
     ExecutionStressProfile,
     _STRICT_SOURCE_AUTHORIZATION,
     _derive_holding_path_datasets,
+    _derive_path_rows,
     _derived_exit_semantic,
     _derived_extreme_order,
     _derived_holding_bucket,
+    _path_rows_for_trade,
     build_primary_gates,
     build_quality_screen,
     build_replay_checks,
@@ -35,6 +37,7 @@ from src.backtest.run_portfolio_execution_slippage_stress import (
     run_execution_slippage_stress,
     save_execution_slippage_stress,
 )
+from src.backtest.run_research_data_snapshot import load_snapshot
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -468,27 +471,31 @@ def test_official_source_integration_verifies_full_lineage_without_running_grid(
     assert len(baseline.loc[baseline["model"] == "FIXED_BASELINE"]) == 13
     assert source["snapshot"]["manifest"]["snapshot_id"] == APPROVED_SNAPSHOT_ID
     # The repointing's core promise: mfe_mae's real 256-trade population,
-    # loaded and hash-verified, with the 12 non-file-backed holding-path
-    # datasets (11 tables + screen) derived in memory, and exactly
-    # `path_rows` flagged as the one remaining, honestly-unimplemented key.
+    # loaded and hash-verified, with the 13 non-file-backed holding-path
+    # datasets (12 tables + screen) derived -- 12 in memory from mfe_mae's
+    # own data, and `path_rows` reconstructed from the independently
+    # loaded snapshot -- and NOTHING left flagged as unimplemented.
     assert len(source["holding_path_trades"]) == 256
-    assert source["holding_path_not_implemented"] == ["path_rows"]
+    assert source["holding_path_not_implemented"] == []
     assert source["holding_path_summary"] == {"strategy_change_authorized": False}
     datasets = source["holding_path_derived_datasets"]
     assert set(datasets) == {
         "asset_classes", "exit_categories", "exit_reasons", "exit_semantics",
         "extreme_orders", "force_close_excluded", "holding_buckets", "outcomes",
-        "overall", "screen", "tickers", "windows",
+        "overall", "path_rows", "screen", "tickers", "windows",
     }
+    path_rows = datasets["path_rows"]
+    assert not path_rows.empty
+    expected_path_rows = int((source["holding_path_trades"]["holding_period_ticker_bars"] + 1).sum())
+    assert len(path_rows) == expected_path_rows
     screen = datasets["screen"]
     implemented = screen.loc[screen["status"] == "IMPLEMENTED"]
-    assert len(implemented) == 8
+    assert len(implemented) == 10
     assert bool(implemented["passed"].all()) is True
-    not_implemented = screen.loc[screen["status"] == "NOT_IMPLEMENTED"]
-    assert set(not_implemented["check"]) == {"path_row_reconciliation", "open_exit_hlc_excluded"}
-    assert bool(not_implemented["passed"].any()) is False, "must never fake a pass for a skipped check"
+    assert set(implemented["check"]).issuperset({"path_row_reconciliation", "open_exit_hlc_excluded"})
     not_applicable = screen.loc[screen["status"] == "NOT_APPLICABLE"]
     assert set(not_applicable["check"]) == {"mfe_bounds_ordered", "mae_bounds_ordered"}
+    assert len(screen) == 12, "12 total checks: 10 implemented + 2 structurally not applicable"
 
 
 # --- Real-data tests for the holding-path derivation layer -----------------
@@ -496,10 +503,14 @@ def test_official_source_integration_verifies_full_lineage_without_running_grid(
 # fixtures) whenever the reference copy is present, per the task's explicit
 # ask for deterministic verification against real mfe_mae data.
 
-_REAL_MFE_MAE_DATA_AVAILABLE = REAL_MFE_MAE_TRADES_PATH.exists() and REAL_MFE_MAE_STATISTICS_PATH.exists()
+_REAL_MFE_MAE_DATA_AVAILABLE = (
+    REAL_MFE_MAE_TRADES_PATH.exists()
+    and REAL_MFE_MAE_STATISTICS_PATH.exists()
+    and SNAPSHOT_PATH.exists()
+)
 _real_mfe_mae_data_required = pytest.mark.skipif(
     not _REAL_MFE_MAE_DATA_AVAILABLE,
-    reason="Real mfe_mae holding-path trades/statistics CSVs are not installed.",
+    reason="Real mfe_mae holding-path trades/statistics CSVs or the snapshot are not installed.",
 )
 
 
@@ -514,12 +525,19 @@ def real_mfe_mae_statistics() -> pd.DataFrame:
 
 
 @pytest.fixture(scope="module")
-def real_holding_path_datasets(real_mfe_mae_trades, real_mfe_mae_statistics) -> dict:
+def real_snapshot() -> dict:
+    return load_snapshot(SNAPSHOT_PATH, verify_code=True, project_root=PROJECT_ROOT)
+
+
+@pytest.fixture(scope="module")
+def real_holding_path_datasets(real_mfe_mae_trades, real_mfe_mae_statistics, real_snapshot) -> dict:
     return _derive_holding_path_datasets(
         mfe_mae_trades=real_mfe_mae_trades,
         mfe_mae_statistics=real_mfe_mae_statistics,
         stamp=APPROVED_MFE_MAE_HOLDING_PATH_STAMP,
         official_source=True,
+        data_by_ticker=real_snapshot["data_by_ticker"],
+        windows=real_snapshot["windows"],
     )
 
 
@@ -559,6 +577,231 @@ def test_derived_extreme_order_orders_by_offset_and_handles_missing():
     assert _derived_extreme_order(float("nan"), 3) is None
 
 
+# --- Synthetic unit tests for path_rows bar-slicing (no real data needed) --
+
+def _bars(rows: dict[str, tuple[float, float, float, float]]) -> pd.DataFrame:
+    """rows: {iso_timestamp: (open, high, low, close)}, in the given order."""
+    index = pd.DatetimeIndex([pd.Timestamp(key) for key in rows])
+    values = list(rows.values())
+    return pd.DataFrame(
+        {
+            "Open": [v[0] for v in values],
+            "High": [v[1] for v in values],
+            "Low": [v[2] for v in values],
+            "Close": [v[3] for v in values],
+        },
+        index=index,
+    )
+
+
+def _trade(
+    *,
+    trade_id: str = "T1",
+    entry_timestamp: str,
+    exit_timestamp: str,
+    exit_reason: str,
+    exit_semantic: str,
+    holding_period_ticker_bars: int,
+    ticker: str = "AAPL",
+    window_id: str = "W1",
+) -> dict:
+    return {
+        "trade_id": trade_id,
+        "entry_timestamp": entry_timestamp,
+        "exit_timestamp": exit_timestamp,
+        "exit_reason": exit_reason,
+        "exit_semantic": exit_semantic,
+        "holding_period_ticker_bars": holding_period_ticker_bars,
+        "ticker": ticker,
+        "window_id": window_id,
+    }
+
+
+def test_path_rows_single_bar_stop_loss_trade_excludes_its_only_bar_hlc():
+    """A stop touched on the SAME bar as entry (holding_period_ticker_bars=0):
+    exactly one row, flagged as both entry and exit, and -- because the
+    engine cannot know whether High or Low came first relative to the
+    stop touch -- high_low_close_included must be False even though it's
+    also the entry bar."""
+    window_data = _bars({"2026-01-05": (100.0, 105.0, 94.0, 96.0)})
+    trade = _trade(
+        entry_timestamp="2026-01-05", exit_timestamp="2026-01-05",
+        exit_reason="STOP_LOSS", exit_semantic="INTRABAR_STOP_BOUNDED",
+        holding_period_ticker_bars=0,
+    )
+
+    rows = _path_rows_for_trade(trade, window_data=window_data, stamp="S1")
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["bar_role"] == "ENTRY_EXIT_BAR"
+    assert row["is_entry_bar"] is True
+    assert row["is_effective_exit_bar"] is True
+    assert row["high_low_close_included"] is False
+    assert row["open_included"] is True
+    assert row["intrabar_order_uncertain"] is True
+    assert row["raw_open"] == 100.0 and row["raw_high"] == 105.0
+
+
+def test_path_rows_force_close_includes_full_exit_bar_hlc():
+    """FORCE_CLOSE_END: the exit price IS that bar's own Close -- no
+    post-exit price action to hide, so the exit bar's High/Low/Close
+    must be fully included, unlike every other exit type."""
+    window_data = _bars(
+        {
+            "2026-01-05": (100.0, 102.0, 99.0, 101.0),
+            "2026-01-06": (101.0, 103.0, 100.0, 102.0),
+            "2026-01-07": (102.0, 104.0, 101.0, 103.0),
+        }
+    )
+    trade = _trade(
+        entry_timestamp="2026-01-05", exit_timestamp="2026-01-07",
+        exit_reason="FORCE_CLOSE_END", exit_semantic="CLOSE_EXIT",
+        holding_period_ticker_bars=2,
+    )
+
+    rows = _path_rows_for_trade(trade, window_data=window_data, stamp="S1")
+
+    assert len(rows) == 3
+    assert [r["bar_role"] for r in rows] == ["ENTRY_BAR", "HOLDING_BAR", "EXIT_BAR"]
+    assert [r["high_low_close_included"] for r in rows] == [True, True, True]
+    assert rows[-1]["is_effective_exit_bar"] is True
+    assert rows[-1]["raw_close"] == 103.0
+
+
+def test_path_rows_open_exit_gap_scenario_excludes_exit_bar_hlc():
+    """GAP_STOP_LOSS / EXIT_SIGNAL_NEXT_OPEN (OPEN_EXIT): the fill is the
+    exit bar's Open; that bar's High/Low/Close happen AFTER the position
+    was already closed and must never be treated as observed."""
+    window_data = _bars(
+        {
+            "2026-01-05": (100.0, 101.0, 99.0, 100.5),
+            "2026-01-06": (90.0, 92.0, 85.0, 87.0),  # the gap-down exit bar
+        }
+    )
+    trade = _trade(
+        entry_timestamp="2026-01-05", exit_timestamp="2026-01-06",
+        exit_reason="GAP_STOP_LOSS", exit_semantic="OPEN_EXIT",
+        holding_period_ticker_bars=1,
+    )
+
+    rows = _path_rows_for_trade(trade, window_data=window_data, stamp="S1")
+
+    assert len(rows) == 2
+    entry_row, exit_row = rows
+    assert entry_row["high_low_close_included"] is True
+    assert exit_row["bar_role"] == "EXIT_BAR"
+    assert exit_row["high_low_close_included"] is False
+    assert exit_row["open_included"] is True
+    assert exit_row["raw_open"] == 90.0
+    assert exit_row["intrabar_order_uncertain"] is False
+
+
+def test_path_rows_reconciliation_mismatch_raises():
+    window_data = _bars(
+        {
+            "2026-01-05": (100.0, 101.0, 99.0, 100.5),
+            "2026-01-06": (90.0, 92.0, 85.0, 87.0),
+        }
+    )
+    trade = _trade(
+        entry_timestamp="2026-01-05", exit_timestamp="2026-01-06",
+        exit_reason="GAP_STOP_LOSS", exit_semantic="OPEN_EXIT",
+        holding_period_ticker_bars=5,  # wrong -- actual is 1
+    )
+    with pytest.raises(ValueError, match="path_rows reconciliation failed"):
+        _path_rows_for_trade(trade, window_data=window_data, stamp="S1")
+
+
+def test_path_rows_never_reads_bars_after_the_trades_own_exit():
+    """Look-ahead check: window_data extends 20 bars past this trade's
+    exit. Not only must no returned row's timestamp exceed the exit --
+    corrupting every post-exit bar to an extreme sentinel value must not
+    change the output at all, proving those values are never read."""
+    rows_dict = {
+        "2026-01-05": (100.0, 101.0, 99.0, 100.5),
+        "2026-01-06": (101.0, 103.0, 100.0, 102.0),
+        "2026-01-07": (90.0, 92.0, 85.0, 87.0),  # gap-down exit bar
+    }
+    for offset in range(20):
+        timestamp = pd.Timestamp("2026-01-08") + pd.Timedelta(days=offset)
+        rows_dict[timestamp.date().isoformat()] = (50.0, 55.0, 45.0, 48.0)
+    window_data = _bars(rows_dict)
+    trade = _trade(
+        entry_timestamp="2026-01-05", exit_timestamp="2026-01-07",
+        exit_reason="GAP_STOP_LOSS", exit_semantic="OPEN_EXIT",
+        holding_period_ticker_bars=2,
+    )
+
+    baseline = _path_rows_for_trade(trade, window_data=window_data, stamp="S1")
+    assert len(baseline) == 3
+    exit_timestamp = pd.Timestamp("2026-01-07")
+    assert all(row["ticker_timestamp"] <= exit_timestamp for row in baseline)
+
+    corrupted = window_data.copy(deep=True)
+    future_mask = corrupted.index > exit_timestamp
+    assert future_mask.sum() == 20
+    corrupted.loc[future_mask, ["Open", "High", "Low", "Close"]] = 999_999.0
+
+    replayed = _path_rows_for_trade(trade, window_data=corrupted, stamp="S1")
+    assert replayed == baseline, "corrupting post-exit bars must never change the result"
+
+
+def test_derive_path_rows_slices_each_trade_to_its_own_window():
+    """_derive_path_rows must bound each trade's market data to its OWN
+    window ([test_start, test_end_exclusive)) before slicing to
+    entry/exit -- proven here by two windows on the same ticker whose
+    bars would otherwise overlap and by asserting cross-window bars
+    never leak into either trade's path_rows."""
+    aapl = _bars(
+        {
+            "2026-01-05": (100.0, 101.0, 99.0, 100.5),
+            "2026-01-06": (100.5, 102.0, 99.5, 101.0),
+            "2026-02-10": (200.0, 201.0, 199.0, 200.5),
+            "2026-02-11": (200.5, 203.0, 199.5, 202.0),
+        }
+    )
+    trades = pd.DataFrame(
+        [
+            _trade(
+                trade_id="T1", ticker="AAPL", window_id="W1",
+                entry_timestamp="2026-01-05", exit_timestamp="2026-01-06",
+                exit_reason="FORCE_CLOSE_END", exit_semantic="CLOSE_EXIT",
+                holding_period_ticker_bars=1,
+            ),
+            _trade(
+                trade_id="T2", ticker="AAPL", window_id="W2",
+                entry_timestamp="2026-02-10", exit_timestamp="2026-02-11",
+                exit_reason="FORCE_CLOSE_END", exit_semantic="CLOSE_EXIT",
+                holding_period_ticker_bars=1,
+            ),
+        ]
+    )
+    windows = pd.DataFrame(
+        [
+            {
+                "window_id": "W1", "train_start": "2025-01-01", "train_end_exclusive": "2026-01-05",
+                "test_start": "2026-01-05", "test_end_exclusive": "2026-01-20",
+            },
+            {
+                "window_id": "W2", "train_start": "2025-02-01", "train_end_exclusive": "2026-02-10",
+                "test_start": "2026-02-10", "test_end_exclusive": "2026-02-20",
+            },
+        ]
+    )
+
+    path_rows = _derive_path_rows(
+        trades, data_by_ticker={"AAPL": aapl}, windows=windows, stamp="S1"
+    )
+
+    assert set(path_rows["trade_id"]) == {"T1", "T2"}
+    t1_timestamps = set(path_rows.loc[path_rows["trade_id"] == "T1", "ticker_timestamp"])
+    t2_timestamps = set(path_rows.loc[path_rows["trade_id"] == "T2", "ticker_timestamp"])
+    assert t1_timestamps == {pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-06")}
+    assert t2_timestamps == {pd.Timestamp("2026-02-10"), pd.Timestamp("2026-02-11")}
+    assert t1_timestamps.isdisjoint(t2_timestamps)
+
+
 @_real_mfe_mae_data_required
 def test_real_mfe_mae_trades_have_the_official_256_trade_population(real_mfe_mae_trades):
     assert len(real_mfe_mae_trades) == 256
@@ -566,21 +809,59 @@ def test_real_mfe_mae_trades_have_the_official_256_trade_population(real_mfe_mae
 
 
 @_real_mfe_mae_data_required
-def test_real_derived_screen_is_eight_implemented_two_not_implemented_two_not_applicable(
+def test_real_derived_screen_is_ten_implemented_two_not_applicable(
     real_holding_path_datasets,
 ):
     screen = real_holding_path_datasets["screen"]
     assert len(screen) == 12
     implemented = screen.loc[screen["status"] == "IMPLEMENTED"]
-    assert len(implemented) == 8
+    assert len(implemented) == 10
     assert bool(implemented["passed"].all()) is True
-    assert set(screen.loc[screen["status"] == "NOT_IMPLEMENTED", "check"]) == {
-        "path_row_reconciliation", "open_exit_hlc_excluded",
-    }
-    assert bool(screen.loc[screen["status"] == "NOT_IMPLEMENTED", "passed"].any()) is False
+    assert set(implemented["check"]).issuperset(
+        {"path_row_reconciliation", "open_exit_hlc_excluded"}
+    )
+    assert (screen["status"] == "NOT_IMPLEMENTED").sum() == 0
     assert set(screen.loc[screen["status"] == "NOT_APPLICABLE", "check"]) == {
         "mfe_bounds_ordered", "mae_bounds_ordered",
     }
+
+
+@_real_mfe_mae_data_required
+def test_real_path_rows_reconciles_against_mfe_maes_own_holding_period(
+    real_mfe_mae_trades, real_holding_path_datasets,
+):
+    path_rows = real_holding_path_datasets["path_rows"]
+    expected = int((real_mfe_mae_trades["holding_period_ticker_bars"] + 1).sum())
+    assert len(path_rows) == expected
+    assert set(path_rows["trade_id"]) == set(real_mfe_mae_trades["trade_id"])
+    # Every trade has exactly one entry bar and one effective-exit bar.
+    per_trade = path_rows.groupby("trade_id")
+    assert (per_trade["is_entry_bar"].sum() == 1).all()
+    assert (per_trade["is_effective_exit_bar"].sum() == 1).all()
+
+
+@_real_mfe_mae_data_required
+def test_real_open_exit_bars_never_carry_high_low_close_in_path_rows(
+    real_holding_path_datasets,
+):
+    path_rows = real_holding_path_datasets["path_rows"]
+    open_exit_exit_bars = path_rows.loc[
+        path_rows["is_effective_exit_bar"] & (path_rows["exit_semantic"] == "OPEN_EXIT")
+    ]
+    assert not open_exit_exit_bars.empty
+    assert bool(open_exit_exit_bars["high_low_close_included"].eq(False).all())
+
+
+@_real_mfe_mae_data_required
+def test_real_close_exit_bars_do_include_high_low_close_in_path_rows(
+    real_holding_path_datasets,
+):
+    path_rows = real_holding_path_datasets["path_rows"]
+    close_exit_exit_bars = path_rows.loc[
+        path_rows["is_effective_exit_bar"] & (path_rows["exit_semantic"] == "CLOSE_EXIT")
+    ]
+    assert not close_exit_exit_bars.empty
+    assert bool(close_exit_exit_bars["high_low_close_included"].eq(True).all())
 
 
 @_real_mfe_mae_data_required
@@ -653,4 +934,4 @@ def test_real_force_close_excluded_matches_sensitivity_population_size(
 @_real_mfe_mae_data_required
 def test_repointed_provenance_result_keys_match_mfe_maes_real_three_files():
     assert EXPECTED_MFE_MAE_RESULT_KEYS == {"json", "statistics", "trades"}
-    assert NOT_IMPLEMENTED_HOLDING_KEYS == frozenset({"path_rows"})
+    assert NOT_IMPLEMENTED_HOLDING_KEYS == frozenset()

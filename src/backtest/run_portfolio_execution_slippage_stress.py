@@ -86,11 +86,14 @@ _STRICT_SOURCE_AUTHORIZATION = object()
 
 # The full 15-key holding-path-equivalent taxonomy this module targets.
 # Of these: {json, trades} are real mfe_mae files, hash-verified on
-# disk. The remaining 12 are NOT separate mfe_mae files -- they are
+# disk. The remaining 13 are NOT separate mfe_mae files -- they are
 # derived in-memory by this module from mfe_mae's verified trades/
-# statistics (see _derive_holding_path_datasets), except path_rows,
-# which is NOT_IMPLEMENTED this turn (see NOT_IMPLEMENTED_HOLDING_KEYS
-# and the module report).
+# statistics (see _derive_holding_path_datasets). `path_rows` is
+# reconstructed from an independently-loaded snapshot (see
+# _derive_path_rows) rather than filtered from mfe_mae's statistics.csv,
+# since mfe_mae's own docstring states "No full per-bar path table is
+# produced in V1." See NOT_IMPLEMENTED_HOLDING_KEYS and the module
+# report for why this is now empty.
 EXPECTED_HOLDING_RESULT_KEYS = {
     "asset_classes",
     "exit_categories",
@@ -113,12 +116,15 @@ EXPECTED_HOLDING_RESULT_KEYS = {
 # EXPECTED_HOLDING_RESULT_KEYS, is what verify_provenance_result_files
 # is checked against now.
 EXPECTED_MFE_MAE_RESULT_KEYS = {"json", "statistics", "trades"}
-# Genuinely not implemented this turn: mfe_mae's own docstring states
-# "No full per-bar path table is produced in V1." Reconstructing one
-# would require a fresh per-bar walk over the snapshot market data,
-# which is out of this repointing's scope. Never fabricated or
-# approximated -- see the report for what the next turn needs.
-NOT_IMPLEMENTED_HOLDING_KEYS = frozenset({"path_rows"})
+# mfe_mae's own docstring states "No full per-bar path table is produced
+# in V1." path_rows is therefore reconstructed here (see
+# _derive_path_rows) by an independent per-bar walk over the same
+# snapshot market data mfe_mae itself consumed -- reusing the frozen
+# original file's (never committed, so never importable)
+# entry-through-effective-exit slicing rule, not a fresh invention.
+# Kept as an explicit, empty frozenset (rather than deleted) so a
+# future genuine gap has an obvious place to be declared again.
+NOT_IMPLEMENTED_HOLDING_KEYS: frozenset[str] = frozenset()
 EXPECTED_STOP_RESULT_KEYS = {
     "aggregate",
     "equity",
@@ -740,7 +746,10 @@ def _verify_declared_files(records: Any, *, label: str) -> dict[str, Path]:
 # functions lifted from the original file (never committed, so never
 # importable) and mfe_mae's own build_statistics_table where the grouping
 # already exists in mfe_mae's statistics.csv. `path_rows` is the one
-# genuinely NOT_IMPLEMENTED gap -- see NOT_IMPLEMENTED_HOLDING_KEYS above.
+# exception that is NOT filtered from mfe_mae's statistics -- it is
+# reconstructed from an independently-loaded snapshot by _derive_path_rows,
+# reusing the original file's entry-through-effective-exit slicing rule
+# (see NOT_IMPLEMENTED_HOLDING_KEYS above for why that gap is now empty).
 
 _OPEN_EXIT = "OPEN_EXIT"
 _INTRABAR_STOP_BOUNDED = "INTRABAR_STOP_BOUNDED"
@@ -860,16 +869,185 @@ def _grouped_both_populations(
     return pd.concat(frames, ignore_index=True)
 
 
-def _derive_holding_path_screen(
-    trades: pd.DataFrame, *, stamp: str, official_source: bool
+_PATH_ROW_COLUMNS = (
+    "mfe_mae_holding_path_stamp",
+    "trade_id",
+    "window_id",
+    "ticker",
+    "exit_reason",
+    "exit_semantic",
+    "ticker_bar_offset",
+    "ticker_timestamp",
+    "bar_role",
+    "raw_open",
+    "raw_high",
+    "raw_low",
+    "raw_close",
+    "open_included",
+    "high_low_close_included",
+    "is_entry_bar",
+    "is_effective_exit_bar",
+    "intrabar_order_uncertain",
+)
+
+
+def _path_rows_for_trade(
+    trade: Mapping[str, Any], *, window_data: pd.DataFrame, stamp: str
+) -> list[dict[str, Any]]:
+    """One row per ticker bar from entry through the trade's own effective
+    exit -- reimplementation of the never-committed original file's
+    `holding_path_for_trade` per-bar loop (entry-through-exit slicing and
+    `high_low_close_included`/`is_effective_exit_bar` semantics), applied
+    to mfe_mae's trades and an independently-loaded snapshot instead of
+    the original's now-superseded censored/possible dual-bound fields
+    (dropped here -- see _derive_holding_path_screen's NOT_APPLICABLE
+    mfe_bounds_ordered/mae_bounds_ordered for why that design does not
+    carry over to mfe_mae).
+
+    Look-ahead boundary: `window_data` is already pre-sliced to this
+    trade's own OOS test window by the caller (`_derive_path_rows`); this
+    function further slices to `[entry_position, exit_position]` (or
+    `exit_position + 1` for FORCE_CLOSE_END -- see below), so no bar
+    after the trade's own effective exit is ever read, let alone
+    returned. Verified directly in
+    tests/test_portfolio_execution_slippage_stress.py by corrupting
+    post-exit bars and asserting the output is unchanged.
+    """
+    trade_id = str(trade["trade_id"])
+    entry_timestamp = pd.Timestamp(trade["entry_timestamp"])
+    source_exit_timestamp = pd.Timestamp(trade["exit_timestamp"])
+    if int((window_data.index == entry_timestamp).sum()) != 1:
+        raise ValueError(f"Expected exactly one entry bar for trade {trade_id}.")
+    entry_position = int(window_data.index.get_loc(entry_timestamp))
+    semantic = str(trade["exit_semantic"])
+
+    if semantic == _CLOSE_EXIT:
+        # FORCE_CLOSE_END: the exit price IS that bar's own Close, so
+        # there is no post-exit price action to leak -- the full bar is
+        # safe to include (mirrors the original's `data.index <= effective_exit`
+        # and mfe_mae's own `iloc[entry_position : exit_position + 1]`).
+        eligible = window_data.index[window_data.index <= source_exit_timestamp]
+        if len(eligible) == 0:
+            raise ValueError(f"No local force-close row for trade {trade_id}.")
+        effective_exit_timestamp = pd.Timestamp(eligible[-1])
+    else:
+        if int((window_data.index == source_exit_timestamp).sum()) != 1:
+            raise ValueError(f"Expected exactly one local exit row for trade {trade_id}.")
+        effective_exit_timestamp = source_exit_timestamp
+    exit_position = int(window_data.index.get_loc(effective_exit_timestamp))
+    if exit_position < entry_position:
+        raise ValueError(f"Exit precedes entry for trade {trade_id}.")
+
+    path = window_data.iloc[entry_position : exit_position + 1]
+    elapsed = int(trade["holding_period_ticker_bars"])
+    if elapsed != len(path) - 1:
+        raise ValueError(
+            f"path_rows reconciliation failed for trade {trade_id}: "
+            f"holding_period_ticker_bars={elapsed}, reconstructed={len(path) - 1}."
+        )
+
+    rows: list[dict[str, Any]] = []
+    for offset, (bar_timestamp, row) in enumerate(path.iterrows()):
+        is_entry = offset == 0
+        is_exit = offset == len(path) - 1
+        # OPEN_EXIT/INTRABAR_STOP_BOUNDED: the exit bar's High/Low/Close
+        # reflect price action AFTER the position was already closed
+        # (an Open-price exit, or a stop touched somewhere intrabar) --
+        # using them would leak look-ahead into an MFE/MAE-style
+        # calculation. CLOSE_EXIT's exit bar has no such gap (see above).
+        include_full = (not is_exit) or (semantic == _CLOSE_EXIT)
+        bar_role = (
+            "ENTRY_EXIT_BAR" if is_entry and is_exit
+            else "ENTRY_BAR" if is_entry
+            else "EXIT_BAR" if is_exit
+            else "HOLDING_BAR"
+        )
+        rows.append(
+            {
+                "mfe_mae_holding_path_stamp": stamp,
+                "trade_id": trade_id,
+                "window_id": trade["window_id"],
+                "ticker": trade["ticker"],
+                "exit_reason": trade["exit_reason"],
+                "exit_semantic": semantic,
+                "ticker_bar_offset": offset,
+                "ticker_timestamp": pd.Timestamp(bar_timestamp),
+                "bar_role": bar_role,
+                "raw_open": float(row["Open"]),
+                "raw_high": float(row["High"]),
+                "raw_low": float(row["Low"]),
+                "raw_close": float(row["Close"]),
+                "open_included": True,
+                "high_low_close_included": include_full,
+                "is_entry_bar": is_entry,
+                "is_effective_exit_bar": is_exit,
+                "intrabar_order_uncertain": bool(is_exit and semantic == _INTRABAR_STOP_BOUNDED),
+            }
+        )
+    return rows
+
+
+def _derive_path_rows(
+    trades: pd.DataFrame,
+    *,
+    data_by_ticker: Mapping[str, pd.DataFrame],
+    windows: pd.DataFrame,
+    stamp: str,
 ) -> pd.DataFrame:
-    """8 (or 9, if `official_source`) of the original's checks, honestly
-    derivable from mfe_mae's own verified data; 2 genuinely NOT_IMPLEMENTED
-    (need path_rows); 2 structurally NOT_APPLICABLE (mfe_mae has a single
-    MFE/MAE estimate per trade, not the original's censored/possible
-    dual-bound design, so there is no second bound to order-check against).
-    Every row's `passed` reflects reality -- NOT_IMPLEMENTED/NOT_APPLICABLE
-    rows are never marked as having passed a check that was never run.
+    """Build path_rows for every trade from an independently-loaded snapshot.
+
+    `trades` must already carry the derived `exit_semantic` column (see
+    `_with_derived_columns`). Each trade's market data is first bounded to
+    its own OOS test window (mirrors mfe_mae's own `enrich_holding_paths`
+    window-slicing), then further bounded to `[entry, effective_exit]` by
+    `_path_rows_for_trade` -- never mfe_mae's own computed path/statistics,
+    so this is a genuinely independent reconstruction, not a filter of
+    already-derived numbers.
+
+    Deliberately does not reuse `_window_records` here: that helper also
+    enforces the official EXPECTED_WINDOW_COUNT (13), a grid-level
+    invariant unrelated to path-row reconstruction, which this function
+    must equally support in tests against a smaller synthetic window set.
+    """
+    required_window_columns = {"window_id", "test_start", "test_end_exclusive"}
+    missing = required_window_columns.difference(windows.columns)
+    if missing:
+        raise ValueError(f"Snapshot windows missing columns: {sorted(missing)}")
+    window_by_id = {
+        str(record["window_id"]): (
+            pd.Timestamp(record["test_start"]), pd.Timestamp(record["test_end_exclusive"])
+        )
+        for record in windows.to_dict("records")
+    }
+    normalized_data = {str(ticker).strip().upper(): frame for ticker, frame in data_by_ticker.items()}
+    rows: list[dict[str, Any]] = []
+    for trade in trades.to_dict("records"):
+        ticker = str(trade["ticker"]).strip().upper()
+        window_id = str(trade["window_id"])
+        if ticker not in normalized_data:
+            raise ValueError(f"Snapshot missing trade ticker: {ticker}")
+        if window_id not in window_by_id:
+            raise ValueError(f"Snapshot missing trade window: {window_id}")
+        start, end = window_by_id[window_id]
+        market = normalized_data[ticker]
+        window_data = market.loc[(market.index >= start) & (market.index < end)]
+        if window_data.empty:
+            raise ValueError(f"No snapshot rows for {window_id}/{ticker}.")
+        rows.extend(_path_rows_for_trade(trade, window_data=window_data, stamp=stamp))
+    return pd.DataFrame(rows, columns=_PATH_ROW_COLUMNS)
+
+
+def _derive_holding_path_screen(
+    trades: pd.DataFrame, *, stamp: str, official_source: bool, path_rows: pd.DataFrame
+) -> pd.DataFrame:
+    """10 (or 11, if `official_source`) of the original's checks, honestly
+    derivable from mfe_mae's own verified data plus the independently
+    reconstructed `path_rows`; 2 structurally NOT_APPLICABLE (mfe_mae has
+    a single MFE/MAE estimate per trade, not the original's
+    censored/possible dual-bound design, so there is no second bound to
+    order-check against). Every row's `passed` reflects reality --
+    NOT_APPLICABLE rows are never marked as having passed a check that
+    was never run.
     """
     reason_counts = trades["exit_reason"].value_counts().to_dict()
     checks: list[tuple[str, bool, Any, Any, str, str]] = [
@@ -934,14 +1112,30 @@ def _derive_holding_path_screen(
                 "Official population reason reconciliation.", "IMPLEMENTED",
             )
         )
-    for name in ("path_row_reconciliation", "open_exit_hlc_excluded"):
-        checks.append(
-            (
-                name, False, "requires path_rows", "path_rows is NOT_IMPLEMENTED this turn",
-                "Depends on a per-bar path_rows table this repointing does not produce.",
-                "NOT_IMPLEMENTED",
-            )
+    expected_path_row_count = int((trades["holding_period_ticker_bars"] + 1).sum())
+    actual_path_row_count = len(path_rows)
+    open_exit_rows = path_rows.loc[
+        path_rows["is_effective_exit_bar"] & (path_rows["exit_semantic"] == _OPEN_EXIT)
+    ]
+    open_exit_hlc_excluded_passed = bool(open_exit_rows["high_low_close_included"].eq(False).all())
+    checks.append(
+        (
+            "path_row_reconciliation", expected_path_row_count == actual_path_row_count,
+            expected_path_row_count, actual_path_row_count,
+            "Every trade's (holding_period_ticker_bars + 1) entry-through-exit "
+            "bars has exactly one path_rows row (mirrors the original's "
+            "path_ticker_bar_count-vs-len(paths) reconciliation, using mfe_mae's "
+            "own equivalent field).",
+            "IMPLEMENTED",
         )
+    )
+    checks.append(
+        (
+            "open_exit_hlc_excluded", open_exit_hlc_excluded_passed, True, open_exit_hlc_excluded_passed,
+            "OPEN_EXIT trades' exit bar excludes post-exit High/Low/Close in path_rows.",
+            "IMPLEMENTED",
+        )
+    )
     for name in ("mfe_bounds_ordered", "mae_bounds_ordered"):
         checks.append(
             (
@@ -979,12 +1173,16 @@ def _derive_holding_path_datasets(
     mfe_mae_statistics: pd.DataFrame,
     stamp: str,
     official_source: bool,
+    data_by_ticker: Mapping[str, pd.DataFrame],
+    windows: pd.DataFrame,
 ) -> dict[str, Any]:
-    """Derive the 12 non-file-backed holding-path-equivalent datasets
-    (11 named tables + screen) from mfe_mae's own verified trades/statistics.
-    `path_rows` is deliberately absent -- see NOT_IMPLEMENTED_HOLDING_KEYS.
+    """Derive the 13 non-file-backed holding-path-equivalent datasets
+    (12 named tables + screen) from mfe_mae's own verified trades/statistics,
+    plus `path_rows` reconstructed from an independently-loaded snapshot
+    (`data_by_ticker`/`windows` -- see _derive_path_rows).
     """
     trades = _with_derived_columns(mfe_mae_trades)
+    path_rows = _derive_path_rows(trades, data_by_ticker=data_by_ticker, windows=windows, stamp=stamp)
 
     def _filtered(group_type: str, *, population: str | None = None) -> pd.DataFrame:
         selected = mfe_mae_statistics.loc[mfe_mae_statistics["group_type"] == group_type]
@@ -1019,9 +1217,10 @@ def _derive_holding_path_datasets(
             trades, stamp=stamp, group_type="CENSORED_EXTREME_ORDER",
             group_column="censored_extreme_order", group_values=_EXTREME_ORDER_VALUES,
         ),
+        "path_rows": path_rows,
     }
     datasets["screen"] = _derive_holding_path_screen(
-        trades, stamp=stamp, official_source=official_source
+        trades, stamp=stamp, official_source=official_source, path_rows=path_rows
     )
     return datasets
 
@@ -1040,9 +1239,11 @@ def load_verified_source(
     `holding_path_directory`/`holding_path_stamp` now point at mfe_mae's real
     saved output (repointed; see APPROVED_MFE_MAE_HOLDING_PATH_STAMP). Only
     mfe_mae's own three real files (trades, statistics, json) are hash-
-    verified on disk; the other 11 named holding-path-equivalent datasets are
+    verified on disk; the other 12 named holding-path-equivalent datasets are
     derived in-memory from them (see _derive_holding_path_datasets) --
-    `path_rows` is the one exception, NOT_IMPLEMENTED this turn.
+    `path_rows` is the one exception reconstructed from the independently
+    loaded snapshot's own market data rather than filtered from mfe_mae's
+    statistics.
     """
     if holding_path_stamp != APPROVED_MFE_MAE_HOLDING_PATH_STAMP:
         raise ValueError("Unapproved mfe_mae holding-path stamp.")
@@ -1096,6 +1297,8 @@ def load_verified_source(
         mfe_mae_statistics=holding_statistics,
         stamp=holding_path_stamp,
         official_source=official_source,
+        data_by_ticker=snapshot["data_by_ticker"],
+        windows=snapshot["windows"],
     )
     # strategy_change_authorized is not read from mfe_mae's JSON (it has no
     # such field) -- it is asserted here as a static governance fact about
