@@ -27,7 +27,14 @@ AI_REPORT_PATH = (
 )
 
 
-load_dotenv(ENV_PATH)
+# override=True: python-dotenv's own default (override=False) skips a key
+# already present in os.environ even if it's an empty string -- e.g. a
+# stale env-var declaration inherited from a crontab/systemd/service
+# context. Confirmed as a real bug for this same load_dotenv(ENV_PATH)
+# pattern in src/notify/telegram_notifier.py; applied consistently here
+# for the same latent risk. .env is this project's authoritative
+# credential source, so it must always win over a blank inherited value.
+load_dotenv(ENV_PATH, override=True)
 
 
 RADAR_ANALYST = Agent(
