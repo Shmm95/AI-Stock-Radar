@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "lock_name": "AI_STOCK_RADAR_RESEARCH_BASELINE_V1",
+  "lock_id": "RBL_V1_20260802_192047_D93145CB1DCF",
+  "status": "RESEARCH_REFERENCE_LOCKED",
+  "scope": "CONTROLLED_NINE_ASSET_HISTORICAL_RESEARCH_ONLY",
+  "lineage": {
+    "snapshot_id": "20260802_081049_d93145cb1dcf",
+    "snapshot_fingerprint": "d93145cb1dcf3f837415f5b28ac29eeb51c13bc8ce5b8b1187aa34ebfc01ad44",
+    "stop_walk_forward_stamp": "20260802_081449",
+    "trade_timing_attribution_stamp": "20260802_085312",
+    "entry_statistics_stamp": "20260802_103007",
+    "forward_return_statistics_stamp": "20260802_134341",
+    "holding_path_attribution_stamp": "20260802_155749",
+    "execution_slippage_stress_stamp": "20260802_192047"
+  },
+  "controlled_tickers": [
+    "AAPL",
+    "AMZN",
+    "BTC-USD",
+    "ETH-USD",
+    "GOOGL",
+    "META",
+    "MSFT",
+    "NVDA",
+    "TSLA"
+  ],
+  "baseline_config": {
+    "allow_fractional_crypto": true,
+    "allow_fractional_stocks": false,
+    "commission_rate": 0.0005,
+    "crypto_stop_loss_percent": 5.0,
+    "crypto_trailing_close_percent": 7.5,
+    "force_close_at_end": true,
+    "initial_cash": 10000.0,
+    "maximum_crypto_allocation_percent": 25.0,
+    "maximum_open_positions": 4,
+    "maximum_position_percent": 25.0,
+    "maximum_total_open_risk_percent": 4.0,
+    "minimum_fee": 1.0,
+    "risk_per_trade_percent": 1.0,
+    "slippage_bps": 5.0,
+    "stock_stop_loss_percent": 5.0,
+    "stock_trailing_close_percent": 7.5
+  },
+  "approved_project_files": {
+    "docs/BASELINE.md": "60479fd107a0a67d219310d28879b849d4d7588bc349ec7f837b0cf729750389",
+    "docs/EXECUTION_SLIPPAGE_STRESS_V1_SPEC.md": "349f498f7026fc0ccadb09f9c93fb236cb549f8d0c96ecdd889d05720e10718c",
+    "docs/RESEARCH_BASELINE_LOCK_V1_SPEC.md": "b76376862c53ac73edd631af171ebb2a4edb7e8362e87cb4623aeaf4f5f17de2",
+    "src/backtest/portfolio_backtest_engine.py": "851e864f1c753c82d9c0e8eb0eccc315dab690f5f1360ac0a32f5840d727694f",
+    "src/backtest/portfolio_backtest_models.py": "8b4d9c2a275e4da156be16b5e90b0aea1f0f36781cef49711c57b3397ba12a38",
+    "src/backtest/run_portfolio_backtest.py": "cc7adb4602efe744eadb013e0624e28b5c4e2d4c6d182b3f998da4ac196c1724",
+    "src/backtest/run_portfolio_execution_slippage_stress.py": "6293819612150963b1d312e4c72155c75304e8db4a7b0f79835c72f2e260d4f0",
+    "src/backtest/run_portfolio_research_baseline_lock.py": "ed4f424084a35b030d0e3e5c756cc013e5758fc37b6edd13990680143416f10d",
+    "tests/test_portfolio_backtest.py": "379a1a54e881b9a67ec86a7b5f29bbd10ff4387064c04a801523d623bffb938c",
+    "tests/test_portfolio_execution_slippage_stress.py": "6a874129e6c075c2ecdc654c59aa45572e67415b1334e5688df2f70c989e7269",
+    "tests/test_portfolio_research_baseline_lock.py": "425c856c3f4fd902a2b5e9a84d2d73923a9f59b0bcc0bc292dd13e22236a6031"
+  },
+  "execution_stress": {
+    "stamp": "20260802_192047",
+    "provenance_sha256": "4435b43874af3bc1d0ff86e45973743e1984630fdf69940e113980a6d80bfcd5",
+    "scenario_ids": [
+      "C01_S01",
+      "C01_S02",
+      "C01_S04",
+      "C01_S08",
+      "C02_S01",
+      "C02_S02",
+      "C02_S04",
+      "C02_S08",
+      "C04_S01",
+      "C04_S02",
+      "C04_S04",
+      "C04_S08",
+      "C08_S01",
+      "C08_S02",
+      "C08_S04",
+      "C08_S08"
+    ],
+    "result_hashes": {
+      "aggregate": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_aggregate_20260802_192047.csv",
+        "sha256": "0ad79e9c8d1d80c65a8aa98c8e58a0a07f63329b92b1b3036ca2a2272ce2766f"
+      },
+      "comparison": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_comparison_20260802_192047.csv",
+        "sha256": "baaa525fe4e55636269432d2bedb6ee27c59afeeba8d2d6fb2a00feae6d7b144"
+      },
+      "equity": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_equity_20260802_192047.csv",
+        "sha256": "56dc59041cce2348fa5496903d4a35d5fb1853db7ef4df70554e83f6843a9546"
+      },
+      "json": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_20260802_192047.json",
+        "sha256": "cefc6ec3cdb8f0d14798b712c6636abd16a848ca2aaa63b95d0c9609dd1144e0"
+      },
+      "primary_gates": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_primary_gates_20260802_192047.csv",
+        "sha256": "9d69d4a1ae8fc93f2396b09661a048750a4548aa78f40f3e50db957cb68442b6"
+      },
+      "rejections": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_rejections_20260802_192047.csv",
+        "sha256": "965c4be09bd8e4b3de8a16f7342f32eaad735e0ab5dde939f168ef5d8e038518"
+      },
+      "replay_checks": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_replay_checks_20260802_192047.csv",
+        "sha256": "a35847a12660e889122b9bb6ed9d319dac466a8a7ce1f2c21a0ac75f49aaa09b"
+      },
+      "screen": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_screen_20260802_192047.csv",
+        "sha256": "72817275f6d078c08ecb7d2624f0bc594c91bc790164cda88dd01ff8278092f5"
+      },
+      "test_runs": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_test_runs_20260802_192047.csv",
+        "sha256": "4fe614f6a7ccf143a890df07f4a8d4de2dc21591bcb433b9e0364a56a6764afc"
+      },
+      "tickers": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_tickers_20260802_192047.csv",
+        "sha256": "56d06cff6a90fee5b274d549915164369bd24763dcc3a52f88452c2160ff9048"
+      },
+      "trade_pairs": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trade_pairs_20260802_192047.csv",
+        "sha256": "df550cea8a11f607580e9687128c772d1345b5fcf85efd761243107a1ad89871"
+      },
+      "trades": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trades_20260802_192047.csv",
+        "sha256": "6befa4b020b76c5a1aec9da0f59e89fb217e7c2c71566e7731b524bb59b817d4"
+      },
+      "windows": {
+        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_windows_20260802_192047.csv",
+        "sha256": "a6d7c4cc1a9f737909e83d31706e1b34961c93d22d928a31e02dff2dcb773b6a"
+      }
+    }
+  },
+  "reference_metrics": {
+    "baseline": {
+      "compounded_return_percent": 215.5054,
+      "cagr_percent": 19.3457,
+      "maximum_drawdown_percent": 24.4430,
+      "return_drawdown_ratio": 8.8167,
+      "average_profit_factor": 2.2953,
+      "positive_window_count": 8,
+      "matched_benchmark_compounded_return_percent": 532.4012,
+      "matched_benchmark_beat_count": 4,
+      "total_trades": 256,
+      "average_exposure_percent": 51.4822,
+      "benchmark_excess_compounded_percent": -316.8958
+    },
+    "primary_stress": {
+      "compounded_return_percent": 172.1317,
+      "cagr_percent": 16.6597,
+      "maximum_drawdown_percent": 25.5887,
+      "return_drawdown_ratio": 6.7269,
+      "average_profit_factor": 2.1898,
+      "positive_window_count": 8,
+      "matched_benchmark_compounded_return_percent": 522.5110,
+      "matched_benchmark_beat_count": 3,
+      "total_trades": 255,
+      "average_exposure_percent": 51.5937,
+      "benchmark_excess_compounded_percent": -350.3793,
+      "compounded_return_delta_vs_baseline_percent": -43.3737,
+      "drawdown_worsening_vs_baseline_percent": 1.1457,
+      "matched_trade_count": 248,
+      "baseline_only_trade_count": 8,
+      "scenario_only_trade_count": 7
+    }
+  },
+  "known_limitations": [
+    "The lock covers only the controlled nine-asset historical research basket.",
+    "The baseline and doubled-cost scenario underperform their matched benchmarks in compounded return.",
+    "Execution-cost responses are path-dependent and are not monotonic across the full stress grid.",
+    "Ticker and window concentration remain material, especially the NVDA/W09 path change.",
+    "FORCE_CLOSE_END remains part of the official historical baseline population.",
+    "Historical validation does not establish live fill quality, broker behavior, capacity, or production readiness."
+  ],
+  "authorization": {
+    "research_reference_locked": true,
+    "baseline_parameter_change_authorized": false,
+    "broader_universe_validated": false,
+    "paper_trading_authorized": false,
+    "production_authorized": false,
+    "broker_access_authorized": false,
+    "automation_authorized": false
+  },
+  "following_stage": "BROADER_UNIVERSE_ROBUSTNESS_SPECIFICATION_ONLY"
+}
