@@ -13,7 +13,9 @@ in the original dry-run design: nothing is submitted anywhere, the
 decision log only describes what would happen.
 - `--enable-equity-orders` submits real Alpaca PAPER orders (never
   live/production — `order_submission.py` hardcodes `paper=True`) for
-  the seven equity tickers only.
+  the equity tickers only (see `src/live/live_universe.LIVE_CONTROLLED_TICKERS`
+  for the current live-trading universe, independent of the frozen
+  research universe).
 - `--enable-crypto-orders` submits real Alpaca PAPER orders for the
   two crypto tickers (BTC-USD, ETH-USD) only. Crypto has no native
   stop order (see the Phase 2 order-type investigation), so real-time
@@ -160,11 +162,11 @@ from src.backtest.portfolio_backtest_engine import (
     _queue_ranked_entry_signals,
 )
 from src.backtest.portfolio_backtest_models import PortfolioBacktestConfig, PortfolioTrade
-from src.backtest.run_portfolio_entry_statistics import CONTROLLED_TICKERS
 from src.live import order_submission
 from src.live.account_state import get_live_cash_balance
 from src.live.crypto_stop_monitor import DEFAULT_LOCK_PATH, _query_available_crypto_quantity
 from src.live.data_preparer import prepare_live_market_data
+from src.live.live_universe import LIVE_CONTROLLED_TICKERS
 from src.live.position_state import (
     DEFAULT_STATE_PATH,
     LiveRunnerState,
@@ -735,7 +737,7 @@ def run_daily_decision(
         needs_review.extend(_reconcile_pending_equity_orders(trading_client, runner_state))
 
     cash = get_live_cash_balance()
-    prepared = prepare_live_market_data(CONTROLLED_TICKERS)
+    prepared = prepare_live_market_data(LIVE_CONTROLLED_TICKERS)
     bars_today, equity_date, crypto_date = _bars_today_by_asset_class(prepared)
     # Crypto is real-time; equity's own date is only ever equal to or
     # behind it (weekends/holidays), never ahead. Used only as a
