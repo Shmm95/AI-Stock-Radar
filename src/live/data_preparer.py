@@ -42,14 +42,33 @@ Universe note: default tickers come from `src.live.live_universe.LIVE_CONTROLLED
 not `src.backtest.run_portfolio_entry_statistics.CONTROLLED_TICKERS` -- the
 live-trading universe is deliberately independent of the frozen 9-ticker
 research universe. See that module's docstring for why.
+
+Network-retry note: a real dry-run against a larger candidate universe
+(2026-08-13 feasibility check, see docs/BROADER_UNIVERSE research) hit a
+`requests.exceptions.ConnectionError` (a raw connection reset) partway
+through a sequential fetch -- alpaca-py's own `RESTClient` only retries
+HTTP 429 responses (`RetryException`/`retry_exception_codes`, see
+`alpaca.common.rest.RESTClient._request`); it does not catch or retry
+anything at the socket/connection level, which happens before any HTTP
+response even exists. `_fetch_raw_bars` below retries only
+`requests.exceptions.ConnectionError`/`Timeout`/`ChunkedEncodingError` --
+the raw network-layer exceptions `requests` itself defines -- a fixed
+number of times with exponential backoff. Deliberately narrow: an
+`alpaca.common.exceptions.APIError` (bad symbol, bad request, any real
+HTTP error status) is a different, already-translated exception class
+and is never caught here, so a genuine data/logic problem still fails
+immediately and loudly instead of being masked by three silent retries.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
+import requests
 
 from src.analysis.technical_indicators import add_technical_indicators
 from src.backtest.portfolio_backtest_engine import _validate_market_data
@@ -58,9 +77,19 @@ from src.backtest.run_regime_ablation import build_regime_allowed
 from src.data import alpaca_market_data as amd
 from src.live.live_universe import LIVE_CONTROLLED_TICKERS
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_FETCH_CALENDAR_DAYS = 400
 MINIMUM_DELIVERED_BARS = 150
 REGIME_SYMBOL = "BTC-USD"
+
+_NETWORK_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+_NETWORK_RETRY_ATTEMPTS = 3
+_NETWORK_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
 def _is_crypto_ticker(ticker: str) -> bool:
@@ -73,15 +102,40 @@ def _alpaca_symbol(ticker: str) -> str:
     return ticker.replace("-", "/") if _is_crypto_ticker(ticker) else ticker
 
 
+def _fetch_bars_with_network_retry(
+    *, ticker: str, alpaca_symbol: str, start: datetime, end: datetime
+) -> pd.DataFrame:
+    """Fetch one ticker's bars, retrying only raw network-layer failures.
+
+    See this module's docstring ("Network-retry note") for why this
+    exists and why the caught exception set is deliberately narrow.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, _NETWORK_RETRY_ATTEMPTS + 1):
+        try:
+            if _is_crypto_ticker(ticker):
+                return amd.get_crypto_bars(alpaca_symbol, start=start, end=end)
+            return amd.get_stock_bars(alpaca_symbol, start=start, end=end)
+        except _NETWORK_ERRORS as error:
+            last_error = error
+            logger.warning(
+                "Network error fetching %s (attempt %d/%d): %s: %s",
+                ticker, attempt, _NETWORK_RETRY_ATTEMPTS, type(error).__name__, error,
+            )
+            if attempt < _NETWORK_RETRY_ATTEMPTS:
+                time.sleep(_NETWORK_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+    assert last_error is not None
+    raise last_error
+
+
 def _fetch_raw_bars(ticker: str, *, fetch_calendar_days: int) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=fetch_calendar_days)
     alpaca_symbol = _alpaca_symbol(ticker)
 
-    if _is_crypto_ticker(ticker):
-        raw = amd.get_crypto_bars(alpaca_symbol, start=start, end=end)
-    else:
-        raw = amd.get_stock_bars(alpaca_symbol, start=start, end=end)
+    raw = _fetch_bars_with_network_retry(
+        ticker=ticker, alpaca_symbol=alpaca_symbol, start=start, end=end
+    )
 
     if raw.empty:
         raise ValueError(f"Alpaca returned no bars for {ticker} ({alpaca_symbol}).")
