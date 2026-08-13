@@ -177,6 +177,31 @@ from src.notify.telegram_notifier import send_telegram_message
 
 DEFAULT_DECISION_LOG_DIRECTORY = Path("data/live/decisions")
 
+# Live-only risk-parameter override, deliberately NOT a change to
+# PortfolioBacktestConfig's own defaults (portfolio_backtest_models.py).
+# Those defaults are hash-locked: run_portfolio_research_baseline_lock.py's
+# verify_runtime_config() calls PortfolioBacktestConfig().to_dict() with no
+# arguments and compares every field, including these two, against
+# config/research_baseline_lock_v1.json's frozen baseline_config -- editing
+# the shared dataclass default would break that certification for every
+# research module that also relies on PortfolioBacktestConfig() (confirmed
+# by reading verify_runtime_config, not assumed). This mirrors the same
+# live/research split already established for the ticker universe
+# (LIVE_CONTROLLED_TICKERS vs. CONTROLLED_TICKERS): only this script's own
+# config construction below uses these values; every research module's
+# bare PortfolioBacktestConfig() is completely unaffected.
+#
+# Values: research (2026-08-13, see the position-sizing formula
+# investigation) found maximum_open_positions=4 and
+# maximum_total_open_risk_percent=4.0% were already mutually redundant
+# under the frozen defaults (risk_per_trade_percent=1% x 4 positions = the
+# same 4% ceiling either cap would hit first). Raised together to 6/6.0%
+# as a deliberate first step before widening the live ticker universe
+# (Phase 4), so the risk-parameter change and the universe-size change are
+# never tested confounded together. risk_per_trade_percent is unchanged.
+LIVE_MAXIMUM_OPEN_POSITIONS = 6
+LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT = 6.0
+
 # Asset class + exit_reason -> recommended live order type, per the
 # Phase 2 order-type investigation. Entries are always "market" (the
 # engine never uses a limit price on entry, see that investigation's
@@ -722,7 +747,10 @@ def run_daily_decision(
     enable_equity_orders: bool = False,
     enable_crypto_orders: bool = False,
 ) -> dict:
-    config = PortfolioBacktestConfig()
+    config = PortfolioBacktestConfig(
+        maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
+        maximum_total_open_risk_percent=LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT,
+    )
     config.validate()
 
     runner_state = load_position_state(state_path)
