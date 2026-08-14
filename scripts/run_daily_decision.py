@@ -77,23 +77,33 @@ the order-type rationale):
   independent of this job's schedule; this script only reconciles
   local bookkeeping against that stop order's real status and surfaces
   a `needs_manual_review` entry if it does not show as filled.
-- Idempotency: every real submission is recorded in
-  `runner_state.submitted_actions`, keyed by
-  `f"{ticker}|{kind}|{date}"` -- the real calendar date (equity's own
-  for equity checkpoints, crypto's own for crypto checkpoints; the two
-  can differ, see `_bars_today_by_asset_class`) rather than
-  `portfolio_bar_index`. Checked before any new submission, so
-  re-running this script for the same day re-checks status instead of
-  re-submitting. Deliberately NOT keyed by `portfolio_bar_index`: a
-  real incident showed that counter can jump backward (`data/live/`
-  overwritten by a stale rsync copy), which would let a genuinely new
-  action collide with a stale ledger entry from before the rollback and
-  get silently skipped -- confirmed via a real-code-path stress test,
-  not theoretical. A calendar date cannot recur the way an integer
-  counter can, so this key format cannot collide the same way. See
-  `src/live/position_state.py`'s `RollbackDetectedError` for the
-  primary defense (refuses to run at all on a detected rollback); this
-  key format is the structural backstop for the same risk.
+- Idempotency, two independent layers, neither claimed sufficient
+  alone (an independent 2026-08-14 review correctly pushed back on an
+  earlier version of this note that overclaimed the date key alone as
+  "structurally impossible to collide" -- it narrows the collision
+  window a lot, but a same-day retry, a crash between a real fill and
+  the next save, or a corrupted/never-written ledger entry could still
+  create one):
+  1. `runner_state.submitted_actions` is keyed by
+     `f"{ticker}|{kind}|{date}"` (the real calendar date -- equity's
+     own for equity checkpoints, crypto's own for crypto checkpoints,
+     see `_bars_today_by_asset_class`) rather than
+     `portfolio_bar_index`, which a real incident showed can jump
+     backward (`data/live/` overwritten by a stale rsync copy) and
+     collide with a stale entry from before the rollback -- confirmed
+     via a real-code-path stress test. A calendar date is far less
+     likely to recur than an integer counter can, but "far less
+     likely" is the honest claim, not "cannot."
+  2. The actual authority on whether to submit: every checkpoint now
+     builds a deterministic `client_order_id` and queries Alpaca for it
+     BEFORE submitting (`_resolve_or_submit_order`). This is what
+     closes the gap layer 1 leaves open -- even a lost or rolled-back
+     local ledger entry cannot cause a real duplicate, because the
+     decision no longer depends on this file's own memory of what
+     happened; it depends on what the broker itself confirms.
+  `src/live/position_state.py`'s `RollbackDetectedError` is a third,
+  separate layer (refuses to run at all on a detected rollback) --
+  also real, also partial, not a substitute for either of the above.
 - Known limitation, accepted rather than solved with a heavier
   two-phase-commit design: a newly opened position is recorded in
   local state as soon as the engine decides to open it, without
@@ -161,6 +171,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.models import Order
 
 from src.backtest.portfolio_backtest_engine import (
     _MutablePosition,
@@ -246,6 +257,55 @@ LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT = 6.0
 # has no plain `stop` order (only `stop_limit`), so the closest
 # faithful equivalent is our own monitoring loop + a market order.
 _STOP_EXIT_REASONS = {"STOP_LOSS", "GAP_STOP_LOSS"}
+
+# Broker-authoritative idempotency (2026-08-14, responding to an
+# independent review's HIGH-severity finding: a date-keyed
+# `submitted_actions` entry is not a hard guarantee against collision --
+# same-day retries, a crash between a real fill and the next save, or a
+# corrupted/lost local ledger could all still let a genuinely-new
+# action attempt collide with, or fail to recognize, a real prior
+# submission). Every new-order checkpoint below now builds a
+# deterministic `client_order_id` and asks Alpaca -- not
+# `submitted_actions` -- whether it already exists BEFORE submitting.
+# The local ledger is still written (for the decision log and
+# `_reconcile_pending_equity_orders`), but it is a record of what
+# happened, not the authority on whether to submit -- the broker is.
+_CLIENT_ORDER_ID_MAX_LENGTH = 128
+
+
+def _deterministic_client_order_id(*parts: str) -> str:
+    """Builds a stable id from `parts` -- calling this again with the
+    exact same parts (a retry, a crash-restart, a re-run for the same
+    day) always produces the same string, which is what makes the
+    broker query below meaningful: it is asking "has THIS exact intent
+    already happened," not merely "has any order for this ticker
+    happened." `/` (crypto symbols) is not valid in Alpaca's
+    client_order_id, hence the substitution."""
+    sanitized = "-".join(part.replace("/", "-") for part in parts)
+    return sanitized[:_CLIENT_ORDER_ID_MAX_LENGTH]
+
+
+def _order_status_str(order: Order) -> str:
+    status = order.status
+    return str(status.value if hasattr(status, "value") else status)
+
+
+def _resolve_or_submit_order(
+    client: TradingClient, *, client_order_id: str, submit
+) -> tuple[Order, bool]:
+    """The actual fix: check the broker BEFORE calling `submit`, via
+    `order_submission.get_order_by_client_order_id` (a plain,
+    monkeypatchable module function, not a bare method call on
+    `client` -- see that function's own docstring for the 404-only
+    contract). If an order with this `client_order_id` already exists,
+    `submit` is never invoked -- a lost, never-written, or rolled-back
+    local ledger entry can no longer cause a real duplicate, because
+    the decision no longer depends on the local ledger at all. Returns
+    (order, already_existed)."""
+    existing = order_submission.get_order_by_client_order_id(client, client_order_id)
+    if existing is not None:
+        return existing, True
+    return submit(), False
 
 
 def _recommended_exit_order_type(*, exit_reason: str, asset_class: str) -> str:
@@ -355,7 +415,22 @@ def _build_state(
 def _reconcile_pending_equity_orders(
     client: TradingClient, runner_state: LiveRunnerState
 ) -> list[dict]:
-    """Catch up on entry orders submitted, but not confirmed, on a previous run."""
+    """Catch up on entry orders submitted, but not confirmed, on a previous run.
+
+    The PROTECTIVE_STOP this places used to be keyed by
+    `portfolio_bar_index` -- the same rollback-collision exposure the
+    other six checkpoints had before the 2026-08-14 fix, flagged as its
+    own HIGH-severity finding by an independent review specifically
+    because this function runs before `equity_date` even exists yet
+    (called ahead of the market-data fetch), so it could not simply
+    reuse that fix the way the others did. Fixed here differently, and
+    arguably more robustly than a date ever could be: keyed off the
+    ENTRY order's own id (`record["order_id"]`) -- an immutable
+    reference to "the specific fill this stop protects" that exists
+    the moment the entry confirms, with no dependency on what day it
+    happens to be reconciled. Also broker-queried by client_order_id
+    before submitting, same as every other checkpoint.
+    """
     needs_review: list[dict] = []
     for key, record in list(runner_state.submitted_actions.items()):
         if record.get("kind") != "ENTRY_MARKET_BUY":
@@ -368,20 +443,30 @@ def _reconcile_pending_equity_orders(
         if status == "filled":
             position = runner_state.positions.get(ticker)
             if position is not None and ticker not in runner_state.equity_stop_orders:
-                stop_key = f"{ticker}|PROTECTIVE_STOP|{runner_state.portfolio_bar_index}"
-                stop_order = order_submission.submit_equity_stop_sell(
-                    client,
-                    ticker=ticker,
-                    quantity=position.quantity,
-                    stop_price=position.stop_loss_price,
-                )
-                runner_state.submitted_actions[stop_key] = {
-                    "order_id": str(stop_order.id),
-                    "status": "new",
-                    "kind": "PROTECTIVE_STOP",
-                    "submitted_at": order_submission.now_iso(),
-                }
-                runner_state.equity_stop_orders[ticker] = str(stop_order.id)
+                stop_key = f"{ticker}|PROTECTIVE_STOP|FOR|{record['order_id']}"
+                stop_record = runner_state.submitted_actions.get(stop_key)
+                if stop_record is None:
+                    stop_client_order_id = _deterministic_client_order_id(
+                        ticker, "PROTECTIVE-STOP-FOR", record["order_id"]
+                    )
+                    stop_order, _ = _resolve_or_submit_order(
+                        client,
+                        client_order_id=stop_client_order_id,
+                        submit=lambda: order_submission.submit_equity_stop_sell(
+                            client, ticker=ticker, quantity=position.quantity,
+                            stop_price=position.stop_loss_price,
+                            client_order_id=stop_client_order_id,
+                        ),
+                    )
+                    stop_record = {
+                        "order_id": str(stop_order.id),
+                        "status": "new",
+                        "kind": "PROTECTIVE_STOP",
+                        "submitted_at": order_submission.now_iso(),
+                        "client_order_id": stop_client_order_id,
+                    }
+                    runner_state.submitted_actions[stop_key] = stop_record
+                runner_state.equity_stop_orders[ticker] = stop_record["order_id"]
         elif status in {"rejected", "canceled", "expired"}:
             needs_review.append(
                 {
@@ -404,15 +489,15 @@ def _execute_equity_orders(
 ) -> tuple[list[dict], list[dict]]:
     """Submit real equity orders for today's decisions. Never called for crypto.
 
-    Idempotency keys use `equity_date` (the real calendar date), not
-    `portfolio_bar_index` -- a bar-index rollback (e.g. data/live/
-    overwritten by a stale rsync copy) cannot make a real calendar date
-    recur, so a genuinely new action can never collide with a stale
-    ledger entry from before the rollback. The high-water-mark guard in
-    position_state.py is the primary defense (refuses to run at all);
-    this is the structural, defense-in-depth backstop for the same risk
-    -- see the incident this was verified against in the accompanying
-    report, not this module's docstring alone.
+    Idempotency, two layers (see the module docstring's fuller
+    explanation of why neither is claimed sufficient alone): the local
+    `submitted_actions` lookup below uses `equity_date` rather than
+    `portfolio_bar_index` (a real incident showed that counter can jump
+    backward), which makes a same-key collision far less likely but not
+    impossible. The actual authority is `_resolve_or_submit_order`'s
+    broker query by deterministic `client_order_id`, called before any
+    real submission -- that is what keeps a lost or stale local ledger
+    entry from causing a real duplicate, not the key format by itself.
     """
     actions: list[dict] = []
     needs_review: list[dict] = []
@@ -423,15 +508,25 @@ def _execute_equity_orders(
         action_key = f"{ticker}|ENTRY_MARKET_BUY|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
-            order = order_submission.submit_equity_market_order(
-                client, ticker=ticker, side=OrderSide.BUY, quantity=position.quantity
+            client_order_id = _deterministic_client_order_id(ticker, "ENTRY-MARKET-BUY", equity_date)
+            order, already_existed = _resolve_or_submit_order(
+                client,
+                client_order_id=client_order_id,
+                submit=lambda: order_submission.submit_equity_market_order(
+                    client, ticker=ticker, side=OrderSide.BUY, quantity=position.quantity,
+                    client_order_id=client_order_id,
+                ),
             )
-            status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
+            status = (
+                _order_status_str(order) if already_existed
+                else order_submission.wait_for_fill_or_timeout(client, str(order.id))
+            )
             record = {
                 "order_id": str(order.id),
                 "status": status,
                 "kind": "ENTRY_MARKET_BUY",
                 "submitted_at": order_submission.now_iso(),
+                "client_order_id": client_order_id,
             }
             runner_state.submitted_actions[action_key] = record
         else:
@@ -439,20 +534,31 @@ def _execute_equity_orders(
         actions.append({"ticker": ticker, "action": "BUY", **record})
 
         if record["status"] == "filled" and ticker not in runner_state.equity_stop_orders:
+            # Keyed off the ENTRY order's own id, not a date -- the stop's
+            # whole identity is "protect THIS fill," an immutable
+            # reference that exists the moment the entry confirms, and
+            # is a strictly better anchor than any date could be.
             stop_key = f"{ticker}|PROTECTIVE_STOP|{equity_date}"
             stop_record = runner_state.submitted_actions.get(stop_key)
             if stop_record is None:
-                stop_order = order_submission.submit_equity_stop_sell(
+                stop_client_order_id = _deterministic_client_order_id(
+                    ticker, "PROTECTIVE-STOP-FOR", record["order_id"]
+                )
+                stop_order, _ = _resolve_or_submit_order(
                     client,
-                    ticker=ticker,
-                    quantity=position.quantity,
-                    stop_price=position.stop_loss_price,
+                    client_order_id=stop_client_order_id,
+                    submit=lambda: order_submission.submit_equity_stop_sell(
+                        client, ticker=ticker, quantity=position.quantity,
+                        stop_price=position.stop_loss_price,
+                        client_order_id=stop_client_order_id,
+                    ),
                 )
                 stop_record = {
                     "order_id": str(stop_order.id),
                     "status": "new",
                     "kind": "PROTECTIVE_STOP",
                     "submitted_at": order_submission.now_iso(),
+                    "client_order_id": stop_client_order_id,
                 }
                 runner_state.submitted_actions[stop_key] = stop_record
             runner_state.equity_stop_orders[ticker] = stop_record["order_id"]
@@ -570,15 +676,27 @@ def _execute_equity_orders(
         action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
-            order = order_submission.submit_equity_market_order(
-                client, ticker=trade.ticker, side=OrderSide.SELL, quantity=trade.quantity
+            client_order_id = _deterministic_client_order_id(
+                trade.ticker, "SIGNAL-EXIT-MARKET-SELL", equity_date
             )
-            status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
+            order, already_existed = _resolve_or_submit_order(
+                client,
+                client_order_id=client_order_id,
+                submit=lambda: order_submission.submit_equity_market_order(
+                    client, ticker=trade.ticker, side=OrderSide.SELL, quantity=trade.quantity,
+                    client_order_id=client_order_id,
+                ),
+            )
+            status = (
+                _order_status_str(order) if already_existed
+                else order_submission.wait_for_fill_or_timeout(client, str(order.id))
+            )
             record = {
                 "order_id": str(order.id),
                 "status": status,
                 "kind": "SIGNAL_EXIT_MARKET_SELL",
                 "submitted_at": order_submission.now_iso(),
+                "client_order_id": client_order_id,
             }
             runner_state.submitted_actions[action_key] = record
         else:
@@ -688,19 +806,29 @@ def _execute_crypto_orders(
             action_key = f"{ticker}|ENTRY_MARKET_BUY|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
-                order = order_submission.submit_equity_market_order(
+                client_order_id = _deterministic_client_order_id(ticker, "ENTRY-MARKET-BUY", crypto_date)
+                order, already_existed = _resolve_or_submit_order(
                     client,
-                    ticker=alpaca_symbol,
-                    side=OrderSide.BUY,
-                    quantity=position.quantity,
-                    time_in_force=TimeInForce.IOC,
+                    client_order_id=client_order_id,
+                    submit=lambda: order_submission.submit_equity_market_order(
+                        client,
+                        ticker=alpaca_symbol,
+                        side=OrderSide.BUY,
+                        quantity=position.quantity,
+                        time_in_force=TimeInForce.IOC,
+                        client_order_id=client_order_id,
+                    ),
                 )
-                status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
+                status = (
+                    _order_status_str(order) if already_existed
+                    else order_submission.wait_for_fill_or_timeout(client, str(order.id))
+                )
                 record = {
                     "order_id": str(order.id),
                     "status": status,
                     "kind": "ENTRY_MARKET_BUY",
                     "submitted_at": order_submission.now_iso(),
+                    "client_order_id": client_order_id,
                 }
                 runner_state.submitted_actions[action_key] = record
             else:
@@ -740,37 +868,56 @@ def _execute_crypto_orders(
             action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
-                available_quantity = _query_available_crypto_quantity(client, alpaca_symbol)
-                if available_quantity is None:
-                    needs_review.append(
-                        {
-                            "ticker": trade.ticker,
-                            "issue": (
-                                "signal-based exit due but the broker reports no "
-                                "available quantity for this symbol; refusing to "
-                                "guess a sell quantity from local state"
-                            ),
-                            "local_quantity": trade.quantity,
-                        }
-                    )
-                    continue
-                order = order_submission.submit_equity_market_order(
-                    client,
-                    ticker=alpaca_symbol,
-                    side=OrderSide.SELL,
-                    quantity=available_quantity,
-                    time_in_force=TimeInForce.IOC,
+                client_order_id = _deterministic_client_order_id(
+                    trade.ticker, "SIGNAL-EXIT-MARKET-SELL", crypto_date
                 )
-                status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
-                record = {
-                    "order_id": str(order.id),
-                    "status": status,
-                    "kind": "SIGNAL_EXIT_MARKET_SELL",
-                    "submitted_at": order_submission.now_iso(),
-                    "local_quantity": trade.quantity,
-                    "broker_quantity": available_quantity,
-                }
-                runner_state.submitted_actions[action_key] = record
+                # Checked before spending a call on available_quantity --
+                # if this exact intent already happened, no quantity
+                # decision is needed at all.
+                existing_order = order_submission.get_order_by_client_order_id(client, client_order_id)
+                if existing_order is not None:
+                    record = {
+                        "order_id": str(existing_order.id),
+                        "status": _order_status_str(existing_order),
+                        "kind": "SIGNAL_EXIT_MARKET_SELL",
+                        "submitted_at": order_submission.now_iso(),
+                        "client_order_id": client_order_id,
+                    }
+                    runner_state.submitted_actions[action_key] = record
+                else:
+                    available_quantity = _query_available_crypto_quantity(client, alpaca_symbol)
+                    if available_quantity is None:
+                        needs_review.append(
+                            {
+                                "ticker": trade.ticker,
+                                "issue": (
+                                    "signal-based exit due but the broker reports no "
+                                    "available quantity for this symbol; refusing to "
+                                    "guess a sell quantity from local state"
+                                ),
+                                "local_quantity": trade.quantity,
+                            }
+                        )
+                        continue
+                    order = order_submission.submit_equity_market_order(
+                        client,
+                        ticker=alpaca_symbol,
+                        side=OrderSide.SELL,
+                        quantity=available_quantity,
+                        time_in_force=TimeInForce.IOC,
+                        client_order_id=client_order_id,
+                    )
+                    status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
+                    record = {
+                        "order_id": str(order.id),
+                        "status": status,
+                        "kind": "SIGNAL_EXIT_MARKET_SELL",
+                        "submitted_at": order_submission.now_iso(),
+                        "local_quantity": trade.quantity,
+                        "broker_quantity": available_quantity,
+                        "client_order_id": client_order_id,
+                    }
+                    runner_state.submitted_actions[action_key] = record
             else:
                 record["status"] = order_submission.get_order_status(client, record["order_id"])
             actions.append({"ticker": trade.ticker, "action": "SELL", **record})

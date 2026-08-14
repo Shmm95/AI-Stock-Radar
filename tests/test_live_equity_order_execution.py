@@ -78,6 +78,7 @@ def equity_trade(
 
 
 def test_entry_buy_fills_and_places_stop(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(
         order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("entry-1")
     )
@@ -111,6 +112,7 @@ def test_rerun_for_same_bar_never_resubmits(monkeypatch: pytest.MonkeyPatch):
         calls["submit"] += 1
         return FakeOrder(f"entry-{calls['submit']}")
 
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(order_submission, "submit_equity_market_order", fail_if_called)
     monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
     monkeypatch.setattr(
@@ -138,6 +140,7 @@ def test_rerun_for_same_bar_never_resubmits(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_stop_placement_deferred_when_entry_not_yet_filled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(
         order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("entry-1")
     )
@@ -172,6 +175,7 @@ def test_reconciliation_places_stop_once_deferred_entry_confirms(monkeypatch: py
         },
     )
     monkeypatch.setattr(order_submission, "get_order_status", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(
         order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1")
     )
@@ -208,6 +212,7 @@ def test_signal_exit_cancels_stop_before_selling_and_confirms_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ):
     call_order = []
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(
         order_submission, "submit_equity_market_order",
         lambda *a, **k: (call_order.append("SELL"), FakeOrder("exit-1"))[1],
@@ -299,7 +304,7 @@ def test_real_held_for_orders_rejection_scenario_is_prevented_by_correct_orderin
         stop_state["canceled"] = True
         return "canceled"
 
-    def fake_submit(client, *, ticker, side, quantity, time_in_force=None):
+    def fake_submit(client, *, ticker, side, quantity, time_in_force=None, client_order_id=None):
         if side == OrderSide.SELL and not stop_state["canceled"]:
             # Mirrors the real Alpaca APIError observed in production:
             # {"available":"0","existing_qty":"1","held_for_orders":"1",
@@ -308,6 +313,7 @@ def test_real_held_for_orders_rejection_scenario_is_prevented_by_correct_orderin
             raise HeldForOrdersError("insufficient qty available for order")
         return FakeOrder("exit-1")
 
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(order_submission, "cancel_order_and_confirm", fake_cancel_and_confirm)
     monkeypatch.setattr(order_submission, "submit_equity_market_order", fake_submit)
     monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
@@ -361,6 +367,108 @@ def test_stop_loss_exit_flags_review_when_broker_stop_not_yet_filled(
     assert not any(a["action"] == "RECONCILE_STOP_FILLED" for a in actions)
     assert len(review) == 1
     assert "does not yet show filled" in review[0]["issue"]
+
+
+def test_entry_buy_finds_existing_order_by_client_order_id_and_never_resubmits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The actual fix under test, not the pre-existing local-ledger check:
+    even with an EMPTY local ledger (simulating a lost/rolled-back
+    `submitted_actions`, exactly the scenario the local-ledger-only
+    check cannot defend against), a broker that already has an order
+    for this client_order_id must stop a real resubmission."""
+
+    def fail_if_called(*a, **k):
+        raise AssertionError(
+            "must not submit a new order -- the broker already has one for this client_order_id"
+        )
+
+    class ExistingOrder:
+        id = "already-submitted-entry-1"
+        status = "filled"
+
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", fail_if_called)
+    monkeypatch.setattr(
+        order_submission, "get_order_by_client_order_id", lambda client, client_order_id: ExistingOrder()
+    )
+
+    state = LiveRunnerState()  # empty ledger -- nothing locally remembers this order
+    actions, review = runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-14",
+        newly_opened={"AAPL": equity_position()}, closed_trades=[],
+    )
+
+    assert review == []
+    buy_actions = [a for a in actions if a["action"] == "BUY"]
+    assert buy_actions and buy_actions[0]["order_id"] == "already-submitted-entry-1"
+    assert state.submitted_actions["AAPL|ENTRY_MARKET_BUY|2026-08-14"]["order_id"] == "already-submitted-entry-1"
+
+
+def test_signal_exit_finds_existing_order_by_client_order_id_and_never_resubmits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_if_called(*a, **k):
+        raise AssertionError(
+            "must not submit a new sell -- the broker already has one for this client_order_id"
+        )
+
+    class ExistingOrder:
+        id = "already-submitted-exit-1"
+        status = "filled"
+
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", fail_if_called)
+    monkeypatch.setattr(
+        order_submission, "get_order_by_client_order_id", lambda client, client_order_id: ExistingOrder()
+    )
+
+    state = LiveRunnerState()  # empty ledger, no resting stop to cancel first
+    actions, review = runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-15",
+        newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+    )
+
+    assert review == []
+    sell_actions = [a for a in actions if a["action"] == "SELL"]
+    assert sell_actions and sell_actions[0]["order_id"] == "already-submitted-exit-1"
+
+
+def test_reconciliation_stop_finds_existing_order_by_client_order_id_and_never_resubmits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Point 2 of the 2026-08-14 review: the reconcile function's own
+    PROTECTIVE_STOP placement now goes through the same broker-query
+    check, keyed off the entry order's own id rather than a date."""
+
+    def fail_if_called(*a, **k):
+        raise AssertionError(
+            "must not place a new stop -- the broker already has one for this client_order_id"
+        )
+
+    class ExistingStopOrder:
+        id = "already-submitted-stop-1"
+        status = "new"
+
+    state = LiveRunnerState(
+        portfolio_bar_index=3,
+        positions={"AAPL": equity_position()},
+        submitted_actions={
+            "AAPL|ENTRY_MARKET_BUY|3": {
+                "order_id": "entry-1", "status": "accepted",
+                "kind": "ENTRY_MARKET_BUY", "submitted_at": "x",
+            }
+        },
+    )
+    monkeypatch.setattr(order_submission, "get_order_status", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", fail_if_called)
+    monkeypatch.setattr(
+        order_submission, "get_order_by_client_order_id",
+        lambda client, client_order_id: ExistingStopOrder(),
+    )
+
+    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state)
+
+    assert review == []
+    assert state.equity_stop_orders["AAPL"] == "already-submitted-stop-1"
 
 
 def test_crypto_positions_never_reach_order_submission(monkeypatch: pytest.MonkeyPatch):

@@ -63,10 +63,11 @@ def stub_lock(monkeypatch: pytest.MonkeyPatch):
 def test_entry_buy_uses_ioc_and_alpaca_symbol(stub_lock, monkeypatch: pytest.MonkeyPatch):
     captured = []
 
-    def fake_submit(client, *, ticker, side, quantity, time_in_force):
+    def fake_submit(client, *, ticker, side, quantity, time_in_force, client_order_id=None):
         captured.append({"ticker": ticker, "side": side, "quantity": quantity, "tif": time_in_force})
         return FakeOrder("entry-1")
 
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(order_submission, "submit_equity_market_order", fake_submit)
     monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
 
@@ -88,10 +89,11 @@ def test_entry_buy_uses_ioc_and_alpaca_symbol(stub_lock, monkeypatch: pytest.Mon
 def test_rerun_for_same_bar_never_resubmits_entry(stub_lock, monkeypatch: pytest.MonkeyPatch):
     calls = {"submit": 0}
 
-    def fake_submit(client, *, ticker, side, quantity, time_in_force):
+    def fake_submit(client, *, ticker, side, quantity, time_in_force, client_order_id=None):
         calls["submit"] += 1
         return FakeOrder(f"entry-{calls['submit']}")
 
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(order_submission, "submit_equity_market_order", fake_submit)
     monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
     monkeypatch.setattr(order_submission, "get_order_status", lambda *a, **k: "filled")
@@ -113,10 +115,11 @@ def test_rerun_for_same_bar_never_resubmits_entry(stub_lock, monkeypatch: pytest
 def test_signal_exit_sells_broker_confirmed_quantity_not_local(stub_lock, monkeypatch: pytest.MonkeyPatch):
     captured = []
 
-    def fake_submit(client, *, ticker, side, quantity, time_in_force):
+    def fake_submit(client, *, ticker, side, quantity, time_in_force, client_order_id=None):
         captured.append(quantity)
         return FakeOrder("exit-1")
 
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(
         runner, "_query_available_crypto_quantity", lambda client, symbol: 0.0097
     )
@@ -139,6 +142,7 @@ def test_signal_exit_sells_broker_confirmed_quantity_not_local(stub_lock, monkey
 def test_signal_exit_with_no_available_quantity_skips_and_flags_review(
     stub_lock, monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_query_available_crypto_quantity", lambda client, symbol: None)
 
     def fail_if_called(*a, **k):
