@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from generate_performance_report import (
     ClosedTrade,
     compute_metrics,
+    count_heartbeat_fills,
     fetch_filled_orders,
     reconstruct_round_trips,
 )
@@ -61,10 +62,15 @@ def _notify_safe(text: str) -> bool:
         return False
 
 
-def build_summary_text(closed_trades: list[ClosedTrade], open_lots: list) -> str:
+def build_summary_text(
+    closed_trades: list[ClosedTrade], open_lots: list, *, heartbeat_fill_count: int = 0
+) -> str:
     """Build the short Telegram summary. Never raises -- pure formatting
     over already-computed values; the caller guards the actual data
-    fetch/computation separately."""
+    fetch/computation separately. `closed_trades`/`open_lots` already
+    exclude heartbeat pipeline-test fills (see fetch_filled_orders);
+    `heartbeat_fill_count` is reported separately, never folded into
+    the real metrics below."""
     now = datetime.now(UTC)
     lines = [f"AI-Stock-Radar performance summary -- {now.date().isoformat()}"]
 
@@ -96,6 +102,11 @@ def build_summary_text(closed_trades: list[ClosedTrade], open_lots: list) -> str
     if open_lots:
         lines.append(f"Açık pozisyon (P&L henüz hesaplanmadı): {len(open_lots)}")
 
+    lines.append(
+        f"Pipeline test: {heartbeat_fill_count} heartbeat round-trip bugüne kadar, "
+        f"ayrı takip ediliyor (yukarıdaki metriklere dahil değil)."
+    )
+
     return "\n".join(lines)
 
 
@@ -103,8 +114,9 @@ def main() -> None:
     try:
         client = order_submission.get_trading_client()
         orders = fetch_filled_orders(client)
+        heartbeat_fill_count = count_heartbeat_fills(client)
         closed_trades, open_lots = reconstruct_round_trips(orders)
-        text = build_summary_text(closed_trades, open_lots)
+        text = build_summary_text(closed_trades, open_lots, heartbeat_fill_count=heartbeat_fill_count)
     except Exception as error:
         # Mirrors run_daily_decision.py's main(): never let a failure here
         # go unreported. A short, safe (no credentials/tokens) error

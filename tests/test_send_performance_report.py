@@ -95,6 +95,7 @@ def test_main_warns_on_stderr_when_notification_cannot_be_confirmed(
 ):
     monkeypatch.setattr(spr.order_submission, "get_trading_client", lambda: object())
     monkeypatch.setattr(spr, "fetch_filled_orders", lambda client: [])
+    monkeypatch.setattr(spr, "count_heartbeat_fills", lambda client: 0)
     monkeypatch.setattr(spr, "reconstruct_round_trips", lambda orders: ([], []))
     monkeypatch.setattr(spr, "send_telegram_message", lambda text: False)
 
@@ -111,6 +112,7 @@ def test_main_sends_successfully_with_zero_fills(monkeypatch: pytest.MonkeyPatch
     sent = []
     monkeypatch.setattr(spr.order_submission, "get_trading_client", lambda: object())
     monkeypatch.setattr(spr, "fetch_filled_orders", lambda client: [])
+    monkeypatch.setattr(spr, "count_heartbeat_fills", lambda client: 0)
     monkeypatch.setattr(spr, "reconstruct_round_trips", lambda orders: ([], []))
     monkeypatch.setattr(spr, "send_telegram_message", lambda text: sent.append(text) or True)
 
