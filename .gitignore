@@ -23,3 +23,18 @@ data/raw/*.csv
 # real-data tests locally. Not source, not official output -- never
 # committed.
 data/backtests/
+
+# Research-candidate artifacts (universe snapshots, automated quality/
+# correlation/backtest-sanity reports) explicitly tagged
+# RESEARCH_CANDIDATE_NOT_OFFICIAL inside each file. Same status as
+# data/backtests/ above -- local only, never committed.
+data/research/
+
+# Live-trading runtime state (position state, decision logs, reports)
+# plus the emergency STOP/FREEZE flag files scripts/run_daily_decision.py
+# and scripts/run_crypto_stop_monitor.py check for -- was already
+# untracked in practice but never actually excluded here (confirmed by
+# checking, not assumed). Made explicit so a git-based deploy (pull/
+# checkout/clean) can never delete or overwrite a live flag file or the
+# real runtime state it protects.
+data/live/

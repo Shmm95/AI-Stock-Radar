@@ -177,6 +177,25 @@ from src.notify.telegram_notifier import send_telegram_message
 
 DEFAULT_DECISION_LOG_DIRECTORY = Path("data/live/decisions")
 
+# Emergency two-tier switch: empty files, content never read, only
+# existence checked. Both are checked in main() before any Alpaca/data
+# API call. See docs/EMERGENCY_STOP_RUNBOOK.md for exactly what to type
+# in a crisis -- this exists because SSH + hand-editing crontab is too
+# slow and error-prone to trust under pressure.
+#
+# STOP_FLAG_PATH: full stop. main() returns before touching anything --
+# no cash balance, no market data, no client. If both flags are present,
+# STOP wins (checked first, unconditionally).
+#
+# FREEZE_FLAG_PATH: only new-position-opening stops (skipping steps 3 and
+# 6 below); data fetch and existing-position exit/stop monitoring (steps
+# 1, 2, 4, 5) run exactly as normal, so an open position never loses its
+# stop-loss coverage during a freeze. run_crypto_stop_monitor.py is
+# deliberately NOT gated on this flag for the same reason (see that
+# script's STOP_FLAG_PATH comment).
+STOP_FLAG_PATH = Path("data/live/STOP")
+FREEZE_FLAG_PATH = Path("data/live/FREEZE")
+
 # Live-only risk-parameter override, deliberately NOT a change to
 # PortfolioBacktestConfig's own defaults (portfolio_backtest_models.py).
 # Those defaults are hash-locked: run_portfolio_research_baseline_lock.py's
@@ -746,6 +765,7 @@ def run_daily_decision(
     decision_log_directory: Path = DEFAULT_DECISION_LOG_DIRECTORY,
     enable_equity_orders: bool = False,
     enable_crypto_orders: bool = False,
+    freeze: bool = False,
 ) -> dict:
     config = PortfolioBacktestConfig(
         maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
@@ -787,10 +807,15 @@ def run_daily_decision(
         state, bars_today=bars_today, timestamp=timestamp_string,
         portfolio_bar_index=today_index, config=config,
     )
-    _execute_pending_buys_at_open(
-        state, bars_today=bars_today, timestamp=timestamp_string,
-        portfolio_bar_index=today_index, config=config,
-    )
+    # Step 3 (position-opening) is the one step FREEZE suppresses here --
+    # skipping it leaves any previously-queued buy pending rather than
+    # opening it, so no new exposure is taken on while frozen. Steps 1, 2,
+    # and 4 (exits/stops, both above and below) are exit-only and always run.
+    if not freeze:
+        _execute_pending_buys_at_open(
+            state, bars_today=bars_today, timestamp=timestamp_string,
+            portfolio_bar_index=today_index, config=config,
+        )
     _check_intrabar_stops(
         state, bars_today=bars_today, timestamp=timestamp_string,
         portfolio_bar_index=today_index, config=config,
@@ -807,10 +832,14 @@ def run_daily_decision(
         state, bars_today=bars_today, timestamp=timestamp_string,
         portfolio_bar_index=today_index,
     )
-    _queue_ranked_entry_signals(
-        state, data_by_ticker=prepared, local_indices=local_indices,
-        timestamp=timestamp_string, portfolio_bar_index=today_index,
-    )
+    # Step 6 (queuing new entry signals for a future run) is the other
+    # step FREEZE suppresses -- close-based exits above still queue
+    # normally, since those reduce exposure rather than add to it.
+    if not freeze:
+        _queue_ranked_entry_signals(
+            state, data_by_ticker=prepared, local_indices=local_indices,
+            timestamp=timestamp_string, portfolio_bar_index=today_index,
+        )
 
     newly_opened = {
         ticker: position
@@ -850,6 +879,7 @@ def run_daily_decision(
         "cash_balance_usd": round(cash, 2),
         "live_equity_orders_enabled": enable_equity_orders,
         "live_crypto_orders_enabled": enable_crypto_orders,
+        "freeze_active": freeze,
         "note": (
             "executed_today reflects fills at today's actual Open from "
             "signals queued on a previous run. queued_for_next_run "
@@ -1034,12 +1064,34 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
+    if STOP_FLAG_PATH.exists():
+        text = (
+            f"AI-Stock-Radar daily decision runner -- STOP flag detected "
+            f"({STOP_FLAG_PATH}); this run was skipped entirely, no API "
+            f"calls were made. Remove the file to resume."
+        )
+        print(text)
+        _notify_safe(text)
+        return
+
+    freeze = FREEZE_FLAG_PATH.exists()
+    if freeze:
+        text = (
+            f"AI-Stock-Radar daily decision runner -- FREEZE flag detected "
+            f"({FREEZE_FLAG_PATH}); this run will still fetch data and "
+            f"monitor/exit existing positions as usual, but will NOT open "
+            f"any new positions. Remove the file to resume normal entries."
+        )
+        print(text)
+        _notify_safe(text)
+
     try:
         result = run_daily_decision(
             state_path=arguments.state_path,
             decision_log_directory=arguments.decision_log_directory,
             enable_equity_orders=arguments.enable_equity_orders,
             enable_crypto_orders=arguments.enable_crypto_orders,
+            freeze=freeze,
         )
     except Exception as error:
         # Notify, then re-raise unchanged -- the notification step must
