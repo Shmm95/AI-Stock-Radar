@@ -54,7 +54,7 @@
     "src/backtest/run_portfolio_research_baseline_lock.py": "ed4f424084a35b030d0e3e5c756cc013e5758fc37b6edd13990680143416f10d",
     "tests/test_portfolio_backtest.py": "379a1a54e881b9a67ec86a7b5f29bbd10ff4387064c04a801523d623bffb938c",
     "tests/test_portfolio_execution_slippage_stress.py": "6a874129e6c075c2ecdc654c59aa45572e67415b1334e5688df2f70c989e7269",
-    "tests/test_portfolio_research_baseline_lock.py": "425c856c3f4fd902a2b5e9a84d2d73923a9f59b0bcc0bc292dd13e22236a6031"
+    "tests/test_portfolio_research_baseline_lock.py": "588087c0cb008a8fc9f156150119566ab7e2a1dff9c61ce1397899690c9d8b15"
   },
   "execution_stress": {
     "stamp": "20260802_192047",
