@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "registration_name": "AI_STOCK_RADAR_BROADER_UNIVERSE_COHORT_V1",
+  "stage": "BROADER_UNIVERSE_COHORT_REGISTRATION_AND_DATA_AUDIT_ONLY",
+  "baseline_lock": {
+    "lock_id": "RBL_V1_20260802_192047_D93145CB1DCF",
+    "lock_name": "AI_STOCK_RADAR_RESEARCH_BASELINE_V1",
+    "registry_sha256": "7f0ee4b0d0dfbb3546d9c3e23de086717a473ee1262b4339b049279f25463710"
+  },
+  "study": {
+    "study_start": "2016-08-16",
+    "study_end": "2026-08-02",
+    "maximum_days_between_cohorts": 370,
+    "endpoint_tolerance_days": 31,
+    "membership_rebalance": "ANNUAL_POINT_IN_TIME",
+    "selection_rule": "DESCENDING_POINT_IN_TIME_DOLLAR_LIQUIDITY_WITH_TICKER_ASC_TIEBREAK"
+  },
+  "cohort_policy": {
+    "equity": {
+      "asset_type": "equity",
+      "region": "US",
+      "target_count": 150,
+      "minimum_count": 150,
+      "liquidity_measure": "median_daily_dollar_volume_90d",
+      "price_adjustment": "split_dividend_adjusted"
+    },
+    "crypto": {
+      "asset_type": "crypto",
+      "region": "GLOBAL",
+      "target_count": 20,
+      "minimum_count": 2,
+      "liquidity_measure": "median_daily_dollar_volume_90d",
+      "price_adjustment": "raw_spot"
+    }
+  },
+  "source_policy": {
+    "require_point_in_time_source": true,
+    "require_source_snapshot_file": true,
+    "require_source_snapshot_sha256": true,
+    "require_source_as_of_not_after_cohort_date": true,
+    "allow_current_constituent_backfill": false,
+    "allow_controlled_basket_prefilter": false,
+    "allow_post_outcome_selection": false,
+    "inactive_security_policy": "RETAIN_WHEN_POINT_IN_TIME_ELIGIBLE",
+    "ticker_specific_parameters_allowed": false
+  },
+  "data_policy": {
+    "required_columns": [
+      "timestamp",
+      "Open",
+      "High",
+      "Low",
+      "Close",
+      "Volume",
+      "EMA20",
+      "EMA50",
+      "RSI14",
+      "MACD",
+      "RegimeAllowed"
+    ],
+    "minimum_indicator_history_rows_at_selection": 200,
+    "maximum_missing_business_day_fraction_equity": 0.10,
+    "maximum_missing_calendar_day_fraction_crypto": 0.03,
+    "require_unique_sorted_timestamps": true,
+    "require_positive_ohlc": true,
+    "require_nonnegative_volume": true,
+    "require_membership_interval_coverage": true
+  },
+  "output": {
+    "directory": "data/backtests/portfolio/broader_universe_registration",
+    "save_failed_audits": true
+  },
+  "authorization": {
+    "cohort_registration_may_be_authorized": true,
+    "broader_universe_backtest_authorized": false,
+    "baseline_parameter_change_authorized": false,
+    "broader_universe_validated": false,
+    "paper_trading_authorized": false,
+    "production_authorized": false,
+    "broker_access_authorized": false,
+    "automation_authorized": false
+  }
+}
