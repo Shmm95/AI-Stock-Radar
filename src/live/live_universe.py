@@ -68,6 +68,55 @@ easily-missed, profitable signal; the other 6 (CTVA, PSA, UPS, TECH, EG,
 VZ) stay deferred, their poor profit factor (0.32-0.84) confirming the
 original deferral was correct. All 20 confirmed to add no within-batch
 or vs-existing-30 redundancy above the same 0.75 correlation threshold.
+
+Phase 4, stage 3 (50 -> 82) -- APPROVED, universe widening only. The
+fair 79-ticker backtest (VLTO/SNDK/Q excluded, see below) showed the
+wider universe diluting net P&L under the unchanged 6-slot/6.0% cap
+(-5.6% vs stage 2's own 50-ticker result). Raising the cap to 8/8.0%
+alongside this widening was tried and then explicitly abandoned: the
+re-run backtest showed the higher cap made results WORSE, not better
+-- both in isolation on the unchanged 50-ticker universe (-8.0%) and
+combined with the 79-ticker universe (-43.7%), because
+risk_per_trade_percent stayed at 1% while more concurrent positions
+fragmented the same fixed initial_cash, driving a sharp rise in
+ZERO_QUANTITY rejections. scripts/run_daily_decision.py's
+LIVE_MAXIMUM_OPEN_POSITIONS/LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT
+therefore stay at 6/6.0%, deliberately decoupled from this widening --
+the ~5.6% dilution is accepted as-is rather than "fixed" by a change
+that backtest evidence showed makes it worse. Same PF-priority +
+sector-diversity method as stage 2: candidate pool
+is Phase 6's 222 (data/research/sp500_phase6_stage2_pf_candidates_*)
+minus stage 2's own 20 additions (202 remaining), plus two Phase 2b
+small-sample positive win-rate anomalies that stage 2 had left out
+pending separate review -- VLTO (83.3% win rate, 6 trades) and Q
+(55.6%, 9 trades, also flagged SHORT_HISTORY in Phase 1: listed
+2025-11-14, ~9 months of history) -- for 204 total. Same PF >= 1.2
+floor for Utilities, Real Estate, Communication Services, Health Care,
+and Consumer Staples; other sectors ranked by profit factor without
+that floor, same as stage 2. Took the top 3 candidates per GICS sector
+by profit factor -- a natural cutoff given this stage's larger
+candidate pool, not a forced quota -- rejecting any candidate that
+would pair above the same 0.75 correlation threshold with an
+already-live or already-selected-this-batch ticker
+(sp500_phase1a_quality_correlation_report_20260812_204205.json's
+redundant_pairs; zero rejections this batch). Real Estate had only 2
+eligible candidates after the PF floor (AVB, CSGP); both included.
+VLTO and Q are both small-sample results (6 and 9 trades) -- their
+high profit factor (6.965 and 2.591) is a positive signal, not a
+confident estimate. VLTO, SNDK, and Q are all recently-listed and
+short-history (~2.8 years, ~17 months, and ~9 months respectively);
+Q's history in particular means it will truncate any shared-timeline
+aggregate backtest the same way CEG did in stage 2 (confirmed: the
+82-ticker as-is backtest's shared window collapses to 2025-11-14;
+all three must be excluded from that comparison, not from the live
+list itself, to get a fair read -- see the stage-3 backtest report for
+the excluded-vs-included comparison). CVX (Energy, PF 1.094 -- no
+defensive floor applies there) is
+the one pick below the 1.2 threshold used elsewhere; kept per the
+stated non-defensive-sector rule but is this batch's weakest signal.
+All 32 confirmed tradable via a live Alpaca get_all_assets() call, and
+confirmed to add no within-batch or vs-existing-50 redundancy above
+the 0.75 threshold.
 """
 
 from __future__ import annotations
@@ -128,4 +177,38 @@ LIVE_CONTROLLED_TICKERS: tuple[str, ...] = (
     "WELL",  # Real Estate -- healthcare REIT (PF 1.663)
     "CEG",   # Utilities -- nuclear/power generation (PF 2.073)
     "SRE",   # Utilities -- added back per the Phase 5 finding above (PF 1.398)
+    # Phase 4, stage 3 (50 -> 82) -- see module docstring: universe widening
+    # only, cap/risk% stays 6/6.0% (raising it was tried and abandoned).
+    "CMCSA",  # Communication Services -- cable & satellite (PF 1.697)
+    "TTWO",   # Communication Services -- interactive entertainment (PF 1.518)
+    "TMUS",   # Communication Services -- wireless carrier (PF 1.513)
+    "DPZ",    # Consumer Discretionary -- restaurants (PF 1.888)
+    "CMG",    # Consumer Discretionary -- restaurants (PF 1.711)
+    "HD",     # Consumer Discretionary -- home improvement retail (PF 1.646)
+    "ADM",    # Consumer Staples -- agricultural products (PF 1.602)
+    "KO",     # Consumer Staples -- soft drinks (PF 1.466)
+    "CHD",    # Consumer Staples -- household products (PF 1.460)
+    "VLO",    # Energy -- refining/marketing (PF 1.582)
+    "OKE",    # Energy -- gas storage/transportation (PF 1.491)
+    "CVX",    # Energy -- integrated major (PF 1.094 -- weakest pick this batch, no defensive floor applies)
+    "MSCI",   # Financials -- financial data/exchange (PF 2.005)
+    "CME",    # Financials -- financial exchange (PF 1.982)
+    "ALL",    # Financials -- property & casualty insurance (PF 1.898)
+    "WST",    # Health Care -- health care supplies (PF 2.234)
+    "HCA",    # Health Care -- hospital operator (PF 2.006)
+    "REGN",   # Health Care -- biotechnology (PF 1.930)
+    "VLTO",   # Industrials -- environmental/facilities services (PF 6.965 -- small sample, 6 trades)
+    "CTAS",   # Industrials -- diversified support services (PF 2.872)
+    "BR",     # Industrials -- data processing/outsourcing (PF 2.783)
+    "SNDK",   # Information Technology -- storage hardware (PF 5.684 -- also short-history: listed 2025-03, ~17 months)
+    "Q",      # Information Technology -- semiconductor materials (PF 2.591 -- small sample, 9 trades, SHORT_HISTORY)
+    "TER",    # Information Technology -- semiconductor equipment (PF 2.325)
+    "AVY",    # Materials -- paper/plastic packaging (PF 1.495)
+    "BALL",   # Materials -- metal/glass/plastic containers (PF 1.438)
+    "LIN",    # Materials -- industrial gases (PF 1.420)
+    "AVB",    # Real Estate -- multi-family residential REIT (PF 1.337)
+    "CSGP",   # Real Estate -- real estate data/services (PF 1.302)
+    "FE",     # Utilities -- electric utility (PF 1.987)
+    "AES",    # Utilities -- independent power producer (PF 1.744)
+    "NEE",    # Utilities -- multi-utility (PF 1.568)
 )
