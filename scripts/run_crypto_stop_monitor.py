@@ -43,7 +43,12 @@ from src.live.crypto_stop_monitor import (
     _monitor_lock,
     check_and_execute_crypto_stops,
 )
-from src.live.position_state import DEFAULT_STATE_PATH, load_position_state, save_position_state
+from src.live.position_state import (
+    DEFAULT_STATE_PATH,
+    RollbackDetectedError,
+    load_position_state,
+    save_position_state,
+)
 from src.notify.telegram_notifier import send_telegram_message
 
 _NOTIFY_WORTHY_ACTIONS = {"SELL", "NEEDS_REVIEW"}
@@ -104,6 +109,11 @@ def main() -> int:
     except MonitorAlreadyRunningError as error:
         print(f"SKIPPED: {error}")
         return 0
+    except RollbackDetectedError as error:
+        text = f"AI-Stock-Radar crypto stop monitor -- {error}"
+        print(text, file=sys.stderr)
+        _notify_safe(text)
+        raise
 
     print(json.dumps({"check_id": check_id, "actions": actions}, indent=2, sort_keys=True, default=str))
 

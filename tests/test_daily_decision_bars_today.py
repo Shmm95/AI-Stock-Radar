@@ -138,6 +138,13 @@ def test_run_daily_decision_end_to_end_does_not_crash_on_weekend_dates(
     result = runner.run_daily_decision(
         state_path=tmp_path / "position_state.json",
         decision_log_directory=tmp_path / "decisions",
+        # Isolate the rollback high-water-mark to this test's own tmp_path --
+        # the real default lives outside the repo (see position_state.py)
+        # specifically so it is NOT test-isolated by tmp_path alone; a
+        # synthetic run here must not read or write the real, machine-wide
+        # guard file (confirmed the hard way: it collided with state left
+        # behind by an earlier, unrelated test run in the same session).
+        guard_path=tmp_path / "high_water_mark.json",
     )
 
     decision = result["decision"]

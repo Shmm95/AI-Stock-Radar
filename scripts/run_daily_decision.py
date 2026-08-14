@@ -79,9 +79,21 @@ the order-type rationale):
   a `needs_manual_review` entry if it does not show as filled.
 - Idempotency: every real submission is recorded in
   `runner_state.submitted_actions`, keyed by
-  `f"{ticker}|{kind}|{portfolio_bar_index}"`, and checked before any
-  new submission — re-running this script for the same bar re-checks
-  status instead of re-submitting.
+  `f"{ticker}|{kind}|{date}"` -- the real calendar date (equity's own
+  for equity checkpoints, crypto's own for crypto checkpoints; the two
+  can differ, see `_bars_today_by_asset_class`) rather than
+  `portfolio_bar_index`. Checked before any new submission, so
+  re-running this script for the same day re-checks status instead of
+  re-submitting. Deliberately NOT keyed by `portfolio_bar_index`: a
+  real incident showed that counter can jump backward (`data/live/`
+  overwritten by a stale rsync copy), which would let a genuinely new
+  action collide with a stale ledger entry from before the rollback and
+  get silently skipped -- confirmed via a real-code-path stress test,
+  not theoretical. A calendar date cannot recur the way an integer
+  counter can, so this key format cannot collide the same way. See
+  `src/live/position_state.py`'s `RollbackDetectedError` for the
+  primary defense (refuses to run at all on a detected rollback); this
+  key format is the structural backstop for the same risk.
 - Known limitation, accepted rather than solved with a heavier
   two-phase-commit design: a newly opened position is recorded in
   local state as soon as the engine decides to open it, without
@@ -167,9 +179,11 @@ from src.live.account_state import get_live_cash_balance
 from src.live.crypto_stop_monitor import DEFAULT_LOCK_PATH, _query_available_crypto_quantity
 from src.live.data_preparer import prepare_live_market_data
 from src.live.live_universe import LIVE_CONTROLLED_TICKERS
+import src.live.position_state as ps
 from src.live.position_state import (
     DEFAULT_STATE_PATH,
     LiveRunnerState,
+    RollbackDetectedError,
     load_position_state,
     save_position_state,
 )
@@ -384,18 +398,29 @@ def _execute_equity_orders(
     client: TradingClient,
     *,
     runner_state: LiveRunnerState,
-    today_index: int,
+    equity_date: str,
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
 ) -> tuple[list[dict], list[dict]]:
-    """Submit real equity orders for today's decisions. Never called for crypto."""
+    """Submit real equity orders for today's decisions. Never called for crypto.
+
+    Idempotency keys use `equity_date` (the real calendar date), not
+    `portfolio_bar_index` -- a bar-index rollback (e.g. data/live/
+    overwritten by a stale rsync copy) cannot make a real calendar date
+    recur, so a genuinely new action can never collide with a stale
+    ledger entry from before the rollback. The high-water-mark guard in
+    position_state.py is the primary defense (refuses to run at all);
+    this is the structural, defense-in-depth backstop for the same risk
+    -- see the incident this was verified against in the accompanying
+    report, not this module's docstring alone.
+    """
     actions: list[dict] = []
     needs_review: list[dict] = []
 
     for ticker, position in newly_opened.items():
         if position.asset_class != "EQUITY":
             continue
-        action_key = f"{ticker}|ENTRY_MARKET_BUY|{today_index}"
+        action_key = f"{ticker}|ENTRY_MARKET_BUY|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
             order = order_submission.submit_equity_market_order(
@@ -414,7 +439,7 @@ def _execute_equity_orders(
         actions.append({"ticker": ticker, "action": "BUY", **record})
 
         if record["status"] == "filled" and ticker not in runner_state.equity_stop_orders:
-            stop_key = f"{ticker}|PROTECTIVE_STOP|{today_index}"
+            stop_key = f"{ticker}|PROTECTIVE_STOP|{equity_date}"
             stop_record = runner_state.submitted_actions.get(stop_key)
             if stop_record is None:
                 stop_order = order_submission.submit_equity_stop_sell(
@@ -488,7 +513,7 @@ def _execute_equity_orders(
         # normal case for any signal-based exit.
         stop_order_id = runner_state.equity_stop_orders.get(trade.ticker)
         if stop_order_id is not None:
-            cancel_key = f"{trade.ticker}|CANCEL_STOP|{today_index}"
+            cancel_key = f"{trade.ticker}|CANCEL_STOP|{equity_date}"
             cancel_record = runner_state.submitted_actions.get(cancel_key)
             if cancel_record is None:
                 cancel_status = order_submission.cancel_order_and_confirm(client, stop_order_id)
@@ -542,7 +567,7 @@ def _execute_equity_orders(
                 continue
             runner_state.equity_stop_orders.pop(trade.ticker, None)
 
-        action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{today_index}"
+        action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
             order = order_submission.submit_equity_market_order(
@@ -605,7 +630,7 @@ def _execute_crypto_orders(
     client: TradingClient,
     *,
     runner_state: LiveRunnerState,
-    today_index: int,
+    crypto_date: str,
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
 ) -> tuple[list[dict], list[dict]]:
@@ -614,6 +639,11 @@ def _execute_crypto_orders(
     No protective-stop step (unlike equity): crypto has no native stop
     order. Real-time protection is `crypto_stop_monitor.py`, reading
     `stop_loss_price` from this same persisted state.
+
+    Idempotency keys use `crypto_date` (crypto's own real calendar date,
+    which can differ from `equity_date` -- crypto trades 24/7) rather
+    than `portfolio_bar_index` -- see `_execute_equity_orders`'s
+    docstring for why.
     """
     actions: list[dict] = []
     needs_review: list[dict] = []
@@ -655,7 +685,7 @@ def _execute_crypto_orders(
     try:
         for ticker, position in crypto_entries.items():
             alpaca_symbol = ticker.replace("-", "/")
-            action_key = f"{ticker}|ENTRY_MARKET_BUY|{today_index}"
+            action_key = f"{ticker}|ENTRY_MARKET_BUY|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
                 order = order_submission.submit_equity_market_order(
@@ -707,7 +737,7 @@ def _execute_crypto_orders(
                 continue
 
             alpaca_symbol = trade.ticker.replace("-", "/")
-            action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{today_index}"
+            action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
                 available_quantity = _query_available_crypto_quantity(client, alpaca_symbol)
@@ -766,14 +796,19 @@ def run_daily_decision(
     enable_equity_orders: bool = False,
     enable_crypto_orders: bool = False,
     freeze: bool = False,
+    guard_path: Path = ps.HIGH_WATER_MARK_PATH,
 ) -> dict:
+    """`guard_path` overrides the rollback high-water-mark file's location;
+    defaults to the real, out-of-repo path. Only override in tests -- see
+    `load_position_state`'s docstring for why a tmp_path-only test must
+    not touch the real, machine-wide guard file."""
     config = PortfolioBacktestConfig(
         maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
         maximum_total_open_risk_percent=LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT,
     )
     config.validate()
 
-    runner_state = load_position_state(state_path)
+    runner_state = load_position_state(state_path, guard_path=guard_path)
     positions_before = dict(runner_state.positions)
     pending_buys_before = dict(runner_state.pending_buys)
     pending_exits_before = dict(runner_state.pending_exits)
@@ -852,7 +887,7 @@ def run_daily_decision(
         equity_order_actions, more_review = _execute_equity_orders(
             trading_client,
             runner_state=runner_state,
-            today_index=today_index,
+            equity_date=equity_date,
             newly_opened=newly_opened,
             closed_trades=state.trades,
         )
@@ -863,7 +898,7 @@ def run_daily_decision(
         crypto_order_actions, more_review = _execute_crypto_orders(
             trading_client,
             runner_state=runner_state,
-            today_index=today_index,
+            crypto_date=crypto_date,
             newly_opened=newly_opened,
             closed_trades=state.trades,
         )
@@ -969,7 +1004,7 @@ def run_daily_decision(
         equity_stop_orders=runner_state.equity_stop_orders,
         submitted_actions=runner_state.submitted_actions,
     )
-    save_position_state(new_runner_state, state_path)
+    save_position_state(new_runner_state, state_path, guard_path=guard_path)
 
     return {"decision": decision, "log_path": log_path}
 
