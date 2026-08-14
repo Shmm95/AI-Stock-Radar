@@ -44,7 +44,7 @@
     "stock_trailing_close_percent": 7.5
   },
   "approved_project_files": {
-    "docs/BASELINE.md": "60479fd107a0a67d219310d28879b849d4d7588bc349ec7f837b0cf729750389",
+    "docs/BASELINE.md": "f226e2b9f892d6509b70ff4ea8f48f535a7fd1635102b3b297f37c51d6d0247d",
     "docs/EXECUTION_SLIPPAGE_STRESS_V1_SPEC.md": "349f498f7026fc0ccadb09f9c93fb236cb549f8d0c96ecdd889d05720e10718c",
     "docs/RESEARCH_BASELINE_LOCK_V1_SPEC.md": "b76376862c53ac73edd631af171ebb2a4edb7e8362e87cb4623aeaf4f5f17de2",
     "src/backtest/portfolio_backtest_engine.py": "851e864f1c753c82d9c0e8eb0eccc315dab690f5f1360ac0a32f5840d727694f",
