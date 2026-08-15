@@ -41,11 +41,26 @@ def fake_order(
 
 
 class FakeClient:
-    def __init__(self, orders: list):
+    def __init__(self, orders: list, positions: list | None = None):
         self._orders = orders
+        self._positions = positions or []
 
     def get_orders(self, filter=None):
         return list(self._orders)
+
+    def get_all_positions(self):
+        return list(self._positions)
+
+
+def fake_position(
+    *, symbol: str, quantity: float, entry_price: float, asset_class: str = "crypto"
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        symbol=symbol,
+        qty=quantity,
+        avg_entry_price=entry_price,
+        asset_class=asset_class,
+    )
 
 
 def test_fetch_filled_orders_excludes_non_filled_and_zero_quantity():
@@ -108,6 +123,57 @@ def test_partial_sell_closes_part_of_a_lot_and_leaves_the_rest_open():
     assert closed[0].pnl == pytest.approx((65000.0 - 60000.0) * 0.4)
     assert len(open_lots) == 1
     assert open_lots[0].quantity == pytest.approx(0.6)
+
+
+def test_crypto_in_kind_fee_dust_is_removed_when_broker_is_flat():
+    orders = [
+        fake_order(
+            symbol="BTC/USD", side="buy", quantity=0.001, price=60000.0,
+            filled_at="2026-01-01T00:00:00", asset_class="crypto",
+        ),
+        fake_order(
+            symbol="BTC/USD", side="sell", quantity=0.000999, price=61000.0,
+            filled_at="2026-01-02T00:00:00", asset_class="crypto",
+        ),
+    ]
+
+    _, fifo_open_lots = report.reconstruct_round_trips(orders)
+    reconciled, details = report.reconcile_crypto_open_lots(fifo_open_lots, [])
+
+    assert sum(lot.quantity for lot in fifo_open_lots) == pytest.approx(0.000001)
+    assert reconciled == []
+    assert len(details) == 1
+    assert details[0].fifo_quantity == pytest.approx(0.000001)
+    assert details[0].broker_quantity == 0.0
+    assert "in-kind fee dust" in details[0].resolution
+
+
+def test_crypto_open_quantity_and_entry_price_use_broker_ground_truth():
+    fifo_open_lots = [report.OpenLot("BTC/USD", "crypto", 0.6, 60000.0, "t1")]
+    broker_positions = [
+        fake_position(symbol="BTCUSD", quantity=0.599, entry_price=60010.0)
+    ]
+
+    reconciled, details = report.reconcile_crypto_open_lots(
+        fifo_open_lots, broker_positions
+    )
+
+    assert len(reconciled) == 1
+    assert reconciled[0].symbol == "BTC/USD"
+    assert reconciled[0].quantity == pytest.approx(0.599)
+    assert reconciled[0].entry_price == pytest.approx(60010.0)
+    assert details[0].fifo_quantity == pytest.approx(0.6)
+    assert details[0].broker_quantity == pytest.approx(0.599)
+    assert "broker quantity used" in details[0].resolution
+
+
+def test_equity_open_lots_are_unchanged_by_crypto_reconciliation():
+    equity_lot = report.OpenLot("AAPL", "us_equity", 2.0, 100.0, "t1")
+
+    reconciled, details = report.reconcile_crypto_open_lots([equity_lot], [])
+
+    assert reconciled == [equity_lot]
+    assert details == []
 
 
 def test_symbols_are_matched_independently():
@@ -202,7 +268,35 @@ def test_build_report_text_with_no_data_is_graceful():
     )
 
     assert "No filled orders found yet" in text
+    assert "None (0 open positions)" in text
     assert "No needs_manual_review entries" in text
+
+
+def test_build_report_text_explains_removed_crypto_dust():
+    reconciliation = [
+        report.CryptoOpenLotReconciliation(
+            symbol="BTC/USD",
+            fifo_quantity=0.000779697,
+            broker_quantity=0.0,
+            resolution=(
+                "removed FIFO-only residual; broker reports no position "
+                "(consistent with in-kind fee dust)"
+            ),
+        )
+    ]
+
+    text = report.build_report_text(
+        closed_trades=[],
+        open_lots=[],
+        metrics={},
+        review_entries=[],
+        generated_at="2026-08-15",
+        crypto_reconciliation=reconciliation,
+    )
+
+    assert "FIFO qty 0.000779697" in text
+    assert "broker qty 0" in text
+    assert "in-kind fee dust" in text
 
 
 def test_build_report_text_includes_trades_open_lots_and_review():

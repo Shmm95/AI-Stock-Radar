@@ -1,11 +1,11 @@
 """Read-only Alpaca paper-account performance report.
 
-Reads REAL order history from Alpaca -- never submits, modifies, or
-cancels anything. `src/live/order_submission.py`, `run_daily_decision.py`,
-and `crypto_stop_monitor.py` are never imported here; this script only
-calls `TradingClient.get_orders` (a read-only endpoint) via
-`order_submission.get_trading_client()` for the paper-only client
-builder.
+Reads REAL order history and current positions from Alpaca -- never
+submits, modifies, or cancels anything. `run_daily_decision.py` and
+`crypto_stop_monitor.py` are never imported here; the paper-only client
+builder comes from `order_submission.get_trading_client()`, then this
+script only calls its read-only `get_orders` / `get_all_positions`
+endpoints.
 
 Round-trip reconstruction: this system is long-only (no shorts), so a
 SELL always closes a previously-opened BUY, never opens a new short
@@ -16,11 +16,15 @@ fully consumed by a later SELL) is a still-open position -- reported
 separately, with no P&L (there is nothing to compare its entry price
 against yet).
 
-P&L is computed directly from Alpaca's own recorded `filled_qty` /
-`filled_avg_price` on both sides of a matched pair -- not from local
-bookkeeping (`position_state.json`), which is exactly why this avoids
-the fee-in-kind quantity drift found in earlier crypto work: Alpaca's
-own fill records are already ground truth, nothing to reconcile.
+Closed-trade P&L is computed directly from Alpaca's recorded `filled_qty`
+/ `filled_avg_price` on both sides of a matched pair -- not from local
+bookkeeping (`position_state.json`). Crypto open lots need one additional
+read-only reconciliation: Alpaca reports a BUY's gross `filled_qty`, but
+can deduct its fee in-kind before crediting the position. A later SELL
+therefore consumes the smaller net quantity and pure order-history FIFO
+can leave a fictional residual. Equity FIFO lots remain untouched; crypto
+open quantities are cross-checked against `get_all_positions()`, whose
+quantity is the broker's current ground truth.
 
 Operational health: scans `data/live/decisions/*.json` (the daily
 runner's own decision logs) for any `needs_manual_review` entries and
@@ -90,6 +94,14 @@ class OpenLot:
     quantity: float
     entry_price: float
     entry_time: str
+
+
+@dataclass(slots=True)
+class CryptoOpenLotReconciliation:
+    symbol: str
+    fifo_quantity: float
+    broker_quantity: float
+    resolution: str
 
 
 def _is_heartbeat_order(order: Any) -> bool:
@@ -202,6 +214,129 @@ def reconstruct_round_trips(orders: list[Any]) -> tuple[list[ClosedTrade], list[
     return closed_trades, open_lots
 
 
+def fetch_open_positions(client: TradingClient) -> list[Any]:
+    """Return Alpaca's current broker positions via a read-only endpoint."""
+    return list(client.get_all_positions())
+
+
+def _is_crypto_asset_class(value: Any) -> bool:
+    return _enum_value(value).lower() == "crypto"
+
+
+def _normalized_symbol(symbol: str) -> str:
+    """Match BTC/USD, BTC-USD, and BTCUSD without ticker-specific rules."""
+    return "".join(character for character in symbol.upper() if character.isalnum())
+
+
+def _fifo_weighted_entry_price(lots: list[OpenLot]) -> float:
+    total_quantity = sum(lot.quantity for lot in lots)
+    if total_quantity <= _QUANTITY_EPSILON:
+        return 0.0
+    return sum(lot.entry_price * lot.quantity for lot in lots) / total_quantity
+
+
+def reconcile_crypto_open_lots(
+    open_lots: list[OpenLot], broker_positions: list[Any]
+) -> tuple[list[OpenLot], list[CryptoOpenLotReconciliation]]:
+    """Use broker positions as ground truth for crypto open quantities.
+
+    The FIFO result remains the sole source for equity open lots. Crypto
+    lots are grouped by normalized symbol and compared with the current
+    broker position. A FIFO-only residual is removed when Alpaca reports
+    no position; a real broker position with a different quantity replaces
+    the FIFO quantity with one broker-backed aggregate OpenLot.
+    """
+    equity_lots = [lot for lot in open_lots if not _is_crypto_asset_class(lot.asset_class)]
+    fifo_crypto: dict[str, list[OpenLot]] = {}
+    for lot in open_lots:
+        if _is_crypto_asset_class(lot.asset_class):
+            fifo_crypto.setdefault(_normalized_symbol(lot.symbol), []).append(lot)
+
+    broker_crypto = {
+        _normalized_symbol(str(position.symbol)): position
+        for position in broker_positions
+        if _is_crypto_asset_class(position.asset_class)
+    }
+
+    reconciled_crypto: list[OpenLot] = []
+    reconciliation: list[CryptoOpenLotReconciliation] = []
+    for normalized_symbol in sorted(set(fifo_crypto) | set(broker_crypto)):
+        fifo_lots = fifo_crypto.get(normalized_symbol, [])
+        broker_position = broker_crypto.get(normalized_symbol)
+        fifo_quantity = sum(lot.quantity for lot in fifo_lots)
+        broker_quantity = (
+            float(broker_position.qty) if broker_position is not None else 0.0
+        )
+        display_symbol = (
+            fifo_lots[0].symbol
+            if fifo_lots
+            else str(broker_position.symbol)
+        )
+
+        if broker_quantity <= _QUANTITY_EPSILON:
+            if fifo_quantity > _QUANTITY_EPSILON:
+                reconciliation.append(
+                    CryptoOpenLotReconciliation(
+                        symbol=display_symbol,
+                        fifo_quantity=fifo_quantity,
+                        broker_quantity=0.0,
+                        resolution=(
+                            "removed FIFO-only residual; broker reports no position "
+                            "(consistent with in-kind fee dust)"
+                        ),
+                    )
+                )
+            continue
+
+        if abs(fifo_quantity - broker_quantity) <= _QUANTITY_EPSILON and fifo_lots:
+            reconciled_crypto.extend(fifo_lots)
+            reconciliation.append(
+                CryptoOpenLotReconciliation(
+                    symbol=display_symbol,
+                    fifo_quantity=fifo_quantity,
+                    broker_quantity=broker_quantity,
+                    resolution="confirmed; FIFO and broker quantities agree",
+                )
+            )
+            continue
+
+        broker_entry_price = getattr(broker_position, "avg_entry_price", None)
+        entry_price = (
+            float(broker_entry_price)
+            if broker_entry_price is not None
+            else _fifo_weighted_entry_price(fifo_lots)
+        )
+        entry_time = (
+            min(lot.entry_time for lot in fifo_lots)
+            if fifo_lots
+            else "broker position; entry time unavailable from order window"
+        )
+        reconciled_crypto.append(
+            OpenLot(
+                symbol=display_symbol,
+                asset_class=_enum_value(broker_position.asset_class),
+                quantity=broker_quantity,
+                entry_price=entry_price,
+                entry_time=entry_time,
+            )
+        )
+        resolution = (
+            "broker quantity used because FIFO quantity differed"
+            if fifo_lots
+            else "broker position added; absent from fetched order-history window"
+        )
+        reconciliation.append(
+            CryptoOpenLotReconciliation(
+                symbol=display_symbol,
+                fifo_quantity=fifo_quantity,
+                broker_quantity=broker_quantity,
+                resolution=resolution,
+            )
+        )
+
+    return equity_lots + reconciled_crypto, reconciliation
+
+
 def compute_metrics(closed_trades: list[ClosedTrade]) -> dict[str, dict[str, Any]]:
     by_asset_class: dict[str, list[ClosedTrade]] = {}
     for trade in closed_trades:
@@ -251,6 +386,7 @@ def build_report_text(
     review_entries: list[dict[str, Any]],
     generated_at: str,
     heartbeat_fill_count: int = 0,
+    crypto_reconciliation: list[CryptoOpenLotReconciliation] | None = None,
 ) -> str:
     lines = [f"# AI-Stock-Radar Performance Report — {generated_at}", ""]
 
@@ -280,14 +416,27 @@ def build_report_text(
                 )
             lines.append("")
 
-        if open_lots:
-            lines.append("## Still-open positions (P&L not computed)")
-            for lot in open_lots:
-                lines.append(
-                    f"- {lot.symbol}: qty {lot.quantity:g} @ entry {lot.entry_price:g} "
-                    f"({lot.entry_time})"
-                )
-            lines.append("")
+    lines.append("## Still-open positions (P&L not computed; crypto broker-verified)")
+    if open_lots:
+        for lot in open_lots:
+            lines.append(
+                f"- {lot.symbol}: qty {lot.quantity:g} @ entry {lot.entry_price:g} "
+                f"({lot.entry_time})"
+            )
+    else:
+        lines.append("- None (0 open positions).")
+    lines.append("")
+
+    lines.append("## Crypto open-position reconciliation")
+    if crypto_reconciliation:
+        for item in crypto_reconciliation:
+            lines.append(
+                f"- {item.symbol}: FIFO qty {item.fifo_quantity:g}, "
+                f"broker qty {item.broker_quantity:g} — {item.resolution}."
+            )
+    else:
+        lines.append("- No crypto FIFO/broker discrepancy found.")
+    lines.append("")
 
     lines.append(
         f"Pipeline test: {heartbeat_fill_count} heartbeat round-trip fill(s) recorded "
@@ -323,7 +472,11 @@ def main() -> int:
     client = order_submission.get_trading_client()
     orders = fetch_filled_orders(client)
     heartbeat_fill_count = count_heartbeat_fills(client)
-    closed_trades, open_lots = reconstruct_round_trips(orders)
+    broker_positions = fetch_open_positions(client)
+    closed_trades, fifo_open_lots = reconstruct_round_trips(orders)
+    open_lots, crypto_reconciliation = reconcile_crypto_open_lots(
+        fifo_open_lots, broker_positions
+    )
     metrics = compute_metrics(closed_trades)
     review_entries = scan_needs_manual_review(arguments.decision_log_directory)
 
@@ -334,6 +487,7 @@ def main() -> int:
         review_entries=review_entries,
         generated_at=datetime.now(UTC).isoformat(),
         heartbeat_fill_count=heartbeat_fill_count,
+        crypto_reconciliation=crypto_reconciliation,
     )
     print(report_text)
 

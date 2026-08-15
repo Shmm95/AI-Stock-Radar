@@ -96,6 +96,7 @@ def test_main_warns_on_stderr_when_notification_cannot_be_confirmed(
     monkeypatch.setattr(spr.order_submission, "get_trading_client", lambda: object())
     monkeypatch.setattr(spr, "fetch_filled_orders", lambda client: [])
     monkeypatch.setattr(spr, "count_heartbeat_fills", lambda client: 0)
+    monkeypatch.setattr(spr, "fetch_open_positions", lambda client: [])
     monkeypatch.setattr(spr, "reconstruct_round_trips", lambda orders: ([], []))
     monkeypatch.setattr(spr, "send_telegram_message", lambda text: False)
 
@@ -113,6 +114,7 @@ def test_main_sends_successfully_with_zero_fills(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(spr.order_submission, "get_trading_client", lambda: object())
     monkeypatch.setattr(spr, "fetch_filled_orders", lambda client: [])
     monkeypatch.setattr(spr, "count_heartbeat_fills", lambda client: 0)
+    monkeypatch.setattr(spr, "fetch_open_positions", lambda client: [])
     monkeypatch.setattr(spr, "reconstruct_round_trips", lambda orders: ([], []))
     monkeypatch.setattr(spr, "send_telegram_message", lambda text: sent.append(text) or True)
 
@@ -120,3 +122,22 @@ def test_main_sends_successfully_with_zero_fills(monkeypatch: pytest.MonkeyPatch
 
     assert len(sent) == 1
     assert "Henüz gerçekleşen işlem yok." in sent[0]
+
+
+def test_main_uses_broker_reconciled_crypto_open_lots(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    sent = []
+    fifo_dust = [OpenLot("BTC/USD", "crypto", 0.000001, 60000.0, "t1")]
+    monkeypatch.setattr(spr.order_submission, "get_trading_client", lambda: object())
+    monkeypatch.setattr(spr, "fetch_filled_orders", lambda client: [])
+    monkeypatch.setattr(spr, "count_heartbeat_fills", lambda client: 0)
+    monkeypatch.setattr(spr, "fetch_open_positions", lambda client: [])
+    monkeypatch.setattr(spr, "reconstruct_round_trips", lambda orders: ([], fifo_dust))
+    monkeypatch.setattr(spr, "send_telegram_message", lambda text: sent.append(text) or True)
+
+    spr.main()
+
+    assert len(sent) == 1
+    assert "Henüz gerçekleşen işlem yok." in sent[0]
+    assert "Açık pozisyon" not in sent[0]

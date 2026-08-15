@@ -16,10 +16,9 @@ NOT run_daily_decision.py:
   preserves that separation instead of bolting reporting onto the decision
   script.
 
-This script does NOT change generate_performance_report.py's own
-calculation logic -- it imports and calls its existing, already-reliable
-functions (fetch_filled_orders, reconstruct_round_trips, compute_metrics)
-and only adds a short-message Telegram rendering on top.
+This script does not duplicate generate_performance_report.py's calculation
+logic. It imports its order-history FIFO and crypto broker-reconciliation
+functions, then only adds a short-message Telegram rendering on top.
 
 Recommended cron line (NOT added automatically -- a separate, manual
 deploy step):
@@ -41,6 +40,8 @@ from generate_performance_report import (
     compute_metrics,
     count_heartbeat_fills,
     fetch_filled_orders,
+    fetch_open_positions,
+    reconcile_crypto_open_lots,
     reconstruct_round_trips,
 )
 from src.live import order_submission
@@ -115,7 +116,9 @@ def main() -> None:
         client = order_submission.get_trading_client()
         orders = fetch_filled_orders(client)
         heartbeat_fill_count = count_heartbeat_fills(client)
-        closed_trades, open_lots = reconstruct_round_trips(orders)
+        broker_positions = fetch_open_positions(client)
+        closed_trades, fifo_open_lots = reconstruct_round_trips(orders)
+        open_lots, _ = reconcile_crypto_open_lots(fifo_open_lots, broker_positions)
         text = build_summary_text(closed_trades, open_lots, heartbeat_fill_count=heartbeat_fill_count)
     except Exception as error:
         # Mirrors run_daily_decision.py's main(): never let a failure here
