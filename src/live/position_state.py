@@ -86,15 +86,36 @@ resetting it after a *deliberate* state reset requires deleting it by
 hand at that out-of-repo path -- documented in
 `docs/EMERGENCY_STOP_RUNBOOK.md`.
 
-Write discipline: under a dedicated lock file (same `O_CREAT|O_EXCL`
-primitive as `crypto_stop_monitor.py`'s), written to a temp file in the
-same directory, `fsync`'d, then `os.replace`'d into place, with the
-containing directory itself also `fsync`'d -- so a crash mid-write
-cannot leave a half-written or missing file, and the rename is durable
-against a crash immediately after. A read that finds the file present
-but corrupt (bad JSON, missing key) raises `GuardFileCorruptedError`
-rather than silently treating it as absent (which would reset the
-high-water mark to a permissive 0) -- fail-closed, per the same review.
+Write discipline: the high-water-mark file is written under a dedicated
+lock file (same `O_CREAT|O_EXCL` primitive as `crypto_stop_monitor.py`'s)
+to a temp file in the same directory, `fsync`'d, then `os.replace`'d
+into place, with the containing directory itself also `fsync`'d -- so a
+crash mid-write cannot leave a half-written or missing file, and the
+rename is durable against a crash immediately after
+(`_atomic_write_text`). A read that finds the file present but corrupt
+(bad JSON, missing key) raises `GuardFileCorruptedError` rather than
+silently treating it as absent (which would reset the high-water mark
+to a permissive 0) -- fail-closed, per the same review.
+
+`save_position_state` writes `position_state.json` with that same
+`_atomic_write_text` helper (added 2026-08-15, after a real-crash
+resilience test found the state file had no such protection -- a plain
+`Path.write_text`, unlike the guard file's already-atomic write). A
+crash mid-write of the real ledger is at least as consequential as one
+mid-write of the high-water mark, so it gets the identical guarantee.
+Not lock-protected the way the guard file is -- see `save_position_state`'s
+own docstring for why that's a deliberately separate, not-yet-addressed
+question from the crash/corruption one this fixes.
+
+Guard-lock self-healing (added the same day, after a real-SIGKILL test
+found a process killed while holding `_guard_write_lock` left it stale
+forever, permanently blocking every later write with
+`GuardLockTimeoutError` until a human deleted the lock file by hand):
+the lock file's content now records the acquiring process's PID and
+acquisition time, and a later contender breaks (unlinks) a lock it
+finds either older than `_GUARD_LOCK_MAX_AGE_SECONDS` or held by a PID
+that is no longer alive. See `_guard_write_lock`'s own docstring for
+the race-condition reasoning.
 """
 
 from __future__ import annotations
@@ -137,27 +158,116 @@ class GuardFileCorruptedError(RuntimeError):
 
 class GuardLockTimeoutError(RuntimeError):
     """Raised when the guard file's write lock could not be acquired
-    after all retries -- refuses to write rather than risk a
-    concurrent, interleaved write from two processes."""
+    after all retries by a lock that is neither stale-by-age nor held by
+    a dead process -- refuses to write rather than risk a concurrent,
+    interleaved write from two live processes."""
+
+
+# A lock older than this is judged abandoned rather than genuinely still
+# in progress -- see _lock_is_stale. Deliberately far longer than any
+# real save this module performs (a JSON write + fsync), same spirit as
+# order_submission.py's own generously-sized poll windows: the cost of
+# waiting a little longer on a real, live holder is trivial next to the
+# cost of a false "abandoned" verdict that lets two processes believe
+# they both hold the lock.
+_GUARD_LOCK_MAX_AGE_SECONDS = 300.0
+
+
+def _lock_is_stale(lock_path: Path) -> bool:
+    """A lock is judged stale (safe to break) if EITHER its recorded PID
+    no longer refers to a live process, OR it was acquired more than
+    _GUARD_LOCK_MAX_AGE_SECONDS ago -- whichever signal is available.
+    An unparseable lock file (e.g. a leftover from before this
+    PID+timestamp format existed) is also treated as stale rather than
+    blocking forever on a file this code cannot even interpret.
+
+    Neither check is airtight alone -- PID reuse could in principle
+    defeat the liveness check, and a genuinely slow holder just under
+    the age ceiling would still be waited out -- but requiring both a
+    live PID AND a recent timestamp to call a lock "not stale" is a
+    reasonable, deliberately generous bar: a real holder's process was
+    just observed to exist AND started recently, which a five-minute-old
+    abandoned lock file from a killed process cannot satisfy.
+    """
+    try:
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        pid = int(payload["pid"])
+        acquired_at = float(payload["acquired_at"])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return True
+
+    if time.time() - acquired_at > _GUARD_LOCK_MAX_AGE_SECONDS:
+        return True
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True  # no such process -- the holder is dead
+    except PermissionError:
+        pass  # process exists, just not signalable by us -- still alive
+    return False
+
+
+def _try_create_lock_file(lock_path: Path) -> int | None:
+    try:
+        return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
 
 
 @contextmanager
 def _guard_write_lock(lock_path: Path = _GUARD_LOCK_PATH) -> Iterator[None]:
+    """Mutual-exclusion lock for guard-file writes, same `O_CREAT|O_EXCL`
+    primitive as `crypto_stop_monitor.py`'s own lock.
+
+    Self-healing (added after a real incident: a process SIGKILLed while
+    holding this lock left it stale forever -- every subsequent write
+    failed with GuardLockTimeoutError until a human deleted the lock
+    file by hand). The lock file's own content now records the
+    acquiring process's PID and acquisition time; on contention, a
+    stale lock (see `_lock_is_stale`) is unlinked and acquisition is
+    retried immediately, without waiting out the normal contention
+    sleep -- a genuinely abandoned lock should never cost a real run
+    more than one extra `open()` call.
+
+    Race between two processes that both see the same stale lock: both
+    may unlink it and both then attempt the `O_CREAT|O_EXCL` open that
+    follows -- the OS still arbitrates that open atomically, so at most
+    one of them can succeed. The other sees `FileExistsError` again, now
+    against whichever process won, re-evaluates staleness against that
+    FRESH lock (a live PID acquired moments ago), correctly finds it not
+    stale, and falls back to the normal contention wait/retry below. No
+    window exists where two processes both believe they hold the lock;
+    the exclusivity guarantee is still the kernel-arbitrated `O_EXCL`
+    open, never the staleness heuristic by itself -- the heuristic only
+    decides whether it is worth attempting that open again sooner.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = None
     for attempt in range(_GUARD_LOCK_ATTEMPTS):
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        descriptor = _try_create_lock_file(lock_path)
+        if descriptor is not None:
             break
-        except FileExistsError:
-            if attempt < _GUARD_LOCK_ATTEMPTS - 1:
-                time.sleep(_GUARD_LOCK_RETRY_SECONDS)
+        if _lock_is_stale(lock_path):
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass  # another process already cleared it -- fine, retry below
+            descriptor = _try_create_lock_file(lock_path)
+            if descriptor is not None:
+                break
+        if attempt < _GUARD_LOCK_ATTEMPTS - 1:
+            time.sleep(_GUARD_LOCK_RETRY_SECONDS)
     if descriptor is None:
         raise GuardLockTimeoutError(
-            f"{lock_path} still held after {_GUARD_LOCK_ATTEMPTS} attempts -- "
-            f"refusing to write the high-water mark concurrently."
+            f"{lock_path} still held after {_GUARD_LOCK_ATTEMPTS} attempts by a lock "
+            f"that is neither older than {_GUARD_LOCK_MAX_AGE_SECONDS:g}s nor held by "
+            f"a dead process -- refusing to write the high-water mark concurrently."
         )
-    os.close(descriptor)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"pid": os.getpid(), "acquired_at": time.time()}, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     try:
         yield
     finally:
@@ -179,27 +289,38 @@ def _read_high_water_mark(path: Path = HIGH_WATER_MARK_PATH) -> int:
         ) from error
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write `content` to `path` durably: a temp file in the same
+    directory, `fsync`'d, then `os.replace`'d into place, with the
+    containing directory itself also `fsync`'d -- so a crash mid-write
+    cannot leave a half-written or missing file, and the rename is
+    durable against a crash immediately after. Shared by
+    `_write_high_water_mark` and `save_position_state`, which both need
+    exactly this guarantee for their own file."""
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
 def _write_high_water_mark(value: int, path: Path = HIGH_WATER_MARK_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f"{path.name}.lock"
     with _guard_write_lock(lock_path):
-        descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps({"portfolio_bar_index": int(value)}, indent=2) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-            directory_descriptor = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        finally:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
+        _atomic_write_text(path, json.dumps({"portfolio_bar_index": int(value)}, indent=2) + "\n")
 
 SCHEMA_VERSION = 2
 DEFAULT_STATE_PATH = Path("data/live/position_state.json")
@@ -351,7 +472,26 @@ def save_position_state(
     *,
     guard_path: Path = HIGH_WATER_MARK_PATH,
 ) -> None:
-    """`guard_path` override is for tests only -- see `load_position_state`."""
+    """`guard_path` override is for tests only -- see `load_position_state`.
+
+    Written with the same atomic discipline as the high-water-mark file
+    (`_atomic_write_text`): a crash mid-write cannot leave a corrupted or
+    half-written `position_state.json` behind, only ever the previous
+    good file or the new one. This does not add a write-lock the way
+    the guard file has one -- `run_daily_decision.py` and
+    `run_crypto_stop_monitor.py` are the only two writers, on
+    independent schedules, and a genuinely overlapping write from both
+    at once (a separate, pre-existing concurrency question, not a
+    crash/corruption one) is not what today's fix addresses. A read
+    that finds the file present but corrupt still fails loudly with the
+    underlying `json.JSONDecodeError` uncaught -- deliberately not
+    caught here either, for the same fail-closed reason
+    `GuardFileCorruptedError` exists: silently treating unreadable state
+    as empty would be far more dangerous than a loud crash + Telegram
+    alert. Atomicity narrows how often that can happen; it does not
+    replace fail-closed as the backstop for whatever it doesn't cover
+    (e.g. external corruption of an already-written file).
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -374,7 +514,7 @@ def save_position_state(
             key: dict(record) for key, record in state.submitted_actions.items()
         },
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     # Advance the rollback guard on every successful save -- never move it
     # backward, even if this run's own bar_index is (legitimately) unchanged
