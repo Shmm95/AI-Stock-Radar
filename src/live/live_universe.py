@@ -117,6 +117,19 @@ stated non-defensive-sector rule but is this batch's weakest signal.
 All 32 confirmed tradable via a live Alpaca get_all_assets() call, and
 confirmed to add no within-batch or vs-existing-50 redundancy above
 the 0.75 threshold.
+
+Crypto quality exception (82 -> 83) -- PREPARED, NOT YET APPROVED.
+UNI-USD is prepared under the same explicit quality-not-diversity
+exception framework used for ROL and ZTS above. The Alpaca-only refresh
+(data/research/uni_alpaca_quality_exception_candidate_20260815_070239.json,
+RESEARCH_CANDIDATE_NOT_OFFICIAL) measured isolated PF 1.7771 and daily-
+return correlations of 0.631448 vs BTC and 0.716905 vs ETH, reasonably
+consistent with the prior session's PF 1.514 / 0.60 / 0.71. UNI still
+does not clear the strict < 0.60 correlation gate. Its inclusion therefore
+makes no claim that UNI adds independent diversification; the sole rationale
+is demonstrated standalone signal quality. This tuple entry is preparation
+for review only and must not be staged, committed, or deployed without
+separate approval.
 """
 
 from __future__ import annotations
@@ -131,6 +144,10 @@ LIVE_CONTROLLED_TICKERS: tuple[str, ...] = (
     "TSLA",
     "BTC-USD",
     "ETH-USD",
+    # PREPARED, NOT YET APPROVED -- crypto quality exception, not a
+    # diversification claim (Alpaca PF 1.7771; BTC/ETH corr 0.631448/0.716905;
+    # candidate artifact: uni_alpaca_quality_exception_candidate_20260815_070239.json).
+    "UNI-USD",
     "UNH",
     "JPM",
     "XOM",
