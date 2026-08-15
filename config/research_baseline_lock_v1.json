@@ -12,7 +12,7 @@
     "entry_statistics_stamp": "20260802_103007",
     "forward_return_statistics_stamp": "20260802_134341",
     "holding_path_attribution_stamp": "20260802_155749",
-    "execution_slippage_stress_stamp": "20260802_192047"
+    "execution_slippage_stress_stamp": "20260814_054701"
   },
   "controlled_tickers": [
     "AAPL",
@@ -51,14 +51,14 @@
     "src/backtest/portfolio_backtest_models.py": "8b4d9c2a275e4da156be16b5e90b0aea1f0f36781cef49711c57b3397ba12a38",
     "src/backtest/run_portfolio_backtest.py": "cc7adb4602efe744eadb013e0624e28b5c4e2d4c6d182b3f998da4ac196c1724",
     "src/backtest/run_portfolio_execution_slippage_stress.py": "6293819612150963b1d312e4c72155c75304e8db4a7b0f79835c72f2e260d4f0",
-    "src/backtest/run_portfolio_research_baseline_lock.py": "ed4f424084a35b030d0e3e5c756cc013e5758fc37b6edd13990680143416f10d",
+    "src/backtest/run_portfolio_research_baseline_lock.py": "665eb9fe755958a971f7ffd7034617e374c3dc6b102cc6363afca8a7c6a9e05b",
     "tests/test_portfolio_backtest.py": "379a1a54e881b9a67ec86a7b5f29bbd10ff4387064c04a801523d623bffb938c",
     "tests/test_portfolio_execution_slippage_stress.py": "6a874129e6c075c2ecdc654c59aa45572e67415b1334e5688df2f70c989e7269",
     "tests/test_portfolio_research_baseline_lock.py": "588087c0cb008a8fc9f156150119566ab7e2a1dff9c61ce1397899690c9d8b15"
   },
   "execution_stress": {
-    "stamp": "20260802_192047",
-    "provenance_sha256": "4435b43874af3bc1d0ff86e45973743e1984630fdf69940e113980a6d80bfcd5",
+    "stamp": "20260814_054701",
+    "provenance_sha256": "64b85e44e34135ed1fe8cf3d0bc28df950ee4a3daf5b3b0819067438b100bd36",
     "scenario_ids": [
       "C01_S01",
       "C01_S02",
@@ -79,56 +79,56 @@
     ],
     "result_hashes": {
       "aggregate": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_aggregate_20260802_192047.csv",
-        "sha256": "0ad79e9c8d1d80c65a8aa98c8e58a0a07f63329b92b1b3036ca2a2272ce2766f"
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_aggregate_20260814_054701.csv",
+        "sha256": "ab978f2c5d7eb26fefa072f99c4fdeb25c7f0ea5e39904ab4c54c19c7ce4ca2e"
       },
       "comparison": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_comparison_20260802_192047.csv",
-        "sha256": "baaa525fe4e55636269432d2bedb6ee27c59afeeba8d2d6fb2a00feae6d7b144"
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_comparison_20260814_054701.csv",
+        "sha256": "ea0f802e501e010a897a4becd939d58f2ed438881f431b563c2ea2c311afd403"
       },
       "equity": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_equity_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_equity_20260814_054701.csv",
         "sha256": "56dc59041cce2348fa5496903d4a35d5fb1853db7ef4df70554e83f6843a9546"
       },
       "json": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_20260802_192047.json",
-        "sha256": "cefc6ec3cdb8f0d14798b712c6636abd16a848ca2aaa63b95d0c9609dd1144e0"
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_20260814_054701.json",
+        "sha256": "d18e9418664f709444627a5534808b32f46a03c24f71a61395688cbfcf64d74c"
       },
       "primary_gates": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_primary_gates_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_primary_gates_20260814_054701.csv",
         "sha256": "9d69d4a1ae8fc93f2396b09661a048750a4548aa78f40f3e50db957cb68442b6"
       },
       "rejections": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_rejections_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_rejections_20260814_054701.csv",
         "sha256": "965c4be09bd8e4b3de8a16f7342f32eaad735e0ab5dde939f168ef5d8e038518"
       },
       "replay_checks": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_replay_checks_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_replay_checks_20260814_054701.csv",
         "sha256": "a35847a12660e889122b9bb6ed9d319dac466a8a7ce1f2c21a0ac75f49aaa09b"
       },
       "screen": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_screen_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_screen_20260814_054701.csv",
         "sha256": "72817275f6d078c08ecb7d2624f0bc594c91bc790164cda88dd01ff8278092f5"
       },
       "test_runs": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_test_runs_20260802_192047.csv",
-        "sha256": "4fe614f6a7ccf143a890df07f4a8d4de2dc21591bcb433b9e0364a56a6764afc"
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_test_runs_20260814_054701.csv",
+        "sha256": "fee5ce612de8ba47727fa0a2d506789db43dca81ccd4009c9a0f4722f9ed2a27"
       },
       "tickers": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_tickers_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_tickers_20260814_054701.csv",
         "sha256": "56d06cff6a90fee5b274d549915164369bd24763dcc3a52f88452c2160ff9048"
       },
       "trade_pairs": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trade_pairs_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trade_pairs_20260814_054701.csv",
         "sha256": "df550cea8a11f607580e9687128c772d1345b5fcf85efd761243107a1ad89871"
       },
       "trades": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trades_20260802_192047.csv",
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_trades_20260814_054701.csv",
         "sha256": "6befa4b020b76c5a1aec9da0f59e89fb217e7c2c71566e7731b524bb59b817d4"
       },
       "windows": {
-        "path": "/Users/ayc/Projects/AI-Stock-Radar/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_windows_20260802_192047.csv",
-        "sha256": "a6d7c4cc1a9f737909e83d31706e1b34961c93d22d928a31e02dff2dcb773b6a"
+        "path": "/Users/ayc/Projects/AI-Stock-Radar-workspace-b/data/backtests/portfolio/execution_slippage_stress/portfolio_execution_slippage_stress_windows_20260814_054701.csv",
+        "sha256": "865bb89fb8d1c35e9b74a5fd22595e3c4e30d60447c9870c9155727909911feb"
       }
     }
   },
