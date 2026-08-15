@@ -11,7 +11,7 @@
     "trade_timing_attribution_stamp": "20260802_085312",
     "entry_statistics_stamp": "20260802_103007",
     "forward_return_statistics_stamp": "20260802_134341",
-    "holding_path_attribution_stamp": "20260802_155749",
+    "holding_path_attribution_stamp": "20260808_074833",
     "execution_slippage_stress_stamp": "20260814_054701"
   },
   "controlled_tickers": [
@@ -51,7 +51,7 @@
     "src/backtest/portfolio_backtest_models.py": "8b4d9c2a275e4da156be16b5e90b0aea1f0f36781cef49711c57b3397ba12a38",
     "src/backtest/run_portfolio_backtest.py": "cc7adb4602efe744eadb013e0624e28b5c4e2d4c6d182b3f998da4ac196c1724",
     "src/backtest/run_portfolio_execution_slippage_stress.py": "6293819612150963b1d312e4c72155c75304e8db4a7b0f79835c72f2e260d4f0",
-    "src/backtest/run_portfolio_research_baseline_lock.py": "f55a666f7591faa0933759299fe4ccb8673cc9c272c569fad00634c83baca65d",
+    "src/backtest/run_portfolio_research_baseline_lock.py": "a76a213805c1b446627a9d5d797645643ca9b889ce0da30554600b91db713ab8",
     "tests/test_portfolio_backtest.py": "379a1a54e881b9a67ec86a7b5f29bbd10ff4387064c04a801523d623bffb938c",
     "tests/test_portfolio_execution_slippage_stress.py": "6a874129e6c075c2ecdc654c59aa45572e67415b1334e5688df2f70c989e7269",
     "tests/test_portfolio_research_baseline_lock.py": "588087c0cb008a8fc9f156150119566ab7e2a1dff9c61ce1397899690c9d8b15"
