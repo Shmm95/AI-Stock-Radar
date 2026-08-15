@@ -263,7 +263,7 @@ def verify_execution_stress(
         raise ValueError("Execution-stress snapshot id mismatch.")
     if provenance.get("snapshot_fingerprint") != APPROVED_SNAPSHOT_FINGERPRINT:
         raise ValueError("Execution-stress snapshot fingerprint mismatch.")
-    if provenance.get("holding_path_attribution_stamp") != APPROVED_HOLDING_PATH_STAMP:
+    if provenance.get("mfe_mae_holding_path_stamp") != APPROVED_HOLDING_PATH_STAMP:
         raise ValueError("Execution-stress holding-path stamp mismatch.")
     if provenance.get("stop_walk_forward_stamp") != APPROVED_STOP_WALK_FORWARD_STAMP:
         raise ValueError("Execution-stress stop-walk-forward stamp mismatch.")
