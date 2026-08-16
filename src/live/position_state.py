@@ -327,7 +327,48 @@ DEFAULT_STATE_PATH = Path("data/live/position_state.json")
 
 
 class LiveRunnerState:
-    """In-memory view of what position_state.json persists."""
+    """In-memory view of what position_state.json persists.
+
+    `last_processed_equity_date`/`last_processed_crypto_date` (added
+    2026-08-16, workspace-b research): generic date-string fields
+    (ISO "YYYY-MM-DD"), storage-and-schema-only here -- this module
+    does not itself decide or interpret what gets written into them.
+    The one real caller, `scripts/run_control_arm_decision.py`'s
+    same-day double-run guard, stamps them with the WALL-CLOCK UTC date
+    its own run completed on (not the processed bar's own date --
+    tried first, and rejected after a real test on an actual Sunday
+    showed a bar-date stamp fails to match wall-clock "today" on any
+    non-trading day, silently defeating the guard on exactly the
+    holiday-adjacent cases it most needs to catch; see that wrapper's
+    own `_stamp_last_processed_dates` docstring for the full real-test
+    account). Both default to `None` and are optional everywhere
+    they're read/written specifically so that (a) older
+    `position_state.json` files with no such keys still load fine, and
+    (b) `run_daily_decision.py` -- which constructs `LiveRunnerState`
+    without ever passing these two kwargs, and is not modified by this
+    change -- keeps working exactly as before; it simply never
+    populates them, and whatever last set them is preserved only by a
+    caller that explicitly re-reads and re-saves.
+
+    `last_processed_equity_session_date`/`last_processed_equity_bar_timestamp`
+    (added 2026-08-16, same session): a SEPARATE, market-calendar-aware
+    pair, deliberately distinct from `last_processed_equity_date` above
+    (which this docstring's own instruction says not to touch/repurpose
+    -- it stays the plain wall-clock same-day guard it already is).
+    These two instead carry the REAL Alpaca trading-session date and the
+    literal bar timestamp `run_control_arm_decision.py`'s own market-
+    holiday/session-date verification confirmed for the run that last
+    set them -- see that wrapper's own module docstring for the full
+    calendar-based verification design (real `TradingClient.get_calendar()`
+    call, expected-vs-actual-vs-last-processed comparison, fail-closed
+    on any anomaly). In today's daily-bar-only design the two hold the
+    same value in practice (a daily bar has no finer time component
+    meaningfully different from its own date) -- kept as two fields
+    anyway because they answer two different questions (a
+    calendar-verified session date vs. the literal timestamp on the
+    fetched bar) that could diverge under a future, finer-grained bar
+    design. Same optional/backward-compatible discipline as the pair
+    above."""
 
     __slots__ = (
         "portfolio_bar_index",
@@ -336,6 +377,10 @@ class LiveRunnerState:
         "pending_exits",
         "equity_stop_orders",
         "submitted_actions",
+        "last_processed_equity_date",
+        "last_processed_crypto_date",
+        "last_processed_equity_session_date",
+        "last_processed_equity_bar_timestamp",
     )
 
     def __init__(
@@ -347,6 +392,10 @@ class LiveRunnerState:
         pending_exits: dict[str, _PendingOrder] | None = None,
         equity_stop_orders: dict[str, str] | None = None,
         submitted_actions: dict[str, dict[str, Any]] | None = None,
+        last_processed_equity_date: str | None = None,
+        last_processed_crypto_date: str | None = None,
+        last_processed_equity_session_date: str | None = None,
+        last_processed_equity_bar_timestamp: str | None = None,
     ) -> None:
         self.portfolio_bar_index = portfolio_bar_index
         self.positions = positions or {}
@@ -354,6 +403,10 @@ class LiveRunnerState:
         self.pending_exits = pending_exits or {}
         self.equity_stop_orders = equity_stop_orders or {}
         self.submitted_actions = submitted_actions or {}
+        self.last_processed_equity_date = last_processed_equity_date
+        self.last_processed_crypto_date = last_processed_crypto_date
+        self.last_processed_equity_session_date = last_processed_equity_session_date
+        self.last_processed_equity_bar_timestamp = last_processed_equity_bar_timestamp
 
 
 def _signal_to_dict(signal: PortfolioSignal) -> dict[str, Any]:
@@ -463,6 +516,10 @@ def load_position_state(
             key: dict(record)
             for key, record in payload.get("submitted_actions", {}).items()
         },
+        last_processed_equity_date=payload.get("last_processed_equity_date"),
+        last_processed_crypto_date=payload.get("last_processed_crypto_date"),
+        last_processed_equity_session_date=payload.get("last_processed_equity_session_date"),
+        last_processed_equity_bar_timestamp=payload.get("last_processed_equity_bar_timestamp"),
     )
 
 
@@ -513,6 +570,10 @@ def save_position_state(
         "submitted_actions": {
             key: dict(record) for key, record in state.submitted_actions.items()
         },
+        "last_processed_equity_date": state.last_processed_equity_date,
+        "last_processed_crypto_date": state.last_processed_crypto_date,
+        "last_processed_equity_session_date": state.last_processed_equity_session_date,
+        "last_processed_equity_bar_timestamp": state.last_processed_equity_bar_timestamp,
     }
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

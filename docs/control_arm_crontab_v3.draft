@@ -1,0 +1,77 @@
+# === DRAFT ONLY — NOT ADDED TO ANY CRONTAB — awaiting explicit approval ===
+#
+# v3 — supersedes control_arm_crontab_v2.draft. Fixes applied after a
+# second external audit found three remaining problems in v2:
+#   1. --env-file /root/AI-Stock-Radar-Control/.env added to the command.
+#      v2 relied on run_control_arm_decision.py's transitive imports
+#      (src/data/alpaca_market_data.py, src/notify/telegram_notifier.py)
+#      loading the repo-root .env normally at import time, with no
+#      fail-closed check of that path at all -- the wrapper's own
+#      fail-closed _load_env_file_fail_closed() function only ran when
+#      --env-file was explicitly passed, which v2's cron entry never
+#      did. Production and this session's own sandbox test were
+#      therefore silently using two DIFFERENT credential-loading code
+#      paths (implicit vs. explicit/fail-closed) -- the whole point of
+#      building a fail-closed loader is defeated if production never
+#      actually exercises it. Now both paths call the identical
+#      function: Path(...).resolve(strict=True) (raises immediately if
+#      the file is missing/unresolvable, never a silent fallback to
+#      whatever else might already be in os.environ) + a check that
+#      load_dotenv() actually reported loading something.
+#   2. The BTC/universe leak check now runs in TWO layers, not one:
+#      - NEW pre-flight check (_preflight_universe_check in
+#        run_control_arm_decision.py), which reads the persisted state
+#        file DIRECTLY and refuses to call run_daily_decision() AT ALL
+#        -- zero API calls -- if it already contains any
+#        position/pending-buy/pending-exit for BTC-USD or any ticker
+#        outside the 44-ticker control universe. This is the layer that
+#        actually matters for a STALE entry left behind by an earlier
+#        run/bug/hand-edit -- v2's check ran only AFTER
+#        run_daily_decision() had already fetched live data, written
+#        new state, and (if enabled) could have submitted real orders,
+#        so it could catch this run's OWN mistake but never a
+#        pre-existing one.
+#      - The v2 post-hoc audit check is KEPT, unchanged, as a second,
+#        independent layer (if the pre-flight check somehow didn't fire,
+#        this still would) -- not replaced, since a check that runs
+#        after a real state-changing call is still worth having even
+#        though it is provably weaker on its own.
+#   3. --enable-crypto-orders' help text corrected: no longer claims
+#      unconditional "no-op." BTC-USD can never generate a NEW entry
+#      signal in this universe (RegimeAllowed force-set False), but if a
+#      stale BTC-USD position/pending entry ever existed in state, this
+#      flag's crypto order-submission logic (reused unmodified from
+#      run_daily_decision.py) could still act on it -- item #2's new
+#      pre-flight check is what actually prevents that scenario from
+#      ever reaching this flag, not the flag's own semantics.
+#
+# (v2's fixes, unchanged, still in effect: real operational entry point
+# -- scripts/run_control_arm_decision.py, not run_daily_decision.py
+# directly; single-physical-line cron syntax; 22:02 UTC schedule, 47min
+# after the live system's real 21:15 UTC run, not a multiple of 5 so it
+# never lands in the same minute as the */5 crypto stop monitor.)
+#
+# DST — STILL AN OPEN RISK, STILL NOT RESOLVED: SSH to the production
+# server is still blocked from this sandbox. A bare `H M * * 1-5` cron
+# line runs at a fixed UTC instant regardless of US Eastern Time's DST
+# transitions -- if the live system's 21:15 UTC is itself DST-adjusted
+# by some external mechanism twice a year, this 22:02 UTC control-arm
+# schedule needs the identical adjustment to keep the same 47-minute/
+# non-multiple-of-5 relationship. ACTION ITEM, unchanged from v2: once
+# SSH access works, read the live crontab's actual text/mechanism and
+# either mirror it here or confirm it is unnecessary.
+#
+# No --enable-equity-orders / --enable-crypto-orders flags: this stays
+# a read-only signal-generation + paper-position-tracking run until the
+# user explicitly approves enabling real paper order submission.
+#
+# Guard-file isolation (unchanged from v2): AI_STOCK_RADAR_GUARD_DIR
+# below points HIGH_WATER_MARK_PATH (src/live/position_state.py) at a
+# control-arm-only directory -- without this it would default to
+# $HOME/.ai_stock_radar_guard/ and silently collide with the live
+# deployment's own guard file, since both run as root on the same
+# server. This is the path already used in the deploy commands reported
+# to the user (/root/AI-Stock-Radar-Control/.guard).
+
+AI_STOCK_RADAR_GUARD_DIR=/root/AI-Stock-Radar-Control/.guard
+02 22 * * 1-5 cd /root/AI-Stock-Radar-Control && /root/AI-Stock-Radar-Control/.venv/bin/python3 scripts/run_control_arm_decision.py --state-path /root/AI-Stock-Radar-Control/data/live/position_state.json --decision-log-directory /root/AI-Stock-Radar-Control/data/live/decisions --env-file /root/AI-Stock-Radar-Control/.env >> /root/AI-Stock-Radar-Control/logs/daily_decision.log 2>&1
