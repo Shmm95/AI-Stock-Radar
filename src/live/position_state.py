@@ -368,7 +368,29 @@ class LiveRunnerState:
     calendar-verified session date vs. the literal timestamp on the
     fetched bar) that could diverge under a future, finer-grained bar
     design. Same optional/backward-compatible discipline as the pair
-    above."""
+    above.
+
+    `pending_signal_metadata` (added 2026-08-16, workspace-b research,
+    Phase 2b): a `f"{ticker}|{kind}"`-keyed dict (`kind` is `"BUY"` or
+    `"EXIT"`) of session-based TTL bookkeeping for entries in
+    `pending_buys`/`pending_exits` -- storage-and-schema-only here, same
+    as the two pairs above; this module does not itself decide or
+    interpret the records. The one real caller,
+    `src/live/pending_signal_ttl.py` (invoked from
+    `scripts/run_control_arm_decision.py`), stamps and reads
+    `source_session_date`/`target_execution_session_date`/`created_at_utc`/
+    `signal_id`/`status`/`expire_reason` -- see that module's own
+    docstring for the full one-shot-TTL design and why it deliberately
+    never reads a `PortfolioSignal`'s own `.timestamp` (a real,
+    unfixed-because-unfixable-here crypto-date bug in
+    `run_daily_decision.py`). Defaults to `{}`, same backward-compatible
+    discipline: an older `position_state.json` with no such key still
+    loads fine, and `run_daily_decision.py` -- which never passes this
+    kwarg and is not modified by this change -- simply never populates
+    it; `run_daily_decision()`'s own internal save wipes it to `{}` on
+    every run, which is why its one real caller re-applies it in a
+    second, deliberate save AFTER that call returns (same discipline as
+    `last_processed_equity_date` above)."""
 
     __slots__ = (
         "portfolio_bar_index",
@@ -381,6 +403,7 @@ class LiveRunnerState:
         "last_processed_crypto_date",
         "last_processed_equity_session_date",
         "last_processed_equity_bar_timestamp",
+        "pending_signal_metadata",
     )
 
     def __init__(
@@ -396,6 +419,7 @@ class LiveRunnerState:
         last_processed_crypto_date: str | None = None,
         last_processed_equity_session_date: str | None = None,
         last_processed_equity_bar_timestamp: str | None = None,
+        pending_signal_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.portfolio_bar_index = portfolio_bar_index
         self.positions = positions or {}
@@ -407,6 +431,7 @@ class LiveRunnerState:
         self.last_processed_crypto_date = last_processed_crypto_date
         self.last_processed_equity_session_date = last_processed_equity_session_date
         self.last_processed_equity_bar_timestamp = last_processed_equity_bar_timestamp
+        self.pending_signal_metadata = pending_signal_metadata or {}
 
 
 def _signal_to_dict(signal: PortfolioSignal) -> dict[str, Any]:
@@ -520,6 +545,10 @@ def load_position_state(
         last_processed_crypto_date=payload.get("last_processed_crypto_date"),
         last_processed_equity_session_date=payload.get("last_processed_equity_session_date"),
         last_processed_equity_bar_timestamp=payload.get("last_processed_equity_bar_timestamp"),
+        pending_signal_metadata={
+            key: dict(record)
+            for key, record in payload.get("pending_signal_metadata", {}).items()
+        },
     )
 
 
@@ -574,6 +603,9 @@ def save_position_state(
         "last_processed_crypto_date": state.last_processed_crypto_date,
         "last_processed_equity_session_date": state.last_processed_equity_session_date,
         "last_processed_equity_bar_timestamp": state.last_processed_equity_bar_timestamp,
+        "pending_signal_metadata": {
+            key: dict(record) for key, record in state.pending_signal_metadata.items()
+        },
     }
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

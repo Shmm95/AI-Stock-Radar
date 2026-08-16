@@ -126,6 +126,27 @@ tutarsız seans tarihi" case from this task's own instruction is
 therefore already covered by existing, unmodified engine code; nothing
 new was added here to re-check what that function already guarantees.
 
+PHASE 2a: BROKER RECONCILIATION (added 2026-08-16, on top of the market-
+holiday/session-date verification above): `src/live/broker_reconciliation.py`'s
+`reconcile()` runs at the `[PHASE 2a integration point]` inside `main()`,
+BEFORE `_expected_equity_session_date()` and therefore before any
+market-data fetch or decision computation. It verifies the connected
+Alpaca account's identity (masked, never logs the raw account_number),
+takes a consistency-verified snapshot of the broker's open orders and
+positions, and fail-closed-raises on any of four documented mismatch
+scenarios against `submitted_actions`/`equity_stop_orders`/`positions`
+(never `pending_buys`/`pending_exits` -- those are local-only, not yet at
+the broker). See that module's own docstring for the full case table.
+A reconciliation failure here is caught by the same try/except this
+section sits inside, which sends a `[CONTROL]` failure notification and
+re-raises -- `rdd.run_daily_decision()` is never called, so the decision
+log, position state, and any real broker order are all left untouched.
+The one case that is a SUCCESS, not a failure -- Scenario C's narrow
+"order fully matches and is confirmed filled" resolution -- updates only
+that order's status field on a freshly-loaded state and persists that one
+correction to disk before `rdd.run_daily_decision()` runs, the same as
+any other successful pre-decision state fix.
+
 Isolation from the live deployment is NOT implemented in this file --
 it comes entirely from process cwd (`data/live/STOP`, `data/live/FREEZE`,
 and the default `--state-path`/`--decision-log-directory` are all
@@ -155,7 +176,9 @@ from alpaca.trading.requests import GetCalendarRequest
 from dotenv import load_dotenv
 
 import scripts.run_daily_decision as rdd
+import src.live.broker_reconciliation as broker_reconciliation
 import src.live.order_intent as order_intent
+import src.live.pending_signal_ttl as pending_signal_ttl
 from src.live.control_universe import CONTROL_UNIVERSE_TICKERS
 from src.live.single_instance_lock import SingleInstanceLockError, single_instance_lock
 
@@ -516,6 +539,95 @@ def _run_intent_protocol(decision: dict, pre_state_hash: str | None) -> list[ord
     return intents
 
 
+_PENDING_SIGNAL_ACTION_KIND_FAMILIES: dict[str, tuple[str, ...]] = {
+    pending_signal_ttl.KIND_BUY: ("QUEUED_ENTRY_SIGNAL", "ENTRY_MARKET_BUY"),
+    pending_signal_ttl.KIND_EXIT: ("QUEUED_EXIT_SIGNAL", "SIGNAL_EXIT_MARKET_SELL"),
+}
+_INTENT_NON_TERMINAL_STATUSES = frozenset(
+    {order_intent.PREPARED, order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED, order_intent.UNCERTAIN}
+)
+
+
+def _compute_pending_signal_id(ticker: str, kind: str, source_session_date: str) -> str:
+    """The SAME deterministic-id formula `_run_intent_protocol` already
+    uses for a queued BUY's `client_order_id` (`action_kind=
+    "QUEUED_ENTRY_SIGNAL"`) -- see `pending_signal_ttl.py`'s own module
+    docstring ("SIGNAL_ID / JOURNAL CORRELATION") for why this must be
+    the exact same formula, not a fresh id."""
+    action_kind = "QUEUED_ENTRY_SIGNAL" if kind == pending_signal_ttl.KIND_BUY else "QUEUED_EXIT_SIGNAL"
+    return rdd._deterministic_client_order_id(ticker, action_kind, source_session_date)
+
+
+def _has_unresolved_journal_trace_for_signal(signal_id: str) -> bool:
+    """Exact match: used when a pending-signal metadata record's own
+    `signal_id` is known (a real, non-`age_unknown` record)."""
+    for intent in order_intent.list_intents():
+        if intent.client_order_id == signal_id and intent.status in _INTENT_NON_TERMINAL_STATUSES:
+            return True
+    return False
+
+
+def _has_unresolved_journal_trace_for_ticker(ticker: str, kind: str) -> bool:
+    """Broader, ticker+kind-family match (any date): used ONLY for the
+    `age_unknown` case (no metadata record exists, so no exact
+    `signal_id` can be reproduced -- see `pending_signal_ttl.evaluate_pending_signals`'s
+    own docstring)."""
+    families = _PENDING_SIGNAL_ACTION_KIND_FAMILIES[kind]
+    for intent in order_intent.list_intents():
+        if intent.ticker == ticker and intent.action_kind in families and intent.status in _INTENT_NON_TERMINAL_STATUSES:
+            return True
+    return False
+
+
+def _finalize_pending_signals_after_run(
+    state_path: Path,
+    *,
+    client,
+    decision: dict,
+    ttl_outcome: "pending_signal_ttl.PendingSignalTTLOutcome",
+) -> dict[str, str]:
+    """Second, deliberate save -- same discipline as
+    `_stamp_last_processed_dates` (see that function's own docstring for
+    the full "why a second save" rationale): `rdd.run_daily_decision()`'s
+    internal save has already wiped `pending_signal_metadata` to `{}` by
+    this point (it builds a fresh `LiveRunnerState` that never passes
+    this kwarg). Reloads, restores every record `evaluate_pending_signals`
+    set earlier THIS run (pre-run TTL outcomes: expired/quarantined
+    records, and the transient `reconfirming` markers for stale EXITs),
+    then calls `pending_signal_ttl.stamp_new_pending_signals` to create
+    fresh records for whatever this run's real decision newly queued, and
+    to finalize each `reconfirming` EXIT to either `reconfirmed` (a fresh
+    queued exit for that ticker exists -- the frozen engine's own
+    unmodified Close-phase re-evaluation found the exit condition still
+    valid) or `expired_after_reconfirmation` (it does not). Saves once
+    more. Returns the reconfirmation outcomes for the caller to notify."""
+    runner_state = rdd.ps.load_position_state(state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH)
+    restored: dict[str, dict] = {}
+    for ticker, record in ttl_outcome.expired_buys.items():
+        restored[pending_signal_ttl.pending_key(ticker, pending_signal_ttl.KIND_BUY)] = record
+    for ticker, record in ttl_outcome.quarantined_buys.items():
+        if record:
+            restored[pending_signal_ttl.pending_key(ticker, pending_signal_ttl.KIND_BUY)] = record
+    for ticker, record in ttl_outcome.reconfirming_exits.items():
+        restored[pending_signal_ttl.pending_key(ticker, pending_signal_ttl.KIND_EXIT)] = record
+    for ticker, record in ttl_outcome.quarantined_exits.items():
+        if record:
+            restored[pending_signal_ttl.pending_key(ticker, pending_signal_ttl.KIND_EXIT)] = record
+    runner_state.pending_signal_metadata.update(restored)
+
+    equity_session_date = decision.get("as_of_bar_timestamp_equity")
+    reconfirmation_outcomes = pending_signal_ttl.stamp_new_pending_signals(
+        client=client,
+        runner_state=runner_state,
+        decision=decision,
+        equity_session_date=equity_session_date,
+        compute_signal_id=_compute_pending_signal_id,
+        reconfirming_exit_old_records=ttl_outcome.reconfirming_exits,
+    )
+    rdd.ps.save_position_state(runner_state, state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH)
+    return reconfirmation_outcomes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -651,13 +763,56 @@ def main() -> None:
                 # and does not solve.
                 _preflight_double_run_check(arguments.state_path)
 
-                # [PHASE 2 INTEGRATION POINT: broker-reconciliation logic
-                # goes here -- inspecting order_intent.list_intents() for
-                # any PREPARED/SUBMITTING/UNCERTAIN intent left over from
-                # an interrupted prior run, and resolving it against the
-                # broker's own order history BEFORE this run computes a
-                # new decision. Not implemented this task -- explicitly
-                # out of scope.]
+                # PHASE 2a: broker-vs-local reconciliation, BEFORE any
+                # market-data fetch or decision computation. Account
+                # identity check, then a consistency-verified broker
+                # snapshot (open orders + positions), then the four
+                # documented mismatch scenarios -- see
+                # src/live/broker_reconciliation.py's own module docstring
+                # for the full case table. Raises (fail-closed) on any
+                # anomaly, caught by this same try/except below, which
+                # notifies [CONTROL] and re-raises WITHOUT ever calling
+                # rdd.run_daily_decision() -- so a reconciliation failure
+                # leaves the decision log, position state, and any real
+                # broker order completely untouched. The one narrow
+                # exception (Scenario C's fully-matched "filled" case) is
+                # itself a successful reconciliation outcome, not a
+                # failure -- it updates only an order-status field on the
+                # freshly-loaded state below and persists that correction
+                # to disk before proceeding, exactly like any other
+                # successful pre-decision state fix. NOTE: this deliberately
+                # does NOT yet inspect order_intent.list_intents() for
+                # stray PREPARED/SUBMITTING/UNCERTAIN intents from an
+                # interrupted prior run -- that intent-journal-specific
+                # reconciliation is still out of scope for this task
+                # (broker_reconciliation.py reconciles submitted_actions/
+                # equity_stop_orders/positions only).
+                reconciliation_client = rdd.order_submission.get_trading_client()
+                reconciliation_state = rdd.ps.load_position_state(
+                    arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                )
+                reconciliation_result = broker_reconciliation.reconcile(
+                    reconciliation_client, reconciliation_state
+                )
+                if reconciliation_result.order_status_updates:
+                    print(
+                        f"[CONTROL] Broker reconciliation applied narrow "
+                        f"order-status correction(s) (Scenario C, "
+                        f"filled-and-fully-matched only): "
+                        f"{reconciliation_result.order_status_updates}"
+                    )
+                    rdd.ps.save_position_state(
+                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                    )
+                print(
+                    f"[CONTROL] Broker reconciliation passed: account "
+                    f"{reconciliation_result.account_number_masked}, "
+                    f"{reconciliation_result.local_position_count} local "
+                    f"position(s), {reconciliation_result.broker_position_count} "
+                    f"broker position(s), "
+                    f"{reconciliation_result.broker_open_order_count} broker "
+                    f"open order(s), checked at {reconciliation_result.checked_at}."
+                )
 
                 # Real Alpaca calendar check, BEFORE any market-data
                 # fetch. See module docstring's "MARKET HOLIDAY /
@@ -674,6 +829,71 @@ def main() -> None:
                     print(text)
                     _notify_control(text)
                     return
+
+                # PHASE 2b: pending-signal TTL, BEFORE run_daily_decision()
+                # is ever called -- see src/live/pending_signal_ttl.py's
+                # own module docstring for the full one-shot-session
+                # design and the crypto-date bug it works around WITHOUT
+                # editing run_daily_decision.py. Pure local comparison,
+                # no broker/API call (the one real calendar call this
+                # feature needs -- computing a NEW signal's
+                # target_execution_session_date -- happens only in the
+                # POST-run stamping step below, never here). Mutates
+                # reconciliation_state's pending_buys/pending_exits/
+                # pending_signal_metadata in place and persists that
+                # BEFORE run_daily_decision() loads state, so a stale
+                # signal is pruned before the frozen engine can ever see
+                # it. A raised PendingSignalReconciliationRequiredError
+                # (ambiguous stale EXIT, no local position to reconfirm
+                # against) is caught by the same except block below,
+                # exactly like every other preflight failure -- nothing
+                # is saved on that path (see the function's own docstring
+                # for why), run_daily_decision() is never called.
+                ttl_outcome = pending_signal_ttl.evaluate_pending_signals(
+                    runner_state=reconciliation_state,
+                    expected_session_date=expected_session_date,
+                    freeze_active=freeze,
+                    has_unresolved_journal_trace_for_signal=_has_unresolved_journal_trace_for_signal,
+                    has_unresolved_journal_trace_for_ticker=_has_unresolved_journal_trace_for_ticker,
+                )
+                if ttl_outcome.touched_anything:
+                    rdd.ps.save_position_state(
+                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                    )
+                    for ticker, record in ttl_outcome.expired_buys.items():
+                        _notify_control(
+                            f"Pending BUY EXPIRED (TTL, one-shot window missed): {ticker} -- "
+                            f"source session {record.get('source_session_date')}, target "
+                            f"execution session {record.get('target_execution_session_date')}, "
+                            f"now {expected_session_date}, expire_reason="
+                            f"{record.get('expire_reason')}. No broker order was ever created "
+                            f"for this expired signal; it was never resubmitted."
+                        )
+                    for ticker, record in ttl_outcome.quarantined_buys.items():
+                        _notify_control(
+                            f"Pending BUY for {ticker} looks stale but has an unresolved "
+                            f"order-journal trace -- QUARANTINED, left in place, NOT expired. "
+                            f"Needs manual/broker reconciliation before this can resolve."
+                        )
+                    for ticker in ttl_outcome.reconfirming_exits:
+                        _notify_control(
+                            f"Pending EXIT for {ticker} is stale (one-shot window missed) -- "
+                            f"cleared for deterministic reconfirmation against the current "
+                            f"Close, using the frozen engine's own unmodified exit rule, later "
+                            f"in this same run."
+                        )
+                    for ticker, record in ttl_outcome.quarantined_exits.items():
+                        _notify_control(
+                            f"Pending EXIT for {ticker} looks stale but has an unresolved "
+                            f"order-journal trace -- QUARANTINED, left in place, NOT touched. "
+                            f"Needs manual/broker reconciliation before this can resolve."
+                        )
+                    print(
+                        f"[CONTROL] Pending-signal TTL: {len(ttl_outcome.expired_buys)} BUY(s) "
+                        f"expired, {len(ttl_outcome.quarantined_buys)} BUY(s) quarantined, "
+                        f"{len(ttl_outcome.reconfirming_exits)} EXIT(s) sent for reconfirmation, "
+                        f"{len(ttl_outcome.quarantined_exits)} EXIT(s) quarantined."
+                    )
 
                 pre_state_hash = _hash_state_file(arguments.state_path)
 
@@ -737,6 +957,33 @@ def main() -> None:
                     f"taken effect -- stop and investigate."
                 )
             print("[CONTROL] Audit check passed: zero BTC-USD leakage, zero non-control-universe tickers.")
+
+            # Post-run pending-signal TTL finalize -- see
+            # _finalize_pending_signals_after_run's own docstring for why
+            # this is a second, deliberate save (run_daily_decision()'s
+            # own internal save already wiped pending_signal_metadata to
+            # {}). Creates fresh metadata for anything newly queued this
+            # run and resolves every `reconfirming` stale EXIT to either
+            # `reconfirmed` or `expired_after_reconfirmation`.
+            reconfirmation_outcomes = _finalize_pending_signals_after_run(
+                arguments.state_path,
+                client=reconciliation_client,
+                decision=decision,
+                ttl_outcome=ttl_outcome,
+            )
+            for ticker, outcome_label in reconfirmation_outcomes.items():
+                if outcome_label == pending_signal_ttl.STATUS_RECONFIRMED:
+                    _notify_control(
+                        f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
+                        f"exit rule, re-evaluated against the current Close, STILL finds the "
+                        f"exit condition valid -- re-queued with a fresh source/target session."
+                    )
+                else:
+                    _notify_control(
+                        f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
+                        f"exit rule, re-evaluated against the current Close, no longer finds "
+                        f"the exit condition valid -- closed as {outcome_label}, not re-queued."
+                    )
 
             # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED protocol --
             # see _run_intent_protocol's own docstring for exactly what
