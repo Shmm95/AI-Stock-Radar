@@ -45,6 +45,14 @@ data/live/
 # own dirty-tree guard) isn't blocked by them. TEMPORARY, pending Levent's
 # decision on whether these are committed later -- see the session report
 # that added this block for the open question.
+#
+# src/research/pit_universe/ deliberately NOT listed here (was, briefly,
+# and that was wrong): it is a real runtime dependency of
+# src/live/issuer_identity_preflight.py and
+# scripts/generate_control_universe_identity_anchors.py, not unrelated
+# research -- ignoring it would silently break `git archive`-based
+# deploys with ModuleNotFoundError on the control arm's first real run.
+# Committed for real instead.
 docs/SHARED_CACHE_LAYER_DESIGN_V1.md
 docs/UNIVERSE_MECHANISMS_MAP.md
 docs/UNIVERSE_ROBUSTNESS_STEPS.md
@@ -52,5 +60,4 @@ src/research/backtest_metadata.py
 src/research/batch_fetch_pilot/
 src/research/grid_trading_prototype/
 src/research/performance_report_v1/
-src/research/pit_universe/
 src/strategy/strategy_config.py
