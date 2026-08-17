@@ -211,6 +211,33 @@ def list_intents() -> list[OrderIntent]:
     return intents
 
 
+def find_intent_by_client_order_id(client_order_id: str) -> OrderIntent | None:
+    """LOCAL lookup only -- searches every on-disk intent for a matching
+    `client_order_id`, returns the first match (`client_order_id` is
+    generated deterministically per ticker+action_kind+session-date, see
+    `run_control_arm_decision._compute_pending_signal_id`/
+    `_run_intent_protocol`, so in practice at most one intent should ever
+    match) or `None` if none do.
+
+    Added for reboot-recovery: after a real crash/restart, a caller who
+    already knows a specific `client_order_id` (e.g. one just fetched
+    from the broker via `order_submission.get_order_by_client_order_id`
+    -- the SAME `TradingClient.get_order_by_client_id` SDK method,
+    called from THAT module, never duplicated here) can use this
+    function to find which local intent, if any, that broker order
+    corresponds to, and pick up its state machine from wherever it was
+    left (PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/UNCERTAIN).
+
+    Deliberately makes NO Alpaca call itself -- this module's own
+    documented scope (see module docstring: "Nothing here calls
+    Alpaca") stays intact; correlating a broker-side lookup with this
+    local one is the CALLER's job, not this function's."""
+    for intent in list_intents():
+        if intent.client_order_id == client_order_id:
+            return intent
+    return None
+
+
 def transition_intent(
     intent: OrderIntent,
     new_status: str,

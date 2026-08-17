@@ -1,7 +1,86 @@
 # === DRAFT ONLY — NOT ADDED TO ANY CRONTAB — awaiting explicit approval ===
 #
-# v3 — supersedes control_arm_crontab_v2.draft. Fixes applied after a
-# second external audit found three remaining problems in v2:
+# v5 — supersedes v4 (this same file, prior version). Switches the `cd`
+# target and the python/script invocation from the mutable runtime root
+# (/root/AI-Stock-Radar-Control) to the immutable, provenance-verified
+# release symlink (/root/AI-Stock-Radar-Control/deploy/current) --
+# see scripts/deploy_control_arm_release.sh and
+# scripts/verify_control_arm_deploy.sh, both real, tested in a local
+# sandbox this same session (see that session's own report: git archive
+# → SHA-256-verified tar transfer → atomic symlink swap → atomic
+# DEPLOYED_VERSION.txt). Every cron invocation now runs whatever exact
+# commit `deploy/current` currently points at -- explicit, auditable,
+# and impossible to silently drift from what was approved, unlike
+# invoking a live/mutable working-tree checkout directly. NOTHING here
+# is live yet: no release has been deployed to the real server (this
+# was deliberately NOT done this session -- sandbox-only, per explicit
+# instruction), so `deploy/current` does not exist there yet either.
+# `--env-file`, `--state-path`, `--decision-log-directory`,
+# `--healthchecks-env-file`, and `AI_STOCK_RADAR_GUARD_DIR` all stay
+# pinned to the STABLE runtime-root absolute paths, deliberately NOT
+# release-relative -- persistent state/credentials/config must survive
+# across releases, only the CODE (and the venv/guard/logs/data/live
+# symlinks the deploy script creates inside each release, pointing right
+# back at these same stable paths) is release-versioned.
+#
+# v4 (unchanged, still in effect): Healthchecks.io dead-man's-switch
+# wiring on top of v3's fixes (all still in effect, unchanged — see the
+# tail of this comment block for the full v2→v3 history). NOTHING
+# healthchecks-related is live yet either: Levent has not created a
+# Healthchecks.io account, so HEALTHCHECKS_LIVENESS_URL/
+# HEALTHCHECKS_OPERATIONAL_URL are placeholders in
+# /root/.config/ai-stock-radar-control/healthchecks.env (a file that
+# does not exist on the server yet either). Every healthchecks-related
+# piece below is written to degrade to a silent no-op if that file or
+# those URLs are absent — see src/live/healthchecks_ping.py's own module
+# docstring and run_control_arm_decision.py's `_load_healthchecks_config`
+# for the in-process half of this same guarantee.
+#
+# TWO INDEPENDENT LIVENESS LAYERS, DELIBERATELY, NOT A DUPLICATION BUG:
+# 1. The SHELL-level curl calls below (before/after the python command)
+#    are the OUTER layer -- they fire even if Python itself fails to
+#    start at all (a broken venv, a missing dependency, a syntax error
+#    from a bad deploy) -- exactly the class of failure the in-process
+#    code below can never detect, because it needs Python to already be
+#    running correctly enough to read config and make an HTTP call.
+# 2. run_control_arm_decision.py's own `main()`/`_execute()` ALSO pings
+#    the SAME liveness check from inside Python (see that file's
+#    "HEALTHCHECKS.IO DEAD-MAN'S-SWITCH" docstring section) -- this INNER
+#    layer is what also drives the SEPARATE operational-state check
+#    (STOP/FREEZE/lock-conflict/Telegram-delivery-failure/market-closed/
+#    normal -- richer, domain-aware, only possible from inside Python).
+# On a normal run both layers ping liveness successfully -- Healthchecks.io
+# pings are idempotent check-ins, a harmless double ping, not an error.
+# The redundancy is the entire point: the shell layer is what still tells
+# you the cron job silently stopped running at all, even in the one case
+# (Python won't start) the smarter in-process layer structurally cannot
+# cover itself.
+#
+# Both curl blocks below are silently skipped if HEALTHCHECKS_LIVENESS_URL
+# is unset/blank (sourcing a missing/incomplete healthchecks.env leaves it
+# unset, `2>/dev/null` swallows the "file not found" from `.`, and the
+# `[ -n "$HEALTHCHECKS_LIVENESS_URL" ]` guard skips every curl in that
+# case) -- exactly the "silently disabled if not configured, never blocks
+# the system" requirement, enforced at the shell layer too, not just in
+# Python.
+#
+# `curl -fsS -m 10 --retry 3`: `-m 10` is a 10-second timeout per
+# attempt, `--retry 3` retries transient failures up to 3 times (curl's
+# own built-in retry, same 10s/3x envelope as the in-process
+# `healthchecks_ping.py`), `-f` fails silently on an HTTP error status
+# (so a bad ping never corrupts stdout), `-s`/`-S` stay quiet except for
+# an actual error written to stderr (captured by this line's own `2>&1`
+# redirect into the daily log, same as everything else on this line).
+#
+# PYTHON'S OWN EXIT CODE IS PRESERVED: `EXIT_CODE=$?` is captured
+# IMMEDIATELY after the python command (before any curl call can
+# overwrite `$?`), and the line ends with `exit $EXIT_CODE` -- cron sees
+# the exact same exit status it would have seen with no healthchecks
+# wrapping at all, so a real runner failure still shows up as a failed
+# cron job in every other sense (mail-on-error, log monitoring, etc.),
+# never masked by the wrapper.
+#
+# v2→v3 fixes (unchanged, still in effect):
 #   1. --env-file /root/AI-Stock-Radar-Control/.env added to the command.
 #      v2 relied on run_control_arm_decision.py's transitive imports
 #      (src/data/alpaca_market_data.py, src/notify/telegram_notifier.py)
@@ -57,7 +136,7 @@
 # transitions -- if the live system's 21:15 UTC is itself DST-adjusted
 # by some external mechanism twice a year, this 22:02 UTC control-arm
 # schedule needs the identical adjustment to keep the same 47-minute/
-# non-multiple-of-5 relationship. ACTION ITEM, unchanged from v2: once
+# non-multiple-of-5 relationship. ACTION ITEM, unchanged from v2/v3: once
 # SSH access works, read the live crontab's actual text/mechanism and
 # either mirror it here or confirm it is unnecessary.
 #
@@ -65,7 +144,7 @@
 # a read-only signal-generation + paper-position-tracking run until the
 # user explicitly approves enabling real paper order submission.
 #
-# Guard-file isolation (unchanged from v2): AI_STOCK_RADAR_GUARD_DIR
+# Guard-file isolation (unchanged from v2/v3): AI_STOCK_RADAR_GUARD_DIR
 # below points HIGH_WATER_MARK_PATH (src/live/position_state.py) at a
 # control-arm-only directory -- without this it would default to
 # $HOME/.ai_stock_radar_guard/ and silently collide with the live
@@ -74,4 +153,4 @@
 # to the user (/root/AI-Stock-Radar-Control/.guard).
 
 AI_STOCK_RADAR_GUARD_DIR=/root/AI-Stock-Radar-Control/.guard
-02 22 * * 1-5 cd /root/AI-Stock-Radar-Control && /root/AI-Stock-Radar-Control/.venv/bin/python3 scripts/run_control_arm_decision.py --state-path /root/AI-Stock-Radar-Control/data/live/position_state.json --decision-log-directory /root/AI-Stock-Radar-Control/data/live/decisions --env-file /root/AI-Stock-Radar-Control/.env >> /root/AI-Stock-Radar-Control/logs/daily_decision.log 2>&1
+02 22 * * 1-5 cd /root/AI-Stock-Radar-Control/deploy/current && set -a && . /root/.config/ai-stock-radar-control/healthchecks.env 2>/dev/null; set +a; if [ -n "$HEALTHCHECKS_LIVENESS_URL" ]; then curl -fsS -m 10 --retry 3 -o /dev/null -X POST "${HEALTHCHECKS_LIVENESS_URL}/start"; fi; /root/AI-Stock-Radar-Control/deploy/current/.venv/bin/python3 scripts/run_control_arm_decision.py --state-path /root/AI-Stock-Radar-Control/data/live/position_state.json --decision-log-directory /root/AI-Stock-Radar-Control/data/live/decisions --env-file /root/AI-Stock-Radar-Control/.env --healthchecks-env-file /root/.config/ai-stock-radar-control/healthchecks.env >> /root/AI-Stock-Radar-Control/logs/daily_decision.log 2>&1; EXIT_CODE=$?; if [ -n "$HEALTHCHECKS_LIVENESS_URL" ]; then if [ $EXIT_CODE -eq 0 ]; then curl -fsS -m 10 --retry 3 -o /dev/null -X POST "$HEALTHCHECKS_LIVENESS_URL"; else curl -fsS -m 10 --retry 3 -o /dev/null -X POST "${HEALTHCHECKS_LIVENESS_URL}/fail"; fi; fi; exit $EXIT_CODE
