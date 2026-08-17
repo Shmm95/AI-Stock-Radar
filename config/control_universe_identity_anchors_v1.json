@@ -1,0 +1,861 @@
+{
+  "schema_version": 1,
+  "universe_id": "control_arm_v1_midcap400_44",
+  "universe_source_commit": "bfa2763bf3e26a240657bfc090232c4b5ad16ac3",
+  "universe_source_snapshot": "data/research/sp_midcap400_control_universe_snapshot_20260815_165011.json",
+  "created_at_utc": "2026-08-17T17:49:52Z",
+  "approval_status": "PRE_REGISTERED_FROZEN_BEFORE_LIVE",
+  "ticker_count": 44,
+  "ticker_set_sha256": "249bfed732db7203dc3b0aadb99ea4f73e9e1cf878f42bf94780ddeee707c44e",
+  "sources": {
+    "alpaca": {
+      "account_identity_masked": "...XO4Y",
+      "get_all_assets_call": "unfiltered (GetAssetsRequest with no status/asset_class filter)",
+      "total_assets_returned": 33500,
+      "fetched_at_utc": "2026-08-17T17:49:51Z"
+    },
+    "sec_edgar": {
+      "source_url": "https://www.sec.gov/files/company_tickers.json",
+      "total_entries": 10396,
+      "fetched_at_utc": "2026-08-17T17:49:52Z"
+    }
+  },
+  "anchors": [
+    {
+      "ticker": "AA",
+      "sec_cik": 1675149,
+      "expected_company_name": "Alcoa Corp",
+      "sec_ticker_at_anchor": "AA",
+      "alpaca_asset_id": "3ca0202f-01f4-41a0-bb0c-c8864e767ebd",
+      "alpaca_symbol_at_anchor": "AA",
+      "alpaca_asset_name_at_anchor": "Alcoa Corporation",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "a25653ba2761b0e439f3057f11b0737d879b8e633932ce6a1837a58e66c9bf42",
+        "sec_company_tickers_record_sha256": "f7c354cc70b4c9a8cc9b8d5257d972d4de3a3d1fd0ac90204bdcfb32b4ec1300"
+      }
+    },
+    {
+      "ticker": "ASB",
+      "sec_cik": 7789,
+      "expected_company_name": "ASSOCIATED BANC-CORP",
+      "sec_ticker_at_anchor": "ASB",
+      "alpaca_asset_id": "5cfffa5c-348e-4194-bd43-77f9e32bc09e",
+      "alpaca_symbol_at_anchor": "ASB",
+      "alpaca_asset_name_at_anchor": "Associated Banc-Corp",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "a4f31b89301b25ed058e823b0db93dbaacedc064a16d384e442b74c2493c61e2",
+        "sec_company_tickers_record_sha256": "5fc6f73d74c5672d8ebefb78c72afb6ea4f293ce9c3e8c2b0d09ef7189145f42"
+      }
+    },
+    {
+      "ticker": "AVNT",
+      "sec_cik": 1122976,
+      "expected_company_name": "AVIENT CORP",
+      "sec_ticker_at_anchor": "AVNT",
+      "alpaca_asset_id": "2b4e8100-4aad-4ed1-8922-44d07e1831f7",
+      "alpaca_symbol_at_anchor": "AVNT",
+      "alpaca_asset_name_at_anchor": "Avient Corporation",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "017a6807a5494e52fa7265b09de1fed3b50c517e6e98b08f76530c42afc915b6",
+        "sec_company_tickers_record_sha256": "bb180688601fe242bf85a5456759ba0f09c66a1bedaab0996a8e817b92640e4a"
+      }
+    },
+    {
+      "ticker": "BJ",
+      "sec_cik": 1531152,
+      "expected_company_name": "BJ's Wholesale Club Holdings, Inc.",
+      "sec_ticker_at_anchor": "BJ",
+      "alpaca_asset_id": "5aedb37d-0461-4d32-8068-8da62fef963b",
+      "alpaca_symbol_at_anchor": "BJ",
+      "alpaca_asset_name_at_anchor": "BJs Wholesale Club Holdings, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "4de1da152a20214ee01b8105874fc84a8a42988426f6da626d44cf08d05a84f7",
+        "sec_company_tickers_record_sha256": "068c3dd41615d0c540bd81967024c655c69973384c72dd7abf714a36e6c09bd3"
+      }
+    },
+    {
+      "ticker": "CDE",
+      "sec_cik": 215466,
+      "expected_company_name": "Coeur Mining, Inc.",
+      "sec_ticker_at_anchor": "CDE",
+      "alpaca_asset_id": "74f7cda3-433d-4597-bf2c-b6e7782133d6",
+      "alpaca_symbol_at_anchor": "CDE",
+      "alpaca_asset_name_at_anchor": "Coeur Mining, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "47f7c3c535dfffdcef7f4ca24231b915529bd632fe857dc11d805d267c5c8a40",
+        "sec_company_tickers_record_sha256": "f1725516d7a57c8ae4ab05e3e6cd9265fad9a0fc3d73f02e298ab74257c01021"
+      }
+    },
+    {
+      "ticker": "CNO",
+      "sec_cik": 1224608,
+      "expected_company_name": "CNO Financial Group, Inc.",
+      "sec_ticker_at_anchor": "CNO",
+      "alpaca_asset_id": "6db93524-f41a-413b-8819-16b3c31f70ed",
+      "alpaca_symbol_at_anchor": "CNO",
+      "alpaca_asset_name_at_anchor": "CNO Financial Group, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "96786511eb0c1f3fd18f6b6c803d30348f877cc1dd4261289c0378e7beefb29d",
+        "sec_company_tickers_record_sha256": "7a81c03aea19ce5d1c8cc3a10d963b0242fa8e38206ebe3553732c8161ddc268"
+      }
+    },
+    {
+      "ticker": "CSL",
+      "sec_cik": 790051,
+      "expected_company_name": "CARLISLE COMPANIES INC",
+      "sec_ticker_at_anchor": "CSL",
+      "alpaca_asset_id": "33cbb102-9a1a-4b71-9b78-488edbb52d06",
+      "alpaca_symbol_at_anchor": "CSL",
+      "alpaca_asset_name_at_anchor": "Carlisle Companies, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "cef875b9d8a1005f3e29c7cbdd5785b5a2e588b87749661e7cf7a3d4e004f311",
+        "sec_company_tickers_record_sha256": "f6a070f43a9b0a40dd0230209214715883435ce7736409a61d0f1df8dce57e63"
+      }
+    },
+    {
+      "ticker": "DTM",
+      "sec_cik": 1842022,
+      "expected_company_name": "DT Midstream, Inc.",
+      "sec_ticker_at_anchor": "DTM",
+      "alpaca_asset_id": "b988bd04-4998-4039-8580-443adf2f7aec",
+      "alpaca_symbol_at_anchor": "DTM",
+      "alpaca_asset_name_at_anchor": "DT Midstream, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "a1cdcc0ac76421677647ad8ee1503ef65d8e7a9224677472f07a6fd3fbb2a4f9",
+        "sec_company_tickers_record_sha256": "a36a181d829113845b8c78453545043963b7ff3ea5d8f32794b8f27ac10ff580"
+      }
+    },
+    {
+      "ticker": "EXEL",
+      "sec_cik": 939767,
+      "expected_company_name": "EXELIXIS, INC.",
+      "sec_ticker_at_anchor": "EXEL",
+      "alpaca_asset_id": "2dc1e22f-705f-4ad6-9c42-168259d856d0",
+      "alpaca_symbol_at_anchor": "EXEL",
+      "alpaca_asset_name_at_anchor": "Exelixis, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "6a9cd0d04402fe3e7ec0d427543f8abda50faee60f6cfa0dbcdc14331e717dfa",
+        "sec_company_tickers_record_sha256": "99a7fd28143a9353597291a5b6eb704f8dabec6606a8dacd506a76ce30d2faee"
+      }
+    },
+    {
+      "ticker": "FR",
+      "sec_cik": 921825,
+      "expected_company_name": "FIRST INDUSTRIAL REALTY TRUST INC",
+      "sec_ticker_at_anchor": "FR",
+      "alpaca_asset_id": "24396697-d477-41eb-b8ca-3a2c8efca348",
+      "alpaca_symbol_at_anchor": "FR",
+      "alpaca_asset_name_at_anchor": "First Industrial Realty Trust, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "875bcd6814ac3d932e1e510f17450a75bdc03e7db6bce6aad8837f292ccc0292",
+        "sec_company_tickers_record_sha256": "fa67e2ae4e6fd9f26c041002f1e2182e13d42d36e7f4c81b4e6dae353d3d7faf"
+      }
+    },
+    {
+      "ticker": "GXO",
+      "sec_cik": 1852244,
+      "expected_company_name": "GXO Logistics, Inc.",
+      "sec_ticker_at_anchor": "GXO",
+      "alpaca_asset_id": "87cd3b25-3320-48f7-a71c-0004d08eff5d",
+      "alpaca_symbol_at_anchor": "GXO",
+      "alpaca_asset_name_at_anchor": "GXO Logistics, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "c35b842f0d8066c1d6f476795ed069ce92cff3a6fb397c5daac621c7191c5869",
+        "sec_company_tickers_record_sha256": "b537eda98f65a89f4b24e6e508f7846a761a064dc7aeb1b39c7779b2f70da158"
+      }
+    },
+    {
+      "ticker": "HGV",
+      "sec_cik": 1674168,
+      "expected_company_name": "Hilton Grand Vacations Inc.",
+      "sec_ticker_at_anchor": "HGV",
+      "alpaca_asset_id": "961509c4-722e-4e57-a782-b35cef2bca3b",
+      "alpaca_symbol_at_anchor": "HGV",
+      "alpaca_asset_name_at_anchor": "Hilton Grand Vacations Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "bb0526fab26323bf5056476bfde29a000fa446a47802832b5d3384d5c421993b",
+        "sec_company_tickers_record_sha256": "dd3014797dcf06794a7b5c1d9bce2ad2dc71f5d194a4cfeb2f6598618deea650"
+      }
+    },
+    {
+      "ticker": "HR",
+      "sec_cik": 1360604,
+      "expected_company_name": "Healthcare Realty Trust Inc",
+      "sec_ticker_at_anchor": "HR",
+      "alpaca_asset_id": "b6478b5c-7672-4067-b354-d381ddb277ed",
+      "alpaca_symbol_at_anchor": "HR",
+      "alpaca_asset_name_at_anchor": "Healthcare Realty Trust Incorporated",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "44eb98fd7c9617a96ef68c277582dfb4b08eb89b4f1f04112ac399d6206812dd",
+        "sec_company_tickers_record_sha256": "cd32cb89ee77a4a2da7219dfcfe75479614a5083e64a7d6e9df1ebab38578058"
+      }
+    },
+    {
+      "ticker": "INGR",
+      "sec_cik": 1046257,
+      "expected_company_name": "Ingredion Inc",
+      "sec_ticker_at_anchor": "INGR",
+      "alpaca_asset_id": "d63f9fea-b582-40db-b75f-0329224436df",
+      "alpaca_symbol_at_anchor": "INGR",
+      "alpaca_asset_name_at_anchor": "Ingredion Incorporated",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "bbf578a04646719ac1aabdda84564ec7851e02c3730cfe2014891c56a5627279",
+        "sec_company_tickers_record_sha256": "9948d82f0ef05d31a72440286e20a6db278549185f0eab2e9b656cc24ba4a13c"
+      }
+    },
+    {
+      "ticker": "JAZZ",
+      "sec_cik": 1232524,
+      "expected_company_name": "Jazz Pharmaceuticals plc",
+      "sec_ticker_at_anchor": "JAZZ",
+      "alpaca_asset_id": "ad1ed09f-3d20-4826-9461-af127395b6c7",
+      "alpaca_symbol_at_anchor": "JAZZ",
+      "alpaca_asset_name_at_anchor": "Jazz Pharmaceuticals plc Common Stock (Ireland)",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "e490a2d7caa9b12ca0513b684d219e9dc28e307e828595dc38b738163794a010",
+        "sec_company_tickers_record_sha256": "3df3958abae51618803feabe074ee4fb87b750924ad0f599e243f0648e3be822"
+      }
+    },
+    {
+      "ticker": "JLL",
+      "sec_cik": 1037976,
+      "expected_company_name": "JONES LANG LASALLE INC",
+      "sec_ticker_at_anchor": "JLL",
+      "alpaca_asset_id": "e9b749dc-a900-4a14-a1fc-ceba5d8d7810",
+      "alpaca_symbol_at_anchor": "JLL",
+      "alpaca_asset_name_at_anchor": "Jones Lang LaSalle, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "f3089f0a46ab265f3e57f71db974e164708f06297932562430b8c0b0d379ce0c",
+        "sec_company_tickers_record_sha256": "da88f3f33af0c470b19d9addcdf3ec540dde882fb5d61e4c0933ccfb0246f12d"
+      }
+    },
+    {
+      "ticker": "MANH",
+      "sec_cik": 1056696,
+      "expected_company_name": "MANHATTAN ASSOCIATES INC",
+      "sec_ticker_at_anchor": "MANH",
+      "alpaca_asset_id": "6007d5bb-953b-4910-89c1-aa87ae9e75c9",
+      "alpaca_symbol_at_anchor": "MANH",
+      "alpaca_asset_name_at_anchor": "Manhattan Associates, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "c5c18af5591f1a97be3d6f72b27b5f3753ac411ebb330fd24e23096894783aa4",
+        "sec_company_tickers_record_sha256": "c4db8377530fd5f71c11df0e226cbcea4cdd299f961edd8feb584bdd83f65242"
+      }
+    },
+    {
+      "ticker": "MTDR",
+      "sec_cik": 1520006,
+      "expected_company_name": "Matador Resources Co",
+      "sec_ticker_at_anchor": "MTDR",
+      "alpaca_asset_id": "2f00ea44-09ec-47cf-8bd5-63db689b8a88",
+      "alpaca_symbol_at_anchor": "MTDR",
+      "alpaca_asset_name_at_anchor": "MATADOR RESOURCES COMPANY",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "1a9ec3b8fce1a72dab8f7ff3aef2690ed379f47196145e815df09154516b7611",
+        "sec_company_tickers_record_sha256": "8b68e4d09c6b755df4e1ea2ede0117658c8d86a1055cf5ee1e9b9d114cbbd4f4"
+      }
+    },
+    {
+      "ticker": "NJR",
+      "sec_cik": 356309,
+      "expected_company_name": "NEW JERSEY RESOURCES CORP",
+      "sec_ticker_at_anchor": "NJR",
+      "alpaca_asset_id": "27baf56f-40c3-43c6-882b-f20819e1fde1",
+      "alpaca_symbol_at_anchor": "NJR",
+      "alpaca_asset_name_at_anchor": "New Jersey Resources Corp",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "33a20c03b7b0c54be87f20c09c93e1482071cb4a58cfafea351ef5a19020668c",
+        "sec_company_tickers_record_sha256": "f2c2b8a388feb0f486234d37fced94423e7166958770ec29a372a6d217864efb"
+      }
+    },
+    {
+      "ticker": "NVST",
+      "sec_cik": 1757073,
+      "expected_company_name": "Envista Holdings Corp",
+      "sec_ticker_at_anchor": "NVST",
+      "alpaca_asset_id": "3e9b6a2e-d865-4aeb-8079-e78e5c13ef88",
+      "alpaca_symbol_at_anchor": "NVST",
+      "alpaca_asset_name_at_anchor": "Envista Holdings Corporation Common stock, $0.01 par value per share",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "d7e087aa2b4a94a5c800acd49c0ddda554341a77d666bb9b80aca459143a0d1c",
+        "sec_company_tickers_record_sha256": "b169d9168fc7484b2ca7cce34fd7b57d224adee76b547e63e198da7ce9f8271e"
+      }
+    },
+    {
+      "ticker": "NXST",
+      "sec_cik": 1142417,
+      "expected_company_name": "NEXSTAR MEDIA GROUP, INC.",
+      "sec_ticker_at_anchor": "NXST",
+      "alpaca_asset_id": "0c6730bb-5d7d-491b-8a80-2144619c383e",
+      "alpaca_symbol_at_anchor": "NXST",
+      "alpaca_asset_name_at_anchor": "Nexstar Media Group, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "1d881de7fdbb0c2c663953edf577a08c0253bf0b1251536834b49ffbf0180e01",
+        "sec_company_tickers_record_sha256": "d3fed506e7927ea8e9a22ec01f4cd0da7daf0e43d7589623d9eed76092adf82d"
+      }
+    },
+    {
+      "ticker": "NYT",
+      "sec_cik": 71691,
+      "expected_company_name": "NEW YORK TIMES CO",
+      "sec_ticker_at_anchor": "NYT",
+      "alpaca_asset_id": "b5f4f9e0-89e5-4d5a-a7cf-70503212c958",
+      "alpaca_symbol_at_anchor": "NYT",
+      "alpaca_asset_name_at_anchor": "New York Times Co.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "a509ec3cc18e18a94ab2b2fd4d8f1fd518c564bb87e816a8282bf55c55750798",
+        "sec_company_tickers_record_sha256": "ec7f7ae06283f4a2d00d6053afc9b69f500d059507ca0e2fdd8c39d2afb8c32d"
+      }
+    },
+    {
+      "ticker": "OGE",
+      "sec_cik": 1021635,
+      "expected_company_name": "OGE ENERGY CORP.",
+      "sec_ticker_at_anchor": "OGE",
+      "alpaca_asset_id": "708130a6-61e6-4f12-a13e-787801f5a281",
+      "alpaca_symbol_at_anchor": "OGE",
+      "alpaca_asset_name_at_anchor": "OGE Energy Corp.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "75d2c27886f9051e7c47969f851d2315dd91982dc7c8aa0c91c8913fb1e8ead4",
+        "sec_company_tickers_record_sha256": "843bb50d758ceebc6774bd21613bda9bb3d19e3b629c21f40c99937ff600e0ef"
+      }
+    },
+    {
+      "ticker": "ORA",
+      "sec_cik": 1296445,
+      "expected_company_name": "ORMAT TECHNOLOGIES, INC.",
+      "sec_ticker_at_anchor": "ORA",
+      "alpaca_asset_id": "d1c0c059-88e4-4df3-8644-16561fd7bf4f",
+      "alpaca_symbol_at_anchor": "ORA",
+      "alpaca_asset_name_at_anchor": "Ormat Technologies, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "f3e6f5aa1fe4bb945e9519b5c12d2a8ad7a895ec6fe6a1013d0e153a66945847",
+        "sec_company_tickers_record_sha256": "66d7a12e433173f22449f635537c537b8211cac4e03929e47bd72b69f34b4d22"
+      }
+    },
+    {
+      "ticker": "OVV",
+      "sec_cik": 1792580,
+      "expected_company_name": "Ovintiv Inc.",
+      "sec_ticker_at_anchor": "OVV",
+      "alpaca_asset_id": "6a8e775c-1cf3-48bf-a3d1-3ceabcbf0a44",
+      "alpaca_symbol_at_anchor": "OVV",
+      "alpaca_asset_name_at_anchor": "Ovintiv Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "6d55f29cd77a149c49770a013286a03c76489010e69ca7690e70829be7ca1b3b",
+        "sec_company_tickers_record_sha256": "324bc9348fab3025f5cb1eb9413e1ba9081fcd6ba6dfeaa9624f5c1eb930a607"
+      }
+    },
+    {
+      "ticker": "PEGA",
+      "sec_cik": 1013857,
+      "expected_company_name": "PEGASYSTEMS INC",
+      "sec_ticker_at_anchor": "PEGA",
+      "alpaca_asset_id": "9f54d72f-f84b-46e1-a071-600d5520e70d",
+      "alpaca_symbol_at_anchor": "PEGA",
+      "alpaca_asset_name_at_anchor": "Pegasystems Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "740bc8413f10b9cc440d6acdafa7a858d85316866a965536d00dd2167b107830",
+        "sec_company_tickers_record_sha256": "9c88b66e0eb7cc8a46999a5956c0859a9913b6ffd7a63cd2c43dd49e3b734258"
+      }
+    },
+    {
+      "ticker": "PINS",
+      "sec_cik": 1506293,
+      "expected_company_name": "PINTEREST, INC.",
+      "sec_ticker_at_anchor": "PINS",
+      "alpaca_asset_id": "e034f73f-5a8c-40af-8ed4-d4aed89f3740",
+      "alpaca_symbol_at_anchor": "PINS",
+      "alpaca_asset_name_at_anchor": "Pinterest, Inc. Class A Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "ebacfbda91ee0cfe0c6e6fa60c4e93b58ab39e6b8589c2859ebf8fbb53b52c16",
+        "sec_company_tickers_record_sha256": "af03fea8ffc2f10989d4fca6753ec031f67d25b9d9ea7d3a3e3b135657da3037"
+      }
+    },
+    {
+      "ticker": "POST",
+      "sec_cik": 1530950,
+      "expected_company_name": "Post Holdings, Inc.",
+      "sec_ticker_at_anchor": "POST",
+      "alpaca_asset_id": "967cec46-3eba-48eb-b500-ee855e9ec3e7",
+      "alpaca_symbol_at_anchor": "POST",
+      "alpaca_asset_name_at_anchor": "POST HOLDINGS, INC.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "2f59ecde57f2bbcb7d1d7eff313392c85dfe39e6e1089ccb86ab518685fe0bbd",
+        "sec_company_tickers_record_sha256": "51b57e807a33bf4be8f2445722f9f5110600ece96cadf5106dd9cca6bf8562c5"
+      }
+    },
+    {
+      "ticker": "PVH",
+      "sec_cik": 78239,
+      "expected_company_name": "PVH CORP. /DE/",
+      "sec_ticker_at_anchor": "PVH",
+      "alpaca_asset_id": "8be37e67-c564-40c2-b62c-3c2ea63bd8e0",
+      "alpaca_symbol_at_anchor": "PVH",
+      "alpaca_asset_name_at_anchor": "PVH Corp.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "6e0e2b91aaafd5496b1f892f8b71dc0756a2eb53ded2a2e794f37affd658cdc6",
+        "sec_company_tickers_record_sha256": "36538ec42b6c1f54825b4172553a43b496a7d2afc0a404c514d879c0a697b1a9"
+      }
+    },
+    {
+      "ticker": "REXR",
+      "sec_cik": 1571283,
+      "expected_company_name": "Rexford Industrial Realty, Inc.",
+      "sec_ticker_at_anchor": "REXR",
+      "alpaca_asset_id": "4f6154f7-e54f-46f0-a024-74118638d2ed",
+      "alpaca_symbol_at_anchor": "REXR",
+      "alpaca_asset_name_at_anchor": "REXFORD INDUSTRIAL REALTY, INC.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "93111c9c5cecb6e61a8ebabe93da1bf7177056c47ca148fb715cadb4de748f5b",
+        "sec_company_tickers_record_sha256": "9453620ac9e307550c13419247239a2db217b73e57e604729fcfe8cef8fcf0be"
+      }
+    },
+    {
+      "ticker": "RGEN",
+      "sec_cik": 730272,
+      "expected_company_name": "REPLIGEN CORP",
+      "sec_ticker_at_anchor": "RGEN",
+      "alpaca_asset_id": "93459428-ff91-4928-a9a8-befde317be7d",
+      "alpaca_symbol_at_anchor": "RGEN",
+      "alpaca_asset_name_at_anchor": "Repligen Corporation Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "35d4740ac65934b1725539b80c8df5c5710d96914a58591b836db05af22cbe8c",
+        "sec_company_tickers_record_sha256": "8f6753f8d5e9a6131fe6c326676911b55dcf44e7b221fef3387443be2cda4d8b"
+      }
+    },
+    {
+      "ticker": "RGLD",
+      "sec_cik": 85535,
+      "expected_company_name": "ROYAL GOLD INC",
+      "sec_ticker_at_anchor": "RGLD",
+      "alpaca_asset_id": "957950bd-72e3-4cef-8ad9-5a0c22422c46",
+      "alpaca_symbol_at_anchor": "RGLD",
+      "alpaca_asset_name_at_anchor": "Royal Gold, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "4e1a47877ccdf3fc5c1593cfa00894fa612d1df1aa7ace329be244c6afd9eb68",
+        "sec_company_tickers_record_sha256": "007349cad594efc951bf3106c233984ef1bfd771198c9bf7e62aef388e7788dc"
+      }
+    },
+    {
+      "ticker": "ROKU",
+      "sec_cik": 1428439,
+      "expected_company_name": "ROKU, INC",
+      "sec_ticker_at_anchor": "ROKU",
+      "alpaca_asset_id": "c527d9ac-b902-4dca-89c1-b6735e7460de",
+      "alpaca_symbol_at_anchor": "ROKU",
+      "alpaca_asset_name_at_anchor": "Roku, Inc. Class A Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "42961781ffecf08f287670a66f267453b94f13484595c6f2ebf14b62528d6482",
+        "sec_company_tickers_record_sha256": "eec692ce8e7598b84f6d6e1ee5674612955d17c6f03346958d0cdbf9ea8b8e04"
+      }
+    },
+    {
+      "ticker": "SAM",
+      "sec_cik": 949870,
+      "expected_company_name": "BOSTON BEER CO INC",
+      "sec_ticker_at_anchor": "SAM",
+      "alpaca_asset_id": "cde20996-75b1-457b-b872-e27bd6577087",
+      "alpaca_symbol_at_anchor": "SAM",
+      "alpaca_asset_name_at_anchor": "Boston Beer Company",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "a24c13adc462ee99e875ccc0b88d3b95ef2789f56f8bab7a31d6feccf826d50c",
+        "sec_company_tickers_record_sha256": "b333ba44de1a169ca5aef9f0f4c47a766b012052bc7d9aa3c6b9a05e2f41b4f4"
+      }
+    },
+    {
+      "ticker": "SWX",
+      "sec_cik": 1692115,
+      "expected_company_name": "Southwest Gas Holdings, Inc.",
+      "sec_ticker_at_anchor": "SWX",
+      "alpaca_asset_id": "f1d7daf9-e46e-457c-b4e6-500e521d7c85",
+      "alpaca_symbol_at_anchor": "SWX",
+      "alpaca_asset_name_at_anchor": "Southwest Gas Holdings, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "c427bba354a90f63feffc3903859a91253c793f31688281d42197cb4122c9a00",
+        "sec_company_tickers_record_sha256": "c424951511752e7c28e89f044f06b9a590c9af943953b14856210be5aebc6d7e"
+      }
+    },
+    {
+      "ticker": "TCBI",
+      "sec_cik": 1077428,
+      "expected_company_name": "TEXAS CAPITAL BANCSHARES INC/TX",
+      "sec_ticker_at_anchor": "TCBI",
+      "alpaca_asset_id": "4d14ddd5-2754-40ab-839b-fdbd25685c63",
+      "alpaca_symbol_at_anchor": "TCBI",
+      "alpaca_asset_name_at_anchor": "Texas Capital Bancshares, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "0502826626d9c807996fea9c63507e935f30aadc85e6364528d17d0cd953fb6d",
+        "sec_company_tickers_record_sha256": "3fc188eba07f8a529312a12d85d7a264eb6d8d3644dedc0972f002e6d5a738d1"
+      }
+    },
+    {
+      "ticker": "TREX",
+      "sec_cik": 1069878,
+      "expected_company_name": "TREX CO INC",
+      "sec_ticker_at_anchor": "TREX",
+      "alpaca_asset_id": "687076b9-a1af-4ede-895f-7dad4133f542",
+      "alpaca_symbol_at_anchor": "TREX",
+      "alpaca_asset_name_at_anchor": "Trex Company, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "291f21fba2d399e8662f96c9cb63a6dd6196c14c97078688d5209d06531b97ae",
+        "sec_company_tickers_record_sha256": "a17f485ab16c70abce729767ec31b9a651e124b3ff7e8fe5f56f6d61e0144382"
+      }
+    },
+    {
+      "ticker": "TTMI",
+      "sec_cik": 1116942,
+      "expected_company_name": "TTM TECHNOLOGIES INC",
+      "sec_ticker_at_anchor": "TTMI",
+      "alpaca_asset_id": "bbceaf87-e36a-4d90-a3d1-185d5142e690",
+      "alpaca_symbol_at_anchor": "TTMI",
+      "alpaca_asset_name_at_anchor": "TTM Technologies, Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "4a757571a9bf9f30171d483505e2bfdf50215467c266b13e8e57e1b031190dcb",
+        "sec_company_tickers_record_sha256": "566022cb2be97a4f3f3fe3886014da36803160c8447271cc3f8aa40c9d79fa97"
+      }
+    },
+    {
+      "ticker": "UNM",
+      "sec_cik": 5513,
+      "expected_company_name": "Unum Group",
+      "sec_ticker_at_anchor": "UNM",
+      "alpaca_asset_id": "6dc0a72f-8db7-41e5-b564-89137653e367",
+      "alpaca_symbol_at_anchor": "UNM",
+      "alpaca_asset_name_at_anchor": "Unum Group",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "2f51b916b041b3331b9c77af29dbb6c1d133e63f6691b247026ec987835b455d",
+        "sec_company_tickers_record_sha256": "f4368b64d979b6099e947a9f44ac5df6f9f3f54bb0d2081af297e21782dbc63b"
+      }
+    },
+    {
+      "ticker": "VC",
+      "sec_cik": 1111335,
+      "expected_company_name": "VISTEON CORP",
+      "sec_ticker_at_anchor": "VC",
+      "alpaca_asset_id": "f0efde5b-5276-4db9-ace0-6d9b0c3251ed",
+      "alpaca_symbol_at_anchor": "VC",
+      "alpaca_asset_name_at_anchor": "Visteon Corporation Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "743ff9d8f1bcfeadb73bd7a27bdc0ba38379398ba88dd920152d3bb13ae08ac2",
+        "sec_company_tickers_record_sha256": "84bc9c0256304300aedc937b98da096482449710b2e30bde55ab093bcd9d69c6"
+      }
+    },
+    {
+      "ticker": "VIAV",
+      "sec_cik": 912093,
+      "expected_company_name": "VIAVI SOLUTIONS INC.",
+      "sec_ticker_at_anchor": "VIAV",
+      "alpaca_asset_id": "f90aadf5-2930-4cc5-a8ab-49a4b0974813",
+      "alpaca_symbol_at_anchor": "VIAV",
+      "alpaca_asset_name_at_anchor": "Viavi Solutions Inc. Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "53d55394d5d06816d32e83558ee853e4bcbdb6d04848e5e4e03ce2cde48dfac1",
+        "sec_company_tickers_record_sha256": "c14e61f8b5f7cc02dac80d32be599873008e5a342913e2033184f4e2647e57e4"
+      }
+    },
+    {
+      "ticker": "VNOM",
+      "sec_cik": 2074176,
+      "expected_company_name": "Viper Energy, Inc.",
+      "sec_ticker_at_anchor": "VNOM",
+      "alpaca_asset_id": "16b20982-0ab3-450b-86a7-6b0dfa3500ce",
+      "alpaca_symbol_at_anchor": "VNOM",
+      "alpaca_asset_name_at_anchor": "Viper Energy, Inc. Class A Common Stock",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NASDAQ",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "e78aaa437b5cf0bea64ce4e901ad85391184bafca05b1bf984cf4bf6a987f9ef",
+        "sec_company_tickers_record_sha256": "f9a190a9e61577fc6388cce57aaa6012dee77e1b7c8ea66b989f2dc18947e4ef"
+      }
+    },
+    {
+      "ticker": "WHR",
+      "sec_cik": 106640,
+      "expected_company_name": "WHIRLPOOL CORP /DE/",
+      "sec_ticker_at_anchor": "WHR",
+      "alpaca_asset_id": "a7a9edc6-1d8b-4c37-9497-c0bcba62939b",
+      "alpaca_symbol_at_anchor": "WHR",
+      "alpaca_asset_name_at_anchor": "Whirlpool Corp.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "5712ff6ad94cbfc342688fb87a8447ac6950f47944ca5f83391a1934f708b411",
+        "sec_company_tickers_record_sha256": "2c1960f95d4d947d57539b1c659b3b984bd385d25624d17d7da26fa22e5ac8ef"
+      }
+    },
+    {
+      "ticker": "WSO",
+      "sec_cik": 105016,
+      "expected_company_name": "WATSCO INC",
+      "sec_ticker_at_anchor": "WSO",
+      "alpaca_asset_id": "6dd2f957-3a4b-4872-8656-43b664ec37cd",
+      "alpaca_symbol_at_anchor": "WSO",
+      "alpaca_asset_name_at_anchor": "Watsco, Inc.",
+      "asset_class_at_anchor": "us_equity",
+      "exchange_at_anchor": "NYSE",
+      "status_at_anchor": "active",
+      "tradable_at_anchor": true,
+      "fractionable_at_anchor": true,
+      "anchored_at_utc": "2026-08-17T17:49:51Z",
+      "source_record_hashes": {
+        "alpaca_asset_record_sha256": "c14a09b878ae063d8c406b5730e80dc9e1a2e3040f9d0ac5cc8c7ac948f2306f",
+        "sec_company_tickers_record_sha256": "303422c87242f3e19fde1261645b5c3464f659396b9ff5ab3ea99a6e098da3aa"
+      }
+    }
+  ]
+}

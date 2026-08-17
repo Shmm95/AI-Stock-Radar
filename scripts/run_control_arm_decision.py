@@ -147,6 +147,34 @@ that order's status field on a freshly-loaded state and persists that one
 correction to disk before `rdd.run_daily_decision()` runs, the same as
 any other successful pre-decision state fix.
 
+HEALTHCHECKS.IO DEAD-MAN'S-SWITCH (added 2026-08-16, on top of Phase 2):
+two independent checks -- see `src/live/healthchecks_ping.py`'s own
+module docstring for the mechanical ping contract. LIVENESS is pinged
+`start` as the very first action in `main()`, then `success`/`fail`
+purely on whether `_execute()` raised -- independent of what the run
+actually decided to do (a clean STOP/FREEZE/lock-conflict return is
+still a liveness SUCCESS: the process ran and did not crash). OPERATIONAL
+STATE is pinged `success` only for a genuinely normal run or an expected
+market-closed no-op; every other reachable outcome (STOP active, FREEZE
+active, a lock conflict, or the final Telegram delivery failing) pings
+`fail` with a short, non-sensitive detail code -- see `_execute()`'s own
+return-value contract for the complete outcome table. `main()` wraps the
+call to `_execute()` in a try/except/finally that covers the ENTIRE
+outcome (not just the earlier preflight+run_daily_decision() section --
+see the widened inner try/except inside `_execute()` itself, fixed after
+an independent audit found audit-check/intent-transition/stamp failures
+were previously not caught or notified at all).
+
+Configuration is entirely optional and silently no-ops if absent: no
+`--healthchecks-env-file` given, the file it points to missing, or the
+`HEALTHCHECKS_LIVENESS_URL`/`HEALTHCHECKS_OPERATIONAL_URL` variables
+being blank all result in `ping_healthcheck()` simply returning `False`
+without ever blocking `run_daily_decision()` -- Healthchecks integration
+must never gate trading. A one-time (marker-file-guarded, not per-run)
+`[CONTROL]` Telegram notice is sent the first time this control arm runs
+with Healthchecks not configured, so the gap doesn't go unnoticed
+forever, without spamming the owner on every subsequent cron invocation.
+
 Isolation from the live deployment is NOT implemented in this file --
 it comes entirely from process cwd (`data/live/STOP`, `data/live/FREEZE`,
 and the default `--state-path`/`--decision-log-directory` are all
@@ -165,6 +193,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -172,11 +201,14 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetCalendarRequest
 from dotenv import load_dotenv
 
 import scripts.run_daily_decision as rdd
 import src.live.broker_reconciliation as broker_reconciliation
+import src.live.healthchecks_ping as healthchecks_ping
+import src.live.issuer_identity_preflight as issuer_identity_preflight
 import src.live.order_intent as order_intent
 import src.live.pending_signal_ttl as pending_signal_ttl
 from src.live.control_universe import CONTROL_UNIVERSE_TICKERS
@@ -337,15 +369,21 @@ def _preflight_double_run_check(state_path: Path) -> None:
         )
 
 
-def _expected_equity_session_date() -> str | None:
+def _expected_equity_session_date(client: TradingClient) -> str | None:
     """Real Alpaca `TradingClient.get_calendar()` call, made BEFORE any
     market-data fetch. See module docstring's "MARKET HOLIDAY /
     SESSION-DATE VERIFICATION" section for the full design. Returns the
     calendar-confirmed session date (ISO string) for today if today's
     session exists AND has already closed (+ a 15-minute settle
     buffer), or `None` if this run should clean no-op (no session
-    today, or today's session has not yet closed)."""
-    client = rdd.order_submission.get_trading_client()
+    today, or today's session has not yet closed).
+
+    `client` is REQUIRED, never constructed internally -- see
+    `_execute()`'s own `trading_client` injection-seam parameter for why:
+    every real client construction in this file happens at exactly one
+    point (`_execute()`'s own resolution of `trading_client`), so a test
+    harness supplying a fake client there transparently reaches every
+    Alpaca call this whole run makes, this one included."""
     today = datetime.now(timezone.utc).date()
     calendar = client.get_calendar(GetCalendarRequest(start=today, end=today))
     if not calendar:
@@ -628,6 +666,560 @@ def _finalize_pending_signals_after_run(
     return reconfirmation_outcomes
 
 
+# Outcome codes _execute() can return -- see module docstring's
+# "HEALTHCHECKS.IO DEAD-MAN'S-SWITCH" section and main()'s own mapping
+# from these strings to liveness/operational pings. Plain strings, not an
+# Enum, kept deliberately simple since these are also the literal
+# Healthchecks POST-body detail values (see healthchecks_ping.py's own
+# "POST BODY" docstring section -- non-sensitive status codes only).
+OUTCOME_RUN_OK = "RUN_OK"
+OUTCOME_STOP_ACTIVE = "STOP_ACTIVE"
+OUTCOME_FREEZE_ACTIVE = "FREEZE_ACTIVE"
+OUTCOME_LOCK_CONFLICT = "LOCK_CONFLICT"
+OUTCOME_MARKET_CLOSED_EXPECTED = "MARKET_CLOSED_EXPECTED"
+OUTCOME_TELEGRAM_DELIVERY_FAILED = "TELEGRAM_DELIVERY_FAILED"
+# Only these two outcomes ping the operational check `success` -- every
+# other reachable outcome pings `fail` (still liveness `success`, since
+# none of them are a crash). See module docstring.
+_OPERATIONAL_SUCCESS_OUTCOMES = frozenset({OUTCOME_RUN_OK, OUTCOME_MARKET_CLOSED_EXPECTED})
+
+_HEALTHCHECKS_NOT_CONFIGURED_NOTICE_MARKER = (
+    rdd.ps.HIGH_WATER_MARK_PATH.parent / "healthchecks_not_configured_notice_sent"
+)
+
+
+def _ping_healthcheck(base_url: str | None, event: str, detail: str) -> bool:
+    """Thin wrapper around `healthchecks_ping.ping_healthcheck` -- kept as
+    a separate module-level name (same pattern as `_notify_control`
+    wrapping `rdd._notify_safe`) so call sites in this file read as
+    control-arm-specific operations, and so tests can monkeypatch this
+    one name without reaching into `healthchecks_ping` internals."""
+    return healthchecks_ping.ping_healthcheck(base_url, event, detail)
+
+
+def _notify_and_warn(text: str) -> bool:
+    """`_notify_control(text)`, but captures and reports a delivery
+    failure at every call site uniformly -- the fix for an independent
+    audit finding: several `_notify_control(...)` call sites (STOP,
+    FREEZE, the lock-conflict path, the final daily success message)
+    previously ignored the return value entirely, so a silently-failed
+    Telegram delivery for any of them was invisible. Never raises, never
+    affects trading/state -- purely a reporting fix. Returns the same
+    bool `_notify_control` returned, for callers that need to fold it
+    into an outcome decision (see `_execute()`'s final RUN_OK vs
+    TELEGRAM_DELIVERY_FAILED branch)."""
+    delivered = _notify_control(text)
+    if not delivered:
+        print(
+            "WARNING: [CONTROL] Telegram notification could not be confirmed "
+            "sent (check TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and network "
+            f"reachability). Message was: {text[:200]!r}",
+            file=sys.stderr,
+        )
+    return delivered
+
+
+def _load_healthchecks_config(healthchecks_env_file: str | None) -> tuple[str | None, str | None]:
+    """Returns `(liveness_url, operational_url)`, or `(None, None)` if
+    Healthchecks integration is not available this run -- NEVER raises.
+
+    If `healthchecks_env_file` is given, attempts to load it with
+    `healthchecks_ping.load_healthchecks_env_file_fail_closed` -- the
+    EXACT same fail-closed mechanics as `--env-file`'s own loader
+    (`resolve(strict=True)`, `load_dotenv()` result verified). But unlike
+    `--env-file`, any failure at that stage (missing file, unreadable,
+    nothing loaded) is caught HERE and downgraded to "not available this
+    run" rather than propagated to block the actual trading run --
+    Healthchecks is optional best-effort infrastructure, and per this
+    task's own explicit instruction, its own absence/misconfiguration
+    must never block the system. A missing/empty `HEALTHCHECKS_LIVENESS_URL`/
+    `HEALTHCHECKS_OPERATIONAL_URL` (e.g. the file loaded fine but the real
+    UUIDs haven't been filled in yet) is treated the same way -- silently
+    disabled, not an error."""
+    if healthchecks_env_file:
+        try:
+            healthchecks_ping.load_healthchecks_env_file_fail_closed(healthchecks_env_file)
+        except (FileNotFoundError, RuntimeError) as error:
+            print(
+                f"[CONTROL] Healthchecks config could not be loaded from "
+                f"{healthchecks_env_file!r} ({type(error).__name__}: {error}) "
+                f"-- Healthchecks integration disabled for this run, trading "
+                f"proceeds normally."
+            )
+            return None, None
+    liveness_url = os.environ.get(healthchecks_ping.LIVENESS_URL_ENV_VAR) or None
+    operational_url = os.environ.get(healthchecks_ping.OPERATIONAL_URL_ENV_VAR) or None
+    return liveness_url, operational_url
+
+
+def _notify_healthchecks_not_configured_once() -> None:
+    """Sends a ONE-TIME (marker-file-guarded, not per-cron-run)
+    `[CONTROL]` Telegram notice that Healthchecks integration is not
+    configured. A cron job runs as a fresh process every day, so a plain
+    "notify every time this is true" would resend this notice daily
+    forever -- the marker file (in the same shared guard directory as
+    the single-instance lock and the high-water mark, so it survives
+    across cron invocations) makes this genuinely one-time until a human
+    deletes it."""
+    if _HEALTHCHECKS_NOT_CONFIGURED_NOTICE_MARKER.exists():
+        return
+    _notify_and_warn(
+        "Healthchecks.io integration is not configured (no "
+        "--healthchecks-env-file given, the file it points to is "
+        "missing, or HEALTHCHECKS_LIVENESS_URL/HEALTHCHECKS_OPERATIONAL_URL "
+        "are blank). The control arm will keep running normally without "
+        "dead-man's-switch monitoring until this is configured. This "
+        "notice is sent once; delete "
+        f"{_HEALTHCHECKS_NOT_CONFIGURED_NOTICE_MARKER} to see it again."
+    )
+    _HEALTHCHECKS_NOT_CONFIGURED_NOTICE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    _HEALTHCHECKS_NOT_CONFIGURED_NOTICE_MARKER.write_text(
+        datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8"
+    )
+
+
+def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | None = None) -> str:
+    """Everything `main()` used to do directly, now returning an outcome
+    code (see the `OUTCOME_*` constants) instead of bare `return`
+    statements, so the caller can classify liveness/operational
+    Healthchecks pings without needing its own copy of this control flow.
+    Any genuinely unexpected exception still propagates uncaught (after
+    attempting a `[CONTROL]` failure notification) -- `main()`'s own
+    try/except/finally around the call to this function is what pings
+    Healthchecks `fail` for that case and re-raises so the process still
+    exits non-zero.
+
+    The inner try/except below is DELIBERATELY widened to cover
+    EVERYTHING from the first pre-flight check through the final daily
+    success notification -- fixed after an independent audit found the
+    ORIGINAL version only wrapped preflight+`run_daily_decision()`, so a
+    failure in the audit checks, `_finalize_pending_signals_after_run`,
+    `_run_intent_protocol`, `_stamp_last_processed_dates`, or the intent
+    COMMITTED loop previously propagated with NO `[CONTROL]` failure
+    notification at all -- a real, silent gap in owner-facing visibility
+    for exactly the phase where a bug would be most consequential (after
+    the frozen engine has already computed and partially acted on a real
+    decision).
+
+    `trading_client` -- INJECTION SEAM, test-harness-only, deliberately
+    NOT exposed as a CLI flag anywhere (see `main()`'s own argparse
+    setup, which has no such option): when `None` (every real production
+    invocation -- `main()` always calls `_execute(arguments)` with no
+    override), behavior is completely unchanged from before this
+    parameter existed -- the real `order_submission.get_trading_client()`
+    factory is used, exactly once, at the same point in the flow this
+    call already happened at. When a caller supplies a client directly
+    (only reachable by importing this module and calling `_execute` or
+    `main` as a Python function, e.g. from a test -- there is no
+    argparse path to it), that ONE object is reused for every real
+    Alpaca call this run makes (`get_all_assets` for issuer-identity,
+    `get_account`/`get_orders`/`get_all_positions`/`get_order_by_id` for
+    broker reconciliation, `get_calendar` for the session-date check) --
+    a single resolution point, not a client constructed independently at
+    each call site, so a fake client transparently reaches the whole
+    real flow.
+    """
+    print(
+        f"[CONTROL] Ticker universe in effect ({len(CONTROL_TICKERS_WITH_REGIME)} tickers: "
+        f"{len(CONTROL_UNIVERSE_TICKERS)} strategy + 1 regime-reference-only): "
+        f"{sorted(CONTROL_TICKERS_WITH_REGIME)}"
+    )
+    assert rdd.LIVE_CONTROLLED_TICKERS == CONTROL_TICKERS_WITH_REGIME
+    assert rdd.prepare_live_market_data is _prepare_control_arm_market_data
+
+    # STOP checked FIRST, before even attempting the lock -- matches
+    # run_daily_decision.main()'s own precedence (STOP wins,
+    # unconditionally, before anything else) and means a STOP file alone
+    # is enough to skip a run with zero contention on the lock at all.
+    if rdd.STOP_FLAG_PATH.exists():
+        text = (
+            f"AI-Stock-Radar CONTROL ARM daily decision runner -- STOP flag "
+            f"detected ({rdd.STOP_FLAG_PATH.resolve()}); this run was "
+            f"skipped entirely, no Alpaca API calls were made. Remove the file to resume."
+        )
+        print(text)
+        _notify_and_warn(text)
+        return OUTCOME_STOP_ACTIVE
+
+    # Single-instance lock -- acquired BEFORE any of the checks below,
+    # held for the rest of this run via the `with` block, released the
+    # instant it exits (success, `return`, or exception) -- see
+    # single_instance_lock.py's own module docstring for why this is a
+    # deliberately DIFFERENT mechanism from position_state.py's
+    # _guard_write_lock (kernel-released via fd closure on process exit,
+    # no age-based staleness heuristic at all, fail-closed with no
+    # override if another real process holds it).
+    try:
+        with single_instance_lock(arguments.state_path) as lock_metadata:
+            print(f"[CONTROL] Single-instance lock acquired: {lock_metadata}")
+
+            # STOP re-checked NOW that the lock is held -- closes the
+            # (tiny, but real) window between the first check above and
+            # lock acquisition during which a STOP file could have been
+            # created.
+            if rdd.STOP_FLAG_PATH.exists():
+                text = (
+                    f"AI-Stock-Radar CONTROL ARM daily decision runner -- STOP flag "
+                    f"detected after acquiring the lock ({rdd.STOP_FLAG_PATH.resolve()}); "
+                    f"this run was skipped entirely, no Alpaca API calls were made. "
+                    f"Remove the file to resume."
+                )
+                print(text)
+                _notify_and_warn(text)
+                return OUTCOME_STOP_ACTIVE
+
+            freeze = rdd.FREEZE_FLAG_PATH.exists()
+            if freeze:
+                text = (
+                    f"AI-Stock-Radar CONTROL ARM daily decision runner -- FREEZE flag "
+                    f"detected ({rdd.FREEZE_FLAG_PATH.resolve()}); this run will still "
+                    f"fetch data and monitor/exit existing positions as usual, but will "
+                    f"NOT open any new positions. Remove the file to resume normal entries."
+                )
+                print(text)
+                _notify_and_warn(text)
+
+            try:
+                # Tracks whether EVERY [CONTROL] Telegram notification
+                # this run attempts actually delivered -- folded into the
+                # final RUN_OK vs TELEGRAM_DELIVERY_FAILED outcome code
+                # below (see _execute()'s own docstring / module
+                # docstring's Healthchecks section). A failure here never
+                # affects trading/state, only which outcome code gets
+                # reported.
+                telegram_all_ok = True
+
+                # Pre-flight, BEFORE any API call: refuse to even call
+                # run_daily_decision() if the persisted state already
+                # contains a stale out-of-universe (incl. BTC-USD)
+                # position/pending entry. See _preflight_universe_check's
+                # own docstring for why this is a stronger guarantee
+                # than the post-hoc audit check below.
+                _preflight_universe_check(arguments.state_path, frozenset(CONTROL_UNIVERSE_TICKERS))
+
+                # Second pre-flight, same zero-Alpaca-API-calls
+                # discipline: refuse to double-process today's equity
+                # bar. See its own docstring for exactly what this does
+                # and does not solve.
+                _preflight_double_run_check(arguments.state_path)
+
+                # PHASE 3: issuer-identity preflight -- BEFORE broker
+                # reconciliation and before any market-data fetch. Real,
+                # unfiltered Alpaca get_all_assets() (daily) + a
+                # weekly-cadence-refreshed SEC EDGAR CIK cross-check for
+                # all 44 control tickers against the pre-registered
+                # anchor artifact (config/control_universe_identity_anchors_v1.json)
+                # -- see src/live/issuer_identity_preflight.py's own
+                # module docstring for the full nine-hard-condition/
+                # two-soft-condition table. A hard mismatch raises
+                # IssuerIdentityMismatchError, caught by this same
+                # try/except below (notifies [CONTROL], re-raises,
+                # run_daily_decision() never called -- zero progress, no
+                # single-ticker exclusion exists anywhere in that
+                # module). A soft (review-required) drift does NOT raise
+                # -- this run continues normally, but gets a [CONTROL]
+                # notice below.
+                # Single resolution point for the whole run -- see this
+                # function's own docstring, "trading_client -- INJECTION
+                # SEAM". Real factory unless a test supplied one.
+                reconciliation_client = trading_client if trading_client is not None else rdd.order_submission.get_trading_client()
+                issuer_identity_result = issuer_identity_preflight.run_issuer_identity_preflight(reconciliation_client)
+                if issuer_identity_result.soft_findings:
+                    for finding in issuer_identity_result.soft_findings:
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Issuer-identity SOFT drift (review required, NOT blocking): "
+                            f"{finding.ticker} {finding.field} changed from "
+                            f"{finding.old_value!r} to {finding.new_value!r} -- {finding.detail}"
+                        )
+                print(
+                    f"[CONTROL] Issuer-identity preflight passed: "
+                    f"{issuer_identity_result.checked_ticker_count} ticker(s) verified, "
+                    f"status={issuer_identity_result.status}, "
+                    f"SEC cache age={issuer_identity_result.sec_data_age_days}."
+                )
+
+                # PHASE 2a: broker-vs-local reconciliation, BEFORE any
+                # market-data fetch or decision computation. Account
+                # identity check, then a consistency-verified broker
+                # snapshot (open orders + positions), then the four
+                # documented mismatch scenarios -- see
+                # src/live/broker_reconciliation.py's own module docstring
+                # for the full case table. Raises (fail-closed) on any
+                # anomaly, caught by this same try/except below, which
+                # notifies [CONTROL] and re-raises WITHOUT ever calling
+                # rdd.run_daily_decision() -- so a reconciliation failure
+                # leaves the decision log, position state, and any real
+                # broker order completely untouched. The one narrow
+                # exception (Scenario C's fully-matched "filled" case) is
+                # itself a successful reconciliation outcome, not a
+                # failure -- it updates only an order-status field on the
+                # freshly-loaded state below and persists that correction
+                # to disk before proceeding, exactly like any other
+                # successful pre-decision state fix. NOTE: this deliberately
+                # does NOT yet inspect order_intent.list_intents() for
+                # stray PREPARED/SUBMITTING/UNCERTAIN intents from an
+                # interrupted prior run -- that intent-journal-specific
+                # reconciliation is still out of scope for this task
+                # (broker_reconciliation.py reconciles submitted_actions/
+                # equity_stop_orders/positions only). Reuses
+                # `reconciliation_client`, already constructed above for
+                # the issuer-identity preflight -- one real TradingClient
+                # instance for this whole run, not a fresh one per check.
+                reconciliation_state = rdd.ps.load_position_state(
+                    arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                )
+                reconciliation_result = broker_reconciliation.reconcile(
+                    reconciliation_client, reconciliation_state
+                )
+                if reconciliation_result.order_status_updates:
+                    print(
+                        f"[CONTROL] Broker reconciliation applied narrow "
+                        f"order-status correction(s) (Scenario C, "
+                        f"filled-and-fully-matched only): "
+                        f"{reconciliation_result.order_status_updates}"
+                    )
+                    rdd.ps.save_position_state(
+                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                    )
+                print(
+                    f"[CONTROL] Broker reconciliation passed: account "
+                    f"{reconciliation_result.account_number_masked}, "
+                    f"{reconciliation_result.local_position_count} local "
+                    f"position(s), {reconciliation_result.broker_position_count} "
+                    f"broker position(s), "
+                    f"{reconciliation_result.broker_open_order_count} broker "
+                    f"open order(s), checked at {reconciliation_result.checked_at}."
+                )
+
+                # Real Alpaca calendar check, BEFORE any market-data
+                # fetch. See module docstring's "MARKET HOLIDAY /
+                # SESSION-DATE VERIFICATION" section.
+                expected_session_date = _expected_equity_session_date(reconciliation_client)
+                last_processed_session_date = _read_last_processed_equity_session_date(arguments.state_path)
+                if expected_session_date is None:
+                    text = (
+                        "AI-Stock-Radar CONTROL ARM daily decision runner -- no "
+                        "settled equity session today (no calendar entry, or "
+                        "today's session has not yet closed + settled). Clean "
+                        "no-op, zero progress, zero Alpaca market-data calls."
+                    )
+                    print(text)
+                    _notify_and_warn(text)
+                    return OUTCOME_MARKET_CLOSED_EXPECTED
+
+                # PHASE 2b: pending-signal TTL, BEFORE run_daily_decision()
+                # is ever called -- see src/live/pending_signal_ttl.py's
+                # own module docstring for the full one-shot-session
+                # design and the crypto-date bug it works around WITHOUT
+                # editing run_daily_decision.py. Pure local comparison,
+                # no broker/API call (the one real calendar call this
+                # feature needs -- computing a NEW signal's
+                # target_execution_session_date -- happens only in the
+                # POST-run stamping step below, never here). Mutates
+                # reconciliation_state's pending_buys/pending_exits/
+                # pending_signal_metadata in place and persists that
+                # BEFORE run_daily_decision() loads state, so a stale
+                # signal is pruned before the frozen engine can ever see
+                # it. A raised PendingSignalReconciliationRequiredError
+                # (ambiguous stale EXIT, no local position to reconfirm
+                # against) is caught by the same except block below,
+                # exactly like every other preflight failure -- nothing
+                # is saved on that path (see the function's own docstring
+                # for why), run_daily_decision() is never called.
+                ttl_outcome = pending_signal_ttl.evaluate_pending_signals(
+                    runner_state=reconciliation_state,
+                    expected_session_date=expected_session_date,
+                    freeze_active=freeze,
+                    has_unresolved_journal_trace_for_signal=_has_unresolved_journal_trace_for_signal,
+                    has_unresolved_journal_trace_for_ticker=_has_unresolved_journal_trace_for_ticker,
+                )
+                if ttl_outcome.touched_anything:
+                    rdd.ps.save_position_state(
+                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                    )
+                    for ticker, record in ttl_outcome.expired_buys.items():
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending BUY EXPIRED (TTL, one-shot window missed): {ticker} -- "
+                            f"source session {record.get('source_session_date')}, target "
+                            f"execution session {record.get('target_execution_session_date')}, "
+                            f"now {expected_session_date}, expire_reason="
+                            f"{record.get('expire_reason')}. No broker order was ever created "
+                            f"for this expired signal; it was never resubmitted."
+                        )
+                    for ticker, record in ttl_outcome.quarantined_buys.items():
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending BUY for {ticker} looks stale but has an unresolved "
+                            f"order-journal trace -- QUARANTINED, left in place, NOT expired. "
+                            f"Needs manual/broker reconciliation before this can resolve."
+                        )
+                    for ticker in ttl_outcome.reconfirming_exits:
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending EXIT for {ticker} is stale (one-shot window missed) -- "
+                            f"cleared for deterministic reconfirmation against the current "
+                            f"Close, using the frozen engine's own unmodified exit rule, later "
+                            f"in this same run."
+                        )
+                    for ticker, record in ttl_outcome.quarantined_exits.items():
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending EXIT for {ticker} looks stale but has an unresolved "
+                            f"order-journal trace -- QUARANTINED, left in place, NOT touched. "
+                            f"Needs manual/broker reconciliation before this can resolve."
+                        )
+                    print(
+                        f"[CONTROL] Pending-signal TTL: {len(ttl_outcome.expired_buys)} BUY(s) "
+                        f"expired, {len(ttl_outcome.quarantined_buys)} BUY(s) quarantined, "
+                        f"{len(ttl_outcome.reconfirming_exits)} EXIT(s) sent for reconfirmation, "
+                        f"{len(ttl_outcome.quarantined_exits)} EXIT(s) quarantined."
+                    )
+
+                pre_state_hash = _hash_state_file(arguments.state_path)
+
+                result = rdd.run_daily_decision(
+                    state_path=arguments.state_path,
+                    decision_log_directory=arguments.decision_log_directory,
+                    enable_equity_orders=arguments.enable_equity_orders,
+                    enable_crypto_orders=arguments.enable_crypto_orders,
+                    freeze=freeze,
+                )
+
+                decision = result["decision"]
+                print(json.dumps(decision, indent=2, sort_keys=True, default=str))
+                print()
+                print(f"Decision log written to: {result['log_path'].resolve()}")
+                print(f"Position state updated at: {arguments.state_path.resolve()}")
+
+                # Real-session verification, AFTER the fetch. See module
+                # docstring's own honest limitation note: this detects and
+                # raises loudly, it does not undo run_daily_decision()'s own
+                # internal save that already happened by this point.
+                _verify_actual_equity_session(decision, expected_session_date, last_processed_session_date)
+
+                # Audit assertions -- fail loudly if BTC-USD or any
+                # non-control ticker ever slipped through despite the
+                # patches above. Defense in depth: the module docstring's
+                # reasoning says this should be structurally impossible, but
+                # "should be" is exactly the class of claim this session's
+                # own earlier investigation (a silently wrong dict key
+                # produced a false "0 signals" report) taught not to trust
+                # without a runtime check.
+                open_positions = set(decision.get("open_positions_after_run", {}))
+                queued_buys = {b["ticker"] for b in decision.get("queued_for_next_run", {}).get("buys", [])}
+                executed_entries = {e["ticker"] for e in decision.get("executed_today", {}).get("entries", [])}
+                all_tickers_seen = open_positions | queued_buys | executed_entries
+
+                leaked_btc = all_tickers_seen & {REGIME_ONLY_TICKER}
+                if leaked_btc:
+                    raise RuntimeError(
+                        f"BTC-USD leaked into the tradable control-arm universe despite "
+                        f"the RegimeAllowed=False gate: {leaked_btc}. This should be "
+                        f"structurally impossible -- stop and investigate before this "
+                        f"script is ever used operationally again."
+                    )
+                non_control = all_tickers_seen - set(CONTROL_UNIVERSE_TICKERS)
+                if non_control:
+                    raise RuntimeError(
+                        f"Ticker(s) outside the 44-ticker control universe appeared in "
+                        f"this decision: {non_control}. The universe patch may not have "
+                        f"taken effect -- stop and investigate."
+                    )
+                print("[CONTROL] Audit check passed: zero BTC-USD leakage, zero non-control-universe tickers.")
+
+                # Post-run pending-signal TTL finalize -- see
+                # _finalize_pending_signals_after_run's own docstring for why
+                # this is a second, deliberate save (run_daily_decision()'s
+                # own internal save already wiped pending_signal_metadata to
+                # {}). Creates fresh metadata for anything newly queued this
+                # run and resolves every `reconfirming` stale EXIT to either
+                # `reconfirmed` or `expired_after_reconfirmation`.
+                reconfirmation_outcomes = _finalize_pending_signals_after_run(
+                    arguments.state_path,
+                    client=reconciliation_client,
+                    decision=decision,
+                    ttl_outcome=ttl_outcome,
+                )
+                for ticker, outcome_label in reconfirmation_outcomes.items():
+                    if outcome_label == pending_signal_ttl.STATUS_RECONFIRMED:
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
+                            f"exit rule, re-evaluated against the current Close, STILL finds the "
+                            f"exit condition valid -- re-queued with a fresh source/target session."
+                        )
+                    else:
+                        telegram_all_ok &= _notify_and_warn(
+                            f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
+                            f"exit rule, re-evaluated against the current Close, no longer finds "
+                            f"the exit condition valid -- closed as {outcome_label}, not re-queued."
+                        )
+
+                # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED protocol --
+                # see _run_intent_protocol's own docstring for exactly what
+                # this does and does not represent (no real broker call yet).
+                intents = _run_intent_protocol(decision, pre_state_hash)
+
+                # Stamp last_processed_equity_date/crypto_date AFTER the
+                # audit checks above pass, deliberately -- if this run's own
+                # output were untrustworthy (BTC leak / non-control ticker,
+                # both raise before reaching here), we do not want to record
+                # it as "successfully processed today" and block a corrected
+                # re-run via _preflight_double_run_check.
+                _stamp_last_processed_dates(arguments.state_path, actual_session_date=decision.get("as_of_bar_timestamp_equity"))
+
+                # Intents committed only AFTER state has actually been
+                # durably re-saved above -- COMMITTED is meant to mean
+                # "local state reflects this," not merely "we decided to."
+                for intent in intents:
+                    order_intent.transition_intent(intent, order_intent.COMMITTED)
+                    print(f"[CONTROL] Intent {intent.intent_id} ({intent.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
+
+                telegram_all_ok &= _notify_and_warn(rdd._build_daily_notification_text(decision))
+                # `with single_instance_lock(...)` releases the lock here,
+                # on normal exit from this block.
+                if freeze:
+                    # Being frozen is itself the operationally-notable
+                    # fact for the healthchecks operational check,
+                    # regardless of whether every notification above
+                    # delivered -- takes priority over
+                    # TELEGRAM_DELIVERY_FAILED in the outcome code below
+                    # (a delivery hiccup is still captured and logged to
+                    # stderr by _notify_and_warn either way, just not
+                    # surfaced as the PRIMARY outcome here).
+                    return OUTCOME_FREEZE_ACTIVE
+                if not telegram_all_ok:
+                    return OUTCOME_TELEGRAM_DELIVERY_FAILED
+                return OUTCOME_RUN_OK
+            except Exception as error:
+                # WIDENED to cover the entire block above (preflight
+                # through the final daily notification) -- see this
+                # function's own docstring for the audit finding this
+                # fixes: previously this except only wrapped up through
+                # `rdd.run_daily_decision()`, so an audit-assertion/
+                # intent-transition/stamp failure below that point
+                # propagated with NO [CONTROL] failure notification at
+                # all. Still re-raises -- main()'s own outer
+                # try/except/finally is what pings Healthchecks `fail`
+                # for this case and preserves the non-zero exit code.
+                _notify_and_warn(rdd._build_failure_notification_text(error))
+                raise
+    except SingleInstanceLockError as error:
+        text = (
+            f"AI-Stock-Radar CONTROL ARM daily decision runner -- could not "
+            f"acquire the single-instance lock; another run is already in "
+            f"progress. Refusing to proceed -- zero Alpaca API calls were "
+            f"made. {error}"
+        )
+        print(text)
+        _notify_and_warn(text)
+        return OUTCOME_LOCK_CONFLICT
+    # Any OTHER exception raised inside the `with` block (e.g. from
+    # run_daily_decision() failing, or an audit-assertion RuntimeError)
+    # is deliberately NOT caught here -- it propagates normally, the
+    # `with` block's __exit__ still releases the lock on the way out
+    # (standard context-manager semantics), and the inner try/except
+    # above has already sent the [CONTROL] failure notification before
+    # re-raising. main()'s own outer try/except/finally pings
+    # Healthchecks liveness `fail` for this case.
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -683,348 +1275,58 @@ def main() -> None:
             "real deployment should omit it."
         ),
     )
+    parser.add_argument(
+        "--healthchecks-env-file", type=str, default=None,
+        help=(
+            "Optional .env path providing HEALTHCHECKS_LIVENESS_URL/"
+            "HEALTHCHECKS_OPERATIONAL_URL, loaded with the SAME fail-closed "
+            "loading mechanics as --env-file (resolve(strict=True), "
+            "load_dotenv() result verified) -- but unlike --env-file, a "
+            "failure at that stage never blocks this run; it only disables "
+            "Healthchecks integration for this invocation (see "
+            "_load_healthchecks_config's own docstring). Genuinely optional "
+            "-- omit entirely until a real Healthchecks.io account and its "
+            "two check UUIDs exist; the production crontab (see "
+            "control_arm_crontab_v3.draft) passes "
+            "/root/.config/ai-stock-radar-control/healthchecks.env once "
+            "they do."
+        ),
+    )
     arguments = parser.parse_args()
 
     if arguments.env_file:
         _load_env_file_fail_closed(arguments.env_file)
 
-    print(
-        f"[CONTROL] Ticker universe in effect ({len(CONTROL_TICKERS_WITH_REGIME)} tickers: "
-        f"{len(CONTROL_UNIVERSE_TICKERS)} strategy + 1 regime-reference-only): "
-        f"{sorted(CONTROL_TICKERS_WITH_REGIME)}"
-    )
-    assert rdd.LIVE_CONTROLLED_TICKERS == CONTROL_TICKERS_WITH_REGIME
-    assert rdd.prepare_live_market_data is _prepare_control_arm_market_data
+    liveness_url, operational_url = _load_healthchecks_config(arguments.healthchecks_env_file)
+    if liveness_url is None and operational_url is None:
+        _notify_healthchecks_not_configured_once()
+    _ping_healthcheck(liveness_url, "start", "RUN_STARTED")
 
-    # STOP checked FIRST, before even attempting the lock -- matches
-    # run_daily_decision.main()'s own precedence (STOP wins,
-    # unconditionally, before anything else) and means a STOP file alone
-    # is enough to skip a run with zero contention on the lock at all.
-    if rdd.STOP_FLAG_PATH.exists():
-        text = (
-            f"AI-Stock-Radar CONTROL ARM daily decision runner -- STOP flag "
-            f"detected ({rdd.STOP_FLAG_PATH.resolve()}); this run was "
-            f"skipped entirely, no Alpaca API calls were made. Remove the file to resume."
-        )
-        print(text)
-        _notify_control(text)
-        return
-
-    # Single-instance lock -- acquired BEFORE any of the checks below,
-    # held for the rest of this run via the `with` block, released the
-    # instant it exits (success, `return`, or exception) -- see
-    # single_instance_lock.py's own module docstring for why this is a
-    # deliberately DIFFERENT mechanism from position_state.py's
-    # _guard_write_lock (kernel-released via fd closure on process exit,
-    # no age-based staleness heuristic at all, fail-closed with no
-    # override if another real process holds it).
+    crashed = False
+    outcome: str | None = None
     try:
-        with single_instance_lock(arguments.state_path) as lock_metadata:
-            print(f"[CONTROL] Single-instance lock acquired: {lock_metadata}")
-
-            # STOP re-checked NOW that the lock is held -- closes the
-            # (tiny, but real) window between the first check above and
-            # lock acquisition during which a STOP file could have been
-            # created.
-            if rdd.STOP_FLAG_PATH.exists():
-                text = (
-                    f"AI-Stock-Radar CONTROL ARM daily decision runner -- STOP flag "
-                    f"detected after acquiring the lock ({rdd.STOP_FLAG_PATH.resolve()}); "
-                    f"this run was skipped entirely, no Alpaca API calls were made. "
-                    f"Remove the file to resume."
-                )
-                print(text)
-                _notify_control(text)
-                return
-
-            freeze = rdd.FREEZE_FLAG_PATH.exists()
-            if freeze:
-                text = (
-                    f"AI-Stock-Radar CONTROL ARM daily decision runner -- FREEZE flag "
-                    f"detected ({rdd.FREEZE_FLAG_PATH.resolve()}); this run will still "
-                    f"fetch data and monitor/exit existing positions as usual, but will "
-                    f"NOT open any new positions. Remove the file to resume normal entries."
-                )
-                print(text)
-                _notify_control(text)
-
-            try:
-                # Pre-flight, BEFORE any API call: refuse to even call
-                # run_daily_decision() if the persisted state already
-                # contains a stale out-of-universe (incl. BTC-USD)
-                # position/pending entry. See _preflight_universe_check's
-                # own docstring for why this is a stronger guarantee
-                # than the post-hoc audit check below.
-                _preflight_universe_check(arguments.state_path, frozenset(CONTROL_UNIVERSE_TICKERS))
-
-                # Second pre-flight, same zero-Alpaca-API-calls
-                # discipline: refuse to double-process today's equity
-                # bar. See its own docstring for exactly what this does
-                # and does not solve.
-                _preflight_double_run_check(arguments.state_path)
-
-                # PHASE 2a: broker-vs-local reconciliation, BEFORE any
-                # market-data fetch or decision computation. Account
-                # identity check, then a consistency-verified broker
-                # snapshot (open orders + positions), then the four
-                # documented mismatch scenarios -- see
-                # src/live/broker_reconciliation.py's own module docstring
-                # for the full case table. Raises (fail-closed) on any
-                # anomaly, caught by this same try/except below, which
-                # notifies [CONTROL] and re-raises WITHOUT ever calling
-                # rdd.run_daily_decision() -- so a reconciliation failure
-                # leaves the decision log, position state, and any real
-                # broker order completely untouched. The one narrow
-                # exception (Scenario C's fully-matched "filled" case) is
-                # itself a successful reconciliation outcome, not a
-                # failure -- it updates only an order-status field on the
-                # freshly-loaded state below and persists that correction
-                # to disk before proceeding, exactly like any other
-                # successful pre-decision state fix. NOTE: this deliberately
-                # does NOT yet inspect order_intent.list_intents() for
-                # stray PREPARED/SUBMITTING/UNCERTAIN intents from an
-                # interrupted prior run -- that intent-journal-specific
-                # reconciliation is still out of scope for this task
-                # (broker_reconciliation.py reconciles submitted_actions/
-                # equity_stop_orders/positions only).
-                reconciliation_client = rdd.order_submission.get_trading_client()
-                reconciliation_state = rdd.ps.load_position_state(
-                    arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
-                )
-                reconciliation_result = broker_reconciliation.reconcile(
-                    reconciliation_client, reconciliation_state
-                )
-                if reconciliation_result.order_status_updates:
-                    print(
-                        f"[CONTROL] Broker reconciliation applied narrow "
-                        f"order-status correction(s) (Scenario C, "
-                        f"filled-and-fully-matched only): "
-                        f"{reconciliation_result.order_status_updates}"
-                    )
-                    rdd.ps.save_position_state(
-                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
-                    )
-                print(
-                    f"[CONTROL] Broker reconciliation passed: account "
-                    f"{reconciliation_result.account_number_masked}, "
-                    f"{reconciliation_result.local_position_count} local "
-                    f"position(s), {reconciliation_result.broker_position_count} "
-                    f"broker position(s), "
-                    f"{reconciliation_result.broker_open_order_count} broker "
-                    f"open order(s), checked at {reconciliation_result.checked_at}."
-                )
-
-                # Real Alpaca calendar check, BEFORE any market-data
-                # fetch. See module docstring's "MARKET HOLIDAY /
-                # SESSION-DATE VERIFICATION" section.
-                expected_session_date = _expected_equity_session_date()
-                last_processed_session_date = _read_last_processed_equity_session_date(arguments.state_path)
-                if expected_session_date is None:
-                    text = (
-                        "AI-Stock-Radar CONTROL ARM daily decision runner -- no "
-                        "settled equity session today (no calendar entry, or "
-                        "today's session has not yet closed + settled). Clean "
-                        "no-op, zero progress, zero Alpaca market-data calls."
-                    )
-                    print(text)
-                    _notify_control(text)
-                    return
-
-                # PHASE 2b: pending-signal TTL, BEFORE run_daily_decision()
-                # is ever called -- see src/live/pending_signal_ttl.py's
-                # own module docstring for the full one-shot-session
-                # design and the crypto-date bug it works around WITHOUT
-                # editing run_daily_decision.py. Pure local comparison,
-                # no broker/API call (the one real calendar call this
-                # feature needs -- computing a NEW signal's
-                # target_execution_session_date -- happens only in the
-                # POST-run stamping step below, never here). Mutates
-                # reconciliation_state's pending_buys/pending_exits/
-                # pending_signal_metadata in place and persists that
-                # BEFORE run_daily_decision() loads state, so a stale
-                # signal is pruned before the frozen engine can ever see
-                # it. A raised PendingSignalReconciliationRequiredError
-                # (ambiguous stale EXIT, no local position to reconfirm
-                # against) is caught by the same except block below,
-                # exactly like every other preflight failure -- nothing
-                # is saved on that path (see the function's own docstring
-                # for why), run_daily_decision() is never called.
-                ttl_outcome = pending_signal_ttl.evaluate_pending_signals(
-                    runner_state=reconciliation_state,
-                    expected_session_date=expected_session_date,
-                    freeze_active=freeze,
-                    has_unresolved_journal_trace_for_signal=_has_unresolved_journal_trace_for_signal,
-                    has_unresolved_journal_trace_for_ticker=_has_unresolved_journal_trace_for_ticker,
-                )
-                if ttl_outcome.touched_anything:
-                    rdd.ps.save_position_state(
-                        reconciliation_state, arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
-                    )
-                    for ticker, record in ttl_outcome.expired_buys.items():
-                        _notify_control(
-                            f"Pending BUY EXPIRED (TTL, one-shot window missed): {ticker} -- "
-                            f"source session {record.get('source_session_date')}, target "
-                            f"execution session {record.get('target_execution_session_date')}, "
-                            f"now {expected_session_date}, expire_reason="
-                            f"{record.get('expire_reason')}. No broker order was ever created "
-                            f"for this expired signal; it was never resubmitted."
-                        )
-                    for ticker, record in ttl_outcome.quarantined_buys.items():
-                        _notify_control(
-                            f"Pending BUY for {ticker} looks stale but has an unresolved "
-                            f"order-journal trace -- QUARANTINED, left in place, NOT expired. "
-                            f"Needs manual/broker reconciliation before this can resolve."
-                        )
-                    for ticker in ttl_outcome.reconfirming_exits:
-                        _notify_control(
-                            f"Pending EXIT for {ticker} is stale (one-shot window missed) -- "
-                            f"cleared for deterministic reconfirmation against the current "
-                            f"Close, using the frozen engine's own unmodified exit rule, later "
-                            f"in this same run."
-                        )
-                    for ticker, record in ttl_outcome.quarantined_exits.items():
-                        _notify_control(
-                            f"Pending EXIT for {ticker} looks stale but has an unresolved "
-                            f"order-journal trace -- QUARANTINED, left in place, NOT touched. "
-                            f"Needs manual/broker reconciliation before this can resolve."
-                        )
-                    print(
-                        f"[CONTROL] Pending-signal TTL: {len(ttl_outcome.expired_buys)} BUY(s) "
-                        f"expired, {len(ttl_outcome.quarantined_buys)} BUY(s) quarantined, "
-                        f"{len(ttl_outcome.reconfirming_exits)} EXIT(s) sent for reconfirmation, "
-                        f"{len(ttl_outcome.quarantined_exits)} EXIT(s) quarantined."
-                    )
-
-                pre_state_hash = _hash_state_file(arguments.state_path)
-
-                result = rdd.run_daily_decision(
-                    state_path=arguments.state_path,
-                    decision_log_directory=arguments.decision_log_directory,
-                    enable_equity_orders=arguments.enable_equity_orders,
-                    enable_crypto_orders=arguments.enable_crypto_orders,
-                    freeze=freeze,
-                )
-            except Exception as error:
-                notified = _notify_control(rdd._build_failure_notification_text(error))
-                if not notified:
-                    print(
-                        "WARNING: [CONTROL] Telegram failure notification could not be "
-                        "confirmed sent (check TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and "
-                        "network reachability). Original error follows: "
-                        f"{type(error).__name__}: {error}",
-                        file=sys.stderr,
-                    )
-                raise
-
-            decision = result["decision"]
-            print(json.dumps(decision, indent=2, sort_keys=True, default=str))
-            print()
-            print(f"Decision log written to: {result['log_path'].resolve()}")
-            print(f"Position state updated at: {arguments.state_path.resolve()}")
-
-            # Real-session verification, AFTER the fetch. See module
-            # docstring's own honest limitation note: this detects and
-            # raises loudly, it does not undo run_daily_decision()'s own
-            # internal save that already happened by this point.
-            _verify_actual_equity_session(decision, expected_session_date, last_processed_session_date)
-
-            # Audit assertions -- fail loudly if BTC-USD or any
-            # non-control ticker ever slipped through despite the
-            # patches above. Defense in depth: the module docstring's
-            # reasoning says this should be structurally impossible, but
-            # "should be" is exactly the class of claim this session's
-            # own earlier investigation (a silently wrong dict key
-            # produced a false "0 signals" report) taught not to trust
-            # without a runtime check.
-            open_positions = set(decision.get("open_positions_after_run", {}))
-            queued_buys = {b["ticker"] for b in decision.get("queued_for_next_run", {}).get("buys", [])}
-            executed_entries = {e["ticker"] for e in decision.get("executed_today", {}).get("entries", [])}
-            all_tickers_seen = open_positions | queued_buys | executed_entries
-
-            leaked_btc = all_tickers_seen & {REGIME_ONLY_TICKER}
-            if leaked_btc:
-                raise RuntimeError(
-                    f"BTC-USD leaked into the tradable control-arm universe despite "
-                    f"the RegimeAllowed=False gate: {leaked_btc}. This should be "
-                    f"structurally impossible -- stop and investigate before this "
-                    f"script is ever used operationally again."
-                )
-            non_control = all_tickers_seen - set(CONTROL_UNIVERSE_TICKERS)
-            if non_control:
-                raise RuntimeError(
-                    f"Ticker(s) outside the 44-ticker control universe appeared in "
-                    f"this decision: {non_control}. The universe patch may not have "
-                    f"taken effect -- stop and investigate."
-                )
-            print("[CONTROL] Audit check passed: zero BTC-USD leakage, zero non-control-universe tickers.")
-
-            # Post-run pending-signal TTL finalize -- see
-            # _finalize_pending_signals_after_run's own docstring for why
-            # this is a second, deliberate save (run_daily_decision()'s
-            # own internal save already wiped pending_signal_metadata to
-            # {}). Creates fresh metadata for anything newly queued this
-            # run and resolves every `reconfirming` stale EXIT to either
-            # `reconfirmed` or `expired_after_reconfirmation`.
-            reconfirmation_outcomes = _finalize_pending_signals_after_run(
-                arguments.state_path,
-                client=reconciliation_client,
-                decision=decision,
-                ttl_outcome=ttl_outcome,
-            )
-            for ticker, outcome_label in reconfirmation_outcomes.items():
-                if outcome_label == pending_signal_ttl.STATUS_RECONFIRMED:
-                    _notify_control(
-                        f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
-                        f"exit rule, re-evaluated against the current Close, STILL finds the "
-                        f"exit condition valid -- re-queued with a fresh source/target session."
-                    )
-                else:
-                    _notify_control(
-                        f"Pending EXIT reconfirmation for {ticker}: the frozen engine's own "
-                        f"exit rule, re-evaluated against the current Close, no longer finds "
-                        f"the exit condition valid -- closed as {outcome_label}, not re-queued."
-                    )
-
-            # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED protocol --
-            # see _run_intent_protocol's own docstring for exactly what
-            # this does and does not represent (no real broker call yet).
-            intents = _run_intent_protocol(decision, pre_state_hash)
-
-            # Stamp last_processed_equity_date/crypto_date AFTER the
-            # audit checks above pass, deliberately -- if this run's own
-            # output were untrustworthy (BTC leak / non-control ticker,
-            # both raise before reaching here), we do not want to record
-            # it as "successfully processed today" and block a corrected
-            # re-run via _preflight_double_run_check.
-            _stamp_last_processed_dates(arguments.state_path, actual_session_date=decision.get("as_of_bar_timestamp_equity"))
-
-            # Intents committed only AFTER state has actually been
-            # durably re-saved above -- COMMITTED is meant to mean
-            # "local state reflects this," not merely "we decided to."
-            for intent in intents:
-                order_intent.transition_intent(intent, order_intent.COMMITTED)
-                print(f"[CONTROL] Intent {intent.intent_id} ({intent.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
-
-            _notify_control(rdd._build_daily_notification_text(decision))
-            # `with single_instance_lock(...)` releases the lock here,
-            # on normal exit from this block.
-    except SingleInstanceLockError as error:
-        text = (
-            f"AI-Stock-Radar CONTROL ARM daily decision runner -- could not "
-            f"acquire the single-instance lock; another run is already in "
-            f"progress. Refusing to proceed -- zero Alpaca API calls were "
-            f"made. {error}"
-        )
-        print(text)
-        _notify_control(text)
-        return
-    # Any OTHER exception raised inside the `with` block (e.g. from
-    # run_daily_decision() failing, or an audit-assertion RuntimeError)
-    # is deliberately NOT caught here -- it propagates normally, the
-    # `with` block's __exit__ still releases the lock on the way out
-    # (standard context-manager semantics), and the inner try/except
-    # above has already sent the [CONTROL] failure notification before
-    # re-raising.
+        outcome = _execute(arguments)
+    except Exception:
+        crashed = True
+        raise
+    finally:
+        # TRUE try/finally coverage of the entire run -- fires whether
+        # _execute() returned normally, returned early (STOP/FREEZE/
+        # lock-conflict/market-closed), or raised. See module docstring's
+        # "HEALTHCHECKS.IO DEAD-MAN'S-SWITCH" section for the full
+        # liveness-vs-operational mapping this implements.
+        if crashed:
+            _ping_healthcheck(liveness_url, "fail", "UNCAUGHT_EXCEPTION")
+            # Operational is deliberately NOT pinged on a genuine crash --
+            # the literal outcome table this task specified only requires
+            # a liveness fail here; the operational check's own
+            # missing-ping timeout is what surfaces this case on that
+            # side, rather than this code guessing at a detail string for
+            # a failure it may not have enough context to describe.
+        else:
+            _ping_healthcheck(liveness_url, "success", "RUN_COMPLETED")
+            operational_event = "success" if outcome in _OPERATIONAL_SUCCESS_OUTCOMES else "fail"
+            _ping_healthcheck(operational_url, operational_event, outcome or "UNKNOWN_OUTCOME")
 
 
 if __name__ == "__main__":
