@@ -175,6 +175,54 @@ must never gate trading. A one-time (marker-file-guarded, not per-run)
 with Healthchecks not configured, so the gap doesn't go unnoticed
 forever, without spamming the owner on every subsequent cron invocation.
 
+INTENT JOURNAL ORDERING GAP (found by an independent audit, guarded not
+yet fully fixed): `_run_intent_protocol` (see its own docstring) writes
+PREPARED intents from `decision["queued_for_next_run"]`/`["executed_today"]`
+-- i.e. AFTER `rdd.run_daily_decision()` has already returned, and (for a
+real order, a case that has never yet happened in production -- this
+control arm has never passed `--enable-equity-orders`/
+`--enable-crypto-orders`) after any real broker call
+`_execute_equity_orders`/`_execute_crypto_orders` inside that function
+would already have made. This defeats the entire point of a WRITE-AHEAD
+journal for exactly the case it exists to protect: a crash between the
+real broker call and this wrapper regaining control would leave zero
+on-disk evidence of what was attempted, one atomic black-box call
+(`run_daily_decision()`) providing no hook to intervene earlier without
+editing that frozen file.
+
+GUARDED FOR NOW: `_guard_against_premature_order_activation` (called as
+the very first thing `_execute()` does, before any other check) makes it
+impossible to pass either order-enabling flag at all until this is
+actually fixed -- fail-closed on the gap itself, not a partial or
+uncertain workaround.
+
+DESIGNED, NOT YET BUILT -- the concrete fix for whenever real order
+activation is approved: BEFORE calling `rdd.run_daily_decision()`, this
+wrapper would need to independently compute the SAME set of tickers that
+call is about to submit real orders for (today's `queued_for_next_run`
+entries becoming today's Open-fill attempts, i.e. yesterday's queued
+signals -- NOT re-deriving the frozen engine's own signal-selection
+logic, which would risk drifting from it; rather, reading what is
+ALREADY queued in the freshly-loaded `pending_buys`/`pending_exits`
+BEFORE this run touches them, since those are exactly what
+`_execute_pending_buys_at_open`/`_execute_pending_exits_at_open` are
+about to act on this run), write a "blind" PREPARED intent for each
+(using the SAME deterministic `client_order_id` formula already used
+post-hoc, so the SAME intent record is what gets found/updated
+afterward, never a second, divergent one), THEN call
+`rdd.run_daily_decision()`, THEN reconcile: an intent whose ticker
+appears in the real result's `executed_today`/`equity_order_actions`
+transitions SUBMITTING -> BROKER_ACKNOWLEDGED -> COMMITTED as today;
+a "blind" intent that did NOT materialize (the engine decided
+differently this bar than the pre-run snapshot implied -- possible if
+`FREEZE`/a stop triggered first, changing outcomes) transitions to
+TERMINAL as an abandoned guess, never COMMITTED. This still cannot
+inject a checkpoint DURING `run_daily_decision()`'s own internal broker
+call -- only editing that frozen file could -- but it closes the
+window this module docstring's own gap describes: the intent would be
+durably PREPARED before the call that might submit a real order starts,
+not after it returns.
+
 Isolation from the live deployment is NOT implemented in this file --
 it comes entirely from process cwd (`data/live/STOP`, `data/live/FREEZE`,
 and the default `--state-path`/`--decision-log-directory` are all
@@ -778,6 +826,34 @@ def _notify_healthchecks_not_configured_once() -> None:
     )
 
 
+def _guard_against_premature_order_activation(arguments: argparse.Namespace) -> None:
+    """Hard, unconditional, zero-API-call guard -- see module docstring's
+    "INTENT JOURNAL ORDERING GAP" section for the full "why". Real order
+    submission (`--enable-equity-orders`/`--enable-crypto-orders`) is
+    BLOCKED until a genuine write-ahead intent-journal-before-broker-call
+    guarantee actually exists: today, `_run_intent_protocol` only runs
+    AFTER `rdd.run_daily_decision()` has already returned (and, for a
+    real order, already called the broker) -- a crash between the real
+    broker call and that point would leave ZERO write-ahead journal
+    evidence, defeating the entire purpose of `order_intent.py`'s
+    PREPARED-before-broker-call design. Raises immediately, before any
+    other check or API call, if either flag is set -- this is
+    deliberately the FIRST thing `_execute()` does."""
+    if arguments.enable_equity_orders or arguments.enable_crypto_orders:
+        raise RuntimeError(
+            "Real order activation (--enable-equity-orders/--enable-crypto-orders) "
+            "is BLOCKED: the intent journal currently records PREPARED "
+            "AFTER rdd.run_daily_decision() returns, not before its real "
+            "broker call would happen -- a crash between the two would "
+            "leave zero write-ahead evidence, defeating the entire "
+            "purpose of the journal (see order_intent.py's own module "
+            "docstring). See this file's own module docstring, 'INTENT "
+            "JOURNAL ORDERING GAP', for the designed-but-not-yet-built "
+            "fix (a 'blind' pre-run PREPARED intent set). Do not pass "
+            "either flag until that gap is actually closed."
+        )
+
+
 def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | None = None) -> str:
     """Everything `main()` used to do directly, now returning an outcome
     code (see the `OUTCOME_*` constants) instead of bare `return`
@@ -819,6 +895,8 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
     each call site, so a fake client transparently reaches the whole
     real flow.
     """
+    _guard_against_premature_order_activation(arguments)
+
     print(
         f"[CONTROL] Ticker universe in effect ({len(CONTROL_TICKERS_WITH_REGIME)} tickers: "
         f"{len(CONTROL_UNIVERSE_TICKERS)} strategy + 1 regime-reference-only): "
@@ -969,7 +1047,16 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
                 )
                 reconciliation_result = broker_reconciliation.reconcile(
-                    reconciliation_client, reconciliation_state
+                    reconciliation_client, reconciliation_state,
+                    # See broker_reconciliation.reconcile()'s own
+                    # docstring, "ORDERS-DISABLED / DRY-RUN AWARENESS":
+                    # matches run_daily_decision()'s own
+                    # live_orders_enabled gate exactly (same two flags,
+                    # same or), so a local-only simulated position is
+                    # never mistaken for a real reconciliation anomaly
+                    # while this control arm never actually submits
+                    # orders.
+                    orders_enabled=arguments.enable_equity_orders or arguments.enable_crypto_orders,
                 )
                 if reconciliation_result.order_status_updates:
                     print(

@@ -62,6 +62,10 @@ THE FOUR SCENARIOS (exact case table this task specified):
         classified "in-flight" in the error detail (fill not yet
         broker-confirmed) rather than lumped in with an unexplained
         absence -- still fail-closed either way, just a better diagnostic.
+        EXCEPT when `orders_enabled=False` (`reconcile()`'s own
+        parameter) -- see "ORDERS-DISABLED / DRY-RUN AWARENESS" in
+        `reconcile()`'s own docstring: this scenario is EXPECTED, not
+        raised, while real order submission is disabled.
 
   C. A local order record is non-terminal (still "new"/"accepted"/etc.)
      but no longer appears in the broker's open-orders list.
@@ -487,6 +491,7 @@ def reconcile(
     runner_state: Any,
     *,
     expected_account_suffix: str = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
+    orders_enabled: bool = True,
 ) -> ReconciliationResult:
     """Full reconciliation pass. Mutates `runner_state.submitted_actions[...]
     ["status"]` in place ONLY for the narrow Scenario C success case (see
@@ -503,7 +508,38 @@ def reconcile(
     identity, snapshot inconsistency, short position, Scenario A/B,
     position-quantity mismatch, local-terminal-but-broker-open, the
     equity_stop_orders invariant) also exits before any mutation is
-    possible."""
+    possible.
+
+    `orders_enabled` -- ORDERS-DISABLED / DRY-RUN AWARENESS (added after
+    an independent audit found a real, latent false-alarm bug): when
+    real order submission is disabled (the control arm's current, only
+    real-world mode -- `--enable-equity-orders`/`--enable-crypto-orders`
+    never passed), `run_daily_decision()`'s frozen per-bar engine STILL
+    populates `runner_state.positions` with its own purely SIMULATED
+    bar-by-bar bookkeeping -- that is what makes the control arm's local
+    state a genuine, continuous forward-test track record at all, not
+    reimplementable or suppressible from this wrapper without either
+    editing the frozen engine (forbidden) or freezing `position_state.json`
+    entirely (which would silently defeat the whole point of running the
+    control arm -- no continuous simulated portfolio, no forward-test
+    signal, just one-off dry-run log lines). No real order was EVER
+    submitted for these positions, so their absence at the broker is
+    EXPECTED, not an anomaly -- comparing them against the broker at all
+    is a category error, not a legitimate reconciliation question. When
+    `orders_enabled=False`, Scenario B (`MissingBrokerPositionError`) is
+    never raised; a local-only position is logged as an expected,
+    simulated-only entry instead. Scenario A (broker has something local
+    doesn't) is DELIBERATELY left fully active even in this mode -- a
+    real position unexpectedly appearing on what should be an
+    orders-disabled paper account is still a genuine anomaly worth
+    stopping for. Every other check (account identity, snapshot
+    consistency, short-position guard, Scenario C/D order comparisons,
+    the equity_stop_orders invariant, local-terminal-but-broker-open) is
+    completely unaffected by this parameter -- `submitted_actions`/
+    `equity_stop_orders` are never populated at all while orders are
+    disabled (see `run_daily_decision.py`'s own `_execute_equity_orders`
+    gate), so those checks are already natural no-ops in this mode, not
+    ones that needed a special case."""
     account_number_masked = verify_account_identity(client, expected_suffix=expected_account_suffix)
     snapshot = fetch_consistent_broker_snapshot(client)
 
@@ -533,7 +569,17 @@ def reconcile(
         )
 
     missing_at_broker = sorted(set(local_positions) - set(broker_positions))
-    if missing_at_broker:
+    if missing_at_broker and not orders_enabled:
+        # Expected, not an anomaly -- see this function's own docstring,
+        # "ORDERS-DISABLED / DRY-RUN AWARENESS". No automatic mutation
+        # either way; this is purely informational.
+        print(
+            f"[CONTROL] Dry-run mode (orders disabled): {len(missing_at_broker)} "
+            f"local-only simulated position(s) not compared against the "
+            f"broker -- no real order was ever submitted for these, so "
+            f"their absence at the broker is expected: {missing_at_broker}"
+        )
+    elif missing_at_broker:
         in_flight = sorted(t for t in missing_at_broker if _has_open_entry_buy(runner_state, t))
         unexplained = sorted(t for t in missing_at_broker if t not in in_flight)
         raise MissingBrokerPositionError(

@@ -163,6 +163,38 @@ class PendingSignalTTLOutcome:
         return bool(self.expired_buys or self.quarantined_buys or self.reconfirming_exits or self.quarantined_exits)
 
 
+def _find_stuck_reconfirming_records(runner_state: Any) -> list[tuple[str, dict]]:
+    """A `pending_signal_metadata` record stuck in the transient
+    `reconfirming` status (see `_STATUS_RECONFIRMING`) from a PRIOR,
+    interrupted run -- normally this status only exists for the
+    duration of a single run, between `evaluate_pending_signals` marking
+    it and `stamp_new_pending_signals`/`finalize_after_run` (called from
+    `run_control_arm_decision.py`) resolving it to `reconfirmed` or
+    `expired`/`expired_after_reconfirmation` moments later in that SAME
+    run. If the run crashes or fails anywhere in between, the record is
+    left on disk in `reconfirming` -- and because the corresponding
+    `pending_exits[ticker]` entry was ALREADY deleted (in the very same
+    step that set this status, both persisted together before
+    `run_daily_decision()` was even called), the normal per-ticker loops
+    in `evaluate_pending_signals` below can never encounter that ticker
+    again on a later run to re-resolve it: it is simply not in
+    `pending_exits` anymore. Detected here by scanning
+    `pending_signal_metadata` directly, independent of what's currently
+    in `pending_exits` -- exactly the case a `ticker in
+    runner_state.pending_exits` check would miss."""
+    stuck: list[tuple[str, dict]] = []
+    for key, record in runner_state.pending_signal_metadata.items():
+        if record.get("status") != _STATUS_RECONFIRMING:
+            continue
+        if not key.endswith(f"|{KIND_EXIT}"):
+            continue  # _STATUS_RECONFIRMING is only ever set for EXIT keys
+        ticker = key.split("|", 1)[0]
+        if ticker in runner_state.pending_exits:
+            continue  # legitimately mid-run right now (this same call), not stuck
+        stuck.append((key, record))
+    return stuck
+
+
 def evaluate_pending_signals(
     *,
     runner_state: Any,
@@ -210,10 +242,35 @@ def evaluate_pending_signals(
     Raises `PendingSignalReconciliationRequiredError` immediately on the
     first ambiguous EXIT found -- the caller's own exception handling
     (same as every other preflight check) then skips
-    `run_daily_decision()` entirely for this run.
+    `run_daily_decision()` entirely for this run. Raises the SAME
+    exception, even earlier (before touching `pending_buys`/`pending_exits`
+    at all), if a `reconfirming`-status metadata record is found stuck
+    from an INTERRUPTED PRIOR run -- see `_find_stuck_reconfirming_records`'s
+    own docstring for exactly why that combination can occur and cannot
+    be safely auto-resolved.
     """
     metadata = runner_state.pending_signal_metadata
     outcome = PendingSignalTTLOutcome()
+
+    stuck = _find_stuck_reconfirming_records(runner_state)
+    if stuck:
+        detail = "; ".join(
+            f"{key} (signal_id={record.get('signal_id')}, "
+            f"source_session_date={record.get('source_session_date')})"
+            for key, record in stuck
+        )
+        raise PendingSignalReconciliationRequiredError(
+            f"Found {len(stuck)} pending_signal_metadata record(s) stuck in "
+            f"'reconfirming' status from an interrupted prior run, with no "
+            f"corresponding active pending_exits entry (the prior run "
+            f"already cleared that entry before it failed/crashed) -- this "
+            f"combination cannot be safely auto-resolved: was the "
+            f"reconfirmation genuinely never finished, or did it complete "
+            f"and this is stale leftover metadata? Fail-closed; a human "
+            f"must resolve this by hand (inspect and correct the record's "
+            f"status directly) before this control arm can run again. "
+            f"Affected: {detail}"
+        )
 
     for ticker in list(runner_state.pending_buys.keys()):
         key = pending_key(ticker, KIND_BUY)

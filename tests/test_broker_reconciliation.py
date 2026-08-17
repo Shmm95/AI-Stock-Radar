@@ -282,6 +282,32 @@ def test_scenario_b_missing_broker_position_classifies_in_flight_vs_unexplained(
     assert runner_state.positions["UNEXPLAINED"].quantity == 5.0  # nothing deleted
 
 
+def test_orders_disabled_suppresses_scenario_b_false_alarm():
+    """The frozen engine populates `positions` with its own purely
+    simulated bookkeeping even while real orders are disabled -- no real
+    order was ever submitted for these, so their absence at the broker
+    must NOT be a Scenario B anomaly when `orders_enabled=False`."""
+    runner_state = LiveRunnerState()
+    runner_state.positions["AAA"] = make_position("AAA", 10.0)
+    client = FakeClient(positions=[])
+    result = br.reconcile(client, runner_state, orders_enabled=False)
+    assert result.local_position_count == 1
+    assert runner_state.positions["AAA"].quantity == 10.0  # untouched either way
+
+
+def test_orders_enabled_still_raises_the_same_gap():
+    """Contrast case: the EXACT same local-only-position scenario, but
+    with orders actually enabled -- must still fail closed exactly as
+    before this fix (orders_enabled=True is also the default)."""
+    runner_state = LiveRunnerState()
+    runner_state.positions["AAA"] = make_position("AAA", 10.0)
+    client = FakeClient(positions=[])
+    with pytest.raises(br.MissingBrokerPositionError):
+        br.reconcile(client, runner_state, orders_enabled=True)
+    with pytest.raises(br.MissingBrokerPositionError):
+        br.reconcile(client, runner_state)  # default is orders_enabled=True
+
+
 def test_position_quantity_mismatch_fails_closed():
     runner_state = LiveRunnerState()
     runner_state.positions["AAPL"] = make_position("AAPL", 10.0)
