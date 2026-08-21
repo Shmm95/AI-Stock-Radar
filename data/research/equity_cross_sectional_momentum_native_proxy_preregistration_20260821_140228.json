@@ -1,0 +1,189 @@
+{
+  "abort_rules": [
+    "eligible N < 300 in any formation month -> fail-closed, run halts",
+    "a post-entry exit price bar is missing for a held ticker -> official run halts with status INCOMPLETE_PRICE_PANEL",
+    "the recomputed SHA-256 of either PIT source artifact does not match the value recorded in pit_source_artifacts -> run halts before any market data fetch"
+  ],
+  "cost_assumptions": {
+    "commission_percent": 0.05,
+    "gross_result_status": "the primary, literature-comparable panel",
+    "minimum_fee_usd": 1,
+    "short_borrow_cost_included": false,
+    "slippage_bps": 5,
+    "source": "existing project assumptions, portfolio_backtest_models.py",
+    "wml_net_result_deployment_ready_claim_prohibited": true,
+    "wml_net_result_note": "WML's net-of-cost result must never be presented as deployment-ready, since no short-borrow cost data exists for it"
+  },
+  "created_at_utc": "2026-08-21T14:02:28.741289+00:00",
+  "data_source": {
+    "adjustment": "ALL",
+    "asof_parameter": "set to formation_date on every per-formation-date request",
+    "bar_type": "daily OHLCV",
+    "current_tradability_filter_reason": "a 'tradable today' filter would introduce survivorship bias",
+    "current_tradability_filter_used": false,
+    "existing_market_data_helper_modified": false,
+    "existing_market_data_helper_note": "src/data/alpaca_market_data.py returns raw (unadjusted) bars by default and is NOT modified; this study's loader is isolated and pins Adjustment.ALL/IEX/asof explicitly itself",
+    "feed": "IEX",
+    "market_cap_filter_reason": "no verified point-in-time market-cap panel is available; Alpaca provides no historical market cap, so ranking by today's market cap would be look-ahead; the original JT method also uses no arbitrary Top-N -- S&P 500 membership itself is the large-cap/liquidity proxy",
+    "market_cap_filter_used": false,
+    "provider": "Alpaca",
+    "request_style": "batched StockBarsRequest",
+    "spy_benchmark_source": "same provider/feed/adjustment settings as the universe fetch",
+    "yfinance_prohibited": true
+  },
+  "deployment_status": "RESEARCH_ONLY",
+  "eligibility_gates": {
+    "absolute_dollar_volume_threshold_reason": "IEX feed consolidated liquidity is not a reliable measure",
+    "absolute_dollar_volume_threshold_used": false,
+    "bar_coverage_requirement_percent": 95,
+    "bar_coverage_window": "expected NYSE sessions across the 12-month formation window",
+    "identity_warning_exclusion": true,
+    "identity_warning_exclusion_note": "any ticker present in get_membership_as_of(...).identity_warnings is excluded from ranking for that formation date",
+    "momentum_price_requirement": "required momentum start/end prices and the entry Open must all be positive and present",
+    "price_history_requirement": "12 completed months of history in the required M-12..M-1 window",
+    "volume_requirement": "positive volume in at least 60 of the last 63 sessions"
+  },
+  "excluded_from_this_round": [
+    "application to the 83-ticker live universe",
+    "the existing cap=6 / 6% position sizing engine",
+    "long-only live portfolio design",
+    "order/execution integration",
+    "parameter optimization",
+    "any deployment decision"
+  ],
+  "execution": {
+    "entry_rule": "Open of the first real NYSE session after formation",
+    "exit_rule": "Open of the next monthly rebalance (K=1 month, non-overlapping portfolios)"
+  },
+  "final_classification_note": "NATIVE_REPRODUCTION_PROXY: signal/ranking methodology close to JT/Fama-French, but uses a community-source S&P 500 PIT reconstruction and Alpaca IEX data instead of a full CRSP NYSE/AMEX/NASDAQ panel.",
+  "formation_dates": {
+    "range_end_month": "2025-10",
+    "range_start_month": "2018-12",
+    "rule": "the last REAL NYSE session of each calendar month, resolved from Alpaca's own market calendar -- no weekday assumption used anywhere"
+  },
+  "label": "NATIVE_REPRODUCTION_PROXY — RESEARCH_ONLY_NOT_DEPLOYMENT",
+  "methodology_note": "This is NOT a full Jegadeesh-Titman replication. The original study ranked every NYSE/AMEX stock with sufficient return history into deciles and equal-weighted them. This study's S&P 500 PIT universe is a large-cap proxy for that universe, not a reproduction of it.",
+  "metric_definitions": {
+    "alpha_percent_definition": "CAGR - SPY_CAGR",
+    "metrics_reported": [
+      "starting_capital",
+      "ending_capital",
+      "total_return_percent",
+      "CAGR",
+      "SPY_CAGR",
+      "alpha_percent",
+      "max_drawdown_percent",
+      "sharpe_ratio",
+      "sortino_ratio",
+      "trade_count",
+      "win_rate_percent",
+      "profit_factor",
+      "expectancy",
+      "turnover",
+      "cost_drag"
+    ],
+    "regime_classification": {
+      "bear_threshold": "<= -5% SPY monthly return",
+      "bull_threshold": ">= +5% SPY monthly return",
+      "panel_frequency": "annual, 2019-2025",
+      "regime_metrics_reported": [
+        "profit_factor",
+        "return",
+        "sharpe_ratio",
+        "trade_count",
+        "benchmark_gap"
+      ],
+      "sideways_definition": "otherwise",
+      "source": "same thresholds as scripts/run_portfolio_benchmark_gap_attribution.py"
+    },
+    "sharpe_annualization_factor": "sqrt(252)",
+    "sharpe_annualization_note": "equity-only; the existing V1 helper (metrics.py) uses 365.25 and must NOT be silently reused for this study",
+    "wml_spy_alpha_field_value": "N/A — zero-cost factor, not comparable",
+    "wml_spy_alpha_note": "the V1-style alpha comparison is used only on the Winner-only panel"
+  },
+  "missing_data_handling": {
+    "post_entry_exit_data_loss_policy": "if exit-date price data is missing for a ticker already held, the trade is never silently dropped -- the official performance run halts with status INCOMPLETE_PRICE_PANEL",
+    "sensitivity_variant_allowed": "separate, explicitly labeled zero-recovery / last-valid-price sensitivity results may be produced separately from the official run"
+  },
+  "performance_period": {
+    "description": "83 full monthly holding periods, January 2019 - November 2025",
+    "end_month": "2025-11",
+    "holding_periods_count": 83,
+    "start_month": "2019-01"
+  },
+  "pit_source_artifacts": {
+    "abort_on_mismatch": true,
+    "recompute_at_runtime": true,
+    "reconstruction_inputs_artifact": {
+      "path": "data/research/sp500_pit_membership_2015_2025_v1_reconstruction_inputs_20260815_215706.json",
+      "sha256": "cc7b7a8b3abb535f6e9cae6ef624448bbf7c95979c59b61bcbd96db1130c9bb7"
+    },
+    "summary_artifact": {
+      "path": "data/research/sp500_pit_membership_2015_2025_v1_20260815_215706.json",
+      "sha256": "889cb5adebae1bba90f807c61875683bebf6ff69d8fca966eb3798cf59dde6ef"
+    },
+    "verified_against_local_files_at_preregistration_time": true
+  },
+  "pit_universe": {
+    "abort_if_below_minimum_n": true,
+    "live_or_current_universe_modules_importable": false,
+    "live_or_current_universe_modules_note": "src/live/live_universe.py and src/live/control_universe.py must never be imported anywhere in this study's code path",
+    "membership_mode": "strict",
+    "membership_query_function": "get_membership_as_of",
+    "minimum_eligible_n": 300,
+    "raw_universe_width_observed_range": "499-505 tickers across the months examined",
+    "source_module": "src.research.pit_universe.membership_query"
+  },
+  "purpose": "Freeze every parameter of a native-universe equity cross-sectional 12-1 momentum reproduction proxy BEFORE any market data is fetched or any backtest result is inspected -- same performance-blind pre-registration discipline as data/research/sp_midcap400_control_universe_snapshot_20260815_165011.json.",
+  "randomization": {
+    "bootstrap_seed": 20260820,
+    "bootstrap_seed_usage": "recorded explicitly in the result artifact if a bootstrap procedure is actually used",
+    "selection_seed": null
+  },
+  "reporting_panels": {
+    "DEPLOYMENT_BRIDGE_WINNER_LONG_ONLY": "Winner long only; a separate, secondary diagnostic panel -- NOT a deployment-readiness test",
+    "NATIVE_PRIMARY_WML": "Winner long / Loser short decile spread -- the main literature-comparable panel"
+  },
+  "result_interpretation_guardrail": "Even a favorable result means only 'a momentum candidate was validated on a large-cap PIT proxy' -- it does NOT mean deployment-ready.",
+  "risk_labels": {
+    "membership_completeness_risk": "medium",
+    "price_panel_completeness_risk": "high"
+  },
+  "schema_version": 1,
+  "sensitivity_runs": {
+    "observed_strict_vs_permissive_gap": {
+      "observed_on": "the current PIT artifact, monthly queries 2019-2025",
+      "ticker_count_diff_percent_range": "0-12.28",
+      "ticker_count_diff_range": "0-62"
+    },
+    "ordering_rule": "the primary strict run must complete fully BEFORE the permissive sensitivity run starts; permissive results must never be used to select or alter parameters",
+    "primary_mode": "strict",
+    "secondary_mode": "permissive"
+  },
+  "signal": {
+    "decile_count": 10,
+    "example": "a 31 Dec 2024 formation date uses the return from end-of-Dec-2023 to end-of-Nov-2024; December 2024 itself is fully excluded (prior 2-12 approach, skips the short-term-reversal month)",
+    "excluded_mechanisms": [
+      "sector_neutralization",
+      "volatility_scaling",
+      "correlation_filter",
+      "EMA",
+      "RSI",
+      "regime_gate",
+      "existing_cap_6_position_6_percent_engine"
+    ],
+    "formula": "MOM_12_1 = AdjustedClose(month_end(M-1)) / AdjustedClose(month_end(M-12)) - 1",
+    "holding_period_months": 1,
+    "loser_decile": "bottom decile",
+    "overlapping_portfolios": false,
+    "ranking_direction": "descending momentum",
+    "ranking_frequency": "monthly",
+    "tie_break": "deterministic: alphabetical ticker order on equal momentum",
+    "weighting": "equal weight",
+    "winner_decile": "top decile"
+  },
+  "standard_disclaimer": "PIT-reconstructed, community-source data (Wikipedia-anchored S&P 500 membership event reconstruction, not a licensed point-in-time index constituent feed) -- see src/research/pit_universe/membership_query.py's own module docstring for the full reconstruction methodology, the STRICT/PERMISSIVE distinction, and known limitations.",
+  "status": "FROZEN_BEFORE_MARKET_DATA_FETCH_AND_BACKTEST",
+  "strategy_id": "EQUITY_CROSS_SECTIONAL_MOMENTUM_12_1_K1_DECILE_SP500_PIT_ALPACA_IEX_V1",
+  "study_classification": "NATIVE_REPRODUCTION_PROXY"
+}
