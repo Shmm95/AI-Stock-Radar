@@ -85,6 +85,27 @@ KNOWN_KEYS = frozenset(
 REQUIRED_KEYS = frozenset({"ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"})
 EXPECTED_LIVE_ACCOUNT_NUMBER_SUFFIX_LENGTH = 4
 
+# PROFILE DISTINCTION (2026-08-22, independent audit finding #4): this
+# script previously treated LIVE_ACCOUNT_NUMBER_SUFFIX as always-optional
+# (not in REQUIRED_KEYS) and Layer 3 always compared against the
+# CONTROL arm's own hardcoded EXPECTED_ACCOUNT_SUFFIX ("XO4Y") --
+# regardless of which .env this was run against. But
+# scripts/run_daily_decision.py's own `_require_live_account_suffix()`
+# treats LIVE_ACCOUNT_NUMBER_SUFFIX as MANDATORY for the LIVE entrypoint
+# -- so this health check could report PASS on the live .env (the field
+# is merely optional here) while the real runner would FAIL closed on
+# the exact same file (the field is missing there). Two named profiles
+# close that gap: PROFILE_CONTROL (default, unchanged behavior) checks
+# .env.control's own shape; PROFILE_LIVE additionally requires
+# LIVE_ACCOUNT_NUMBER_SUFFIX in Layer 2, and in Layer 3 compares the
+# connected Alpaca account against THAT FILE'S OWN LIVE_ACCOUNT_NUMBER_SUFFIX
+# value (never the control arm's XO4Y constant -- the live account's
+# real suffix is deliberately not hardcoded anywhere in this codebase;
+# see run_daily_decision.py's own docstring).
+PROFILE_CONTROL = "control"
+PROFILE_LIVE = "live"
+LIVE_PROFILE_REQUIRED_KEYS = REQUIRED_KEYS | {"LIVE_ACCOUNT_NUMBER_SUFFIX"}
+
 # Real, MEASURED lengths -- never a guess. ALPACA_API_KEY (26) and
 # ALPACA_SECRET_KEY (44) were confirmed this session from TWO
 # independent real files agreeing exactly: `.env.control` itself and the
@@ -220,11 +241,12 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def check_layer2_field_schema(path: Path) -> list[Finding]:
+def check_layer2_field_schema(path: Path, *, profile: str = PROFILE_CONTROL) -> list[Finding]:
     findings: list[Finding] = []
     values = _parse_env_file(path)
 
-    for key in sorted(REQUIRED_KEYS):
+    required_keys = LIVE_PROFILE_REQUIRED_KEYS if profile == PROFILE_LIVE else REQUIRED_KEYS
+    for key in sorted(required_keys):
         if key not in values or values[key] == "":
             findings.append(Finding(2, "FAIL", f"{key} is missing or empty"))
 
@@ -280,9 +302,33 @@ def check_layer2_field_schema(path: Path) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
-def check_layer3_cross_identity(path: Path, *, expected_account_suffix: str = EXPECTED_ACCOUNT_SUFFIX) -> list[Finding]:
+def check_layer3_cross_identity(
+    path: Path, *, expected_account_suffix: str = EXPECTED_ACCOUNT_SUFFIX, profile: str = PROFILE_CONTROL
+) -> list[Finding]:
     findings: list[Finding] = []
     values = _parse_env_file(path)
+
+    if profile == PROFILE_LIVE:
+        # Never compare a live .env against the control arm's own XO4Y
+        # constant -- the live account's real suffix is deliberately
+        # not hardcoded anywhere in this codebase (see
+        # run_daily_decision.py's own docstring); the only correct
+        # expectation for THIS file is its own declared value, the
+        # exact same value _require_live_account_suffix() will read at
+        # runtime.
+        live_suffix = values.get("LIVE_ACCOUNT_NUMBER_SUFFIX")
+        if not live_suffix:
+            findings.append(
+                Finding(
+                    3, "FAIL",
+                    "profile=live but LIVE_ACCOUNT_NUMBER_SUFFIX is missing/empty -- "
+                    "cannot perform the account-identity cross-check this profile "
+                    "requires (run_daily_decision.py's own mandatory check would "
+                    "also fail closed on this same file).",
+                )
+            )
+        else:
+            expected_account_suffix = live_suffix
 
     api_key = values.get("ALPACA_API_KEY")
     secret_key = values.get("ALPACA_SECRET_KEY")
@@ -393,6 +439,7 @@ def run_health_check(
     path: Path,
     *,
     expected_account_suffix: str = EXPECTED_ACCOUNT_SUFFIX,
+    profile: str = PROFILE_CONTROL,
     run_layer3: bool = True,
     deploy_host: str | None = None,
     remote_path: str | None = None,
@@ -402,10 +449,12 @@ def run_health_check(
     layer1_ok = not any(f.severity == "FAIL" and f.layer == 1 for f in report.findings)
 
     if layer1_ok:
-        report.findings.extend(check_layer2_field_schema(path))
+        report.findings.extend(check_layer2_field_schema(path, profile=profile))
         layer2_ok = not any(f.severity == "FAIL" and f.layer == 2 for f in report.findings)
         if layer2_ok and run_layer3:
-            report.findings.extend(check_layer3_cross_identity(path, expected_account_suffix=expected_account_suffix))
+            report.findings.extend(
+                check_layer3_cross_identity(path, expected_account_suffix=expected_account_suffix, profile=profile)
+            )
         elif not layer2_ok:
             report.findings.append(Finding(3, "INFO", "Layer 3 skipped -- Layer 2 field-schema checks failed first"))
     else:
@@ -423,7 +472,23 @@ def main() -> int:
     parser.add_argument("env_file", type=Path, help="Path to the .env-style credential file to check")
     parser.add_argument(
         "--expected-account-suffix", default=EXPECTED_ACCOUNT_SUFFIX,
-        help=f"Last 4 characters the Alpaca account_number must end in (default: {EXPECTED_ACCOUNT_SUFFIX})",
+        help=(
+            f"Last 4 characters the Alpaca account_number must end in "
+            f"(default: {EXPECTED_ACCOUNT_SUFFIX}). Ignored for --profile live, "
+            f"which always compares against the checked file's own "
+            f"LIVE_ACCOUNT_NUMBER_SUFFIX value instead."
+        ),
+    )
+    parser.add_argument(
+        "--profile", choices=(PROFILE_CONTROL, PROFILE_LIVE), default=PROFILE_CONTROL,
+        help=(
+            "'control' (default): checks .env.control's own shape, "
+            "LIVE_ACCOUNT_NUMBER_SUFFIX optional. 'live': additionally "
+            "requires LIVE_ACCOUNT_NUMBER_SUFFIX (Layer 2) and cross-checks "
+            "the connected account against the FILE'S OWN declared suffix "
+            "(Layer 3), matching run_daily_decision.py's own mandatory "
+            "_require_live_account_suffix() check on the same file."
+        ),
     )
     parser.add_argument("--skip-layer3", action="store_true", help="Skip real Alpaca/Telegram API calls (Layer 3)")
     parser.add_argument("--deploy-host", default=None, help="If given, also runs Layer 4 (SSH SHA-256 sync check) against this host")
@@ -433,6 +498,7 @@ def main() -> int:
     report = run_health_check(
         arguments.env_file,
         expected_account_suffix=arguments.expected_account_suffix,
+        profile=arguments.profile,
         run_layer3=not arguments.skip_layer3,
         deploy_host=arguments.deploy_host,
         remote_path=arguments.remote_path,
