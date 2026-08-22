@@ -252,16 +252,38 @@ def _mask_account_number(account_number: str) -> str:
 def verify_account_identity(
     client: TradingClient,
     *,
-    expected_suffix: str = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
+    expected_suffix: str | None = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
 ) -> str:
     """Real `client.get_account()` call. Raises `AccountIdentityMismatchError`
     (fail-closed) if the account_number does not end in `expected_suffix`.
     Returns the masked account number (e.g. "...XO4Y") on success -- callers
     should use this masked value in any log/notification, never the raw
-    `account.account_number` field."""
+    `account.account_number` field.
+
+    `expected_suffix=None` -- deliberate, explicit opt-out (added for
+    `run_daily_decision.py`'s own live-account caller, which has no
+    known-safe suffix value hardcoded anywhere in this codebase, and
+    must never silently reuse `_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX`
+    -- that would compare the LIVE account against the CONTROL ARM's
+    own suffix and fail every real run). Still makes the real
+    `get_account()` call and still returns the masked value for
+    logging; only the comparison/raise is skipped. Prints a loud,
+    unmissable notice every time this path is taken, so an unconfigured
+    check is never silently permanent -- see the caller for how to
+    supply a real value once known."""
     account = client.get_account()
     account_number = str(account.account_number)
     masked = _mask_account_number(account_number)
+
+    if expected_suffix is None:
+        print(
+            f"[CONTROL] WARNING: account-identity verification SKIPPED (no "
+            f"expected suffix configured) -- connected account: {masked}. "
+            f"This safety check is not yet active for this caller; supply "
+            f"an expected suffix to enable it."
+        )
+        return masked
+
     if not account_number.endswith(expected_suffix):
         raise AccountIdentityMismatchError(
             f"Broker account identity mismatch: connected account ends "
@@ -490,7 +512,7 @@ def reconcile(
     client: TradingClient,
     runner_state: Any,
     *,
-    expected_account_suffix: str = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
+    expected_account_suffix: str | None = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
     orders_enabled: bool = True,
 ) -> ReconciliationResult:
     """Full reconciliation pass. Mutates `runner_state.submitted_actions[...]

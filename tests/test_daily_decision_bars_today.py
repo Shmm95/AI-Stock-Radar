@@ -115,6 +115,27 @@ def test_crypto_tickers_disagreeing_among_themselves_still_raises():
         runner._bars_today_by_asset_class(prepared)
 
 
+class _FakeAccount:
+    account_number = "PA3HONFDTEST"
+
+
+class _FakeReconciliationClient:
+    """Minimal fake satisfying broker_reconciliation.reconcile()'s real
+    calls for a clean pass against EMPTY local state (fresh
+    LiveRunnerState -- no submitted_actions, no equity_stop_orders, so
+    neither the Scenario C loop nor the Scenario F invariant loop has
+    anything to iterate, and get_order_by_id is never reached)."""
+
+    def get_account(self):
+        return _FakeAccount()
+
+    def get_orders(self, *args, **kwargs):
+        return []
+
+    def get_all_positions(self):
+        return []
+
+
 def test_run_daily_decision_end_to_end_does_not_crash_on_weekend_dates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -145,6 +166,12 @@ def test_run_daily_decision_end_to_end_does_not_crash_on_weekend_dates(
         # guard file (confirmed the hard way: it collided with state left
         # behind by an earlier, unrelated test run in the same session).
         guard_path=tmp_path / "high_water_mark.json",
+        # Injection seam (added alongside the broker-reconciliation wiring
+        # fix, 2026-08-21) -- without this, run_daily_decision() now
+        # builds a real TradingClient and calls broker_reconciliation.reconcile()
+        # unconditionally, which would need real Alpaca credentials this
+        # test environment does not have.
+        trading_client=_FakeReconciliationClient(),
     )
 
     decision = result["decision"]

@@ -185,6 +185,7 @@ from src.backtest.portfolio_backtest_engine import (
     _queue_ranked_entry_signals,
 )
 from src.backtest.portfolio_backtest_models import PortfolioBacktestConfig, PortfolioTrade
+import src.live.broker_reconciliation as broker_reconciliation
 from src.live import order_submission
 from src.live.account_state import get_live_cash_balance
 from src.live.crypto_stop_monitor import DEFAULT_LOCK_PATH, _query_available_crypto_quantity
@@ -944,11 +945,42 @@ def run_daily_decision(
     enable_crypto_orders: bool = False,
     freeze: bool = False,
     guard_path: Path = ps.HIGH_WATER_MARK_PATH,
+    trading_client: TradingClient | None = None,
 ) -> dict:
     """`guard_path` overrides the rollback high-water-mark file's location;
     defaults to the real, out-of-repo path. Only override in tests -- see
     `load_position_state`'s docstring for why a tmp_path-only test must
-    not touch the real, machine-wide guard file."""
+    not touch the real, machine-wide guard file.
+
+    `trading_client` -- injection seam, test-harness-only, mirrors
+    `scripts/run_control_arm_decision.py`'s own `_execute(...,
+    trading_client=None)` pattern (that file already reuses this exact
+    function, so the seam existing here benefits both callers). When
+    `None` (every real production invocation), the real
+    `order_submission.get_trading_client()` factory is used, exactly
+    once, unconditionally -- see the broker-reconciliation section
+    below for why this is no longer gated behind
+    `enable_equity_orders`/`enable_crypto_orders`.
+
+    BROKER RECONCILIATION (added after the 2026-08-21 governance
+    finding: `src/live/broker_reconciliation.py`'s Scenario F --
+    verifies a resting protective stop for every open local equity
+    position is still genuinely open at the broker -- existed and was
+    fully tested, but was wired only into
+    `scripts/run_control_arm_decision.py`'s separate control-arm
+    account, never here. A real position (CEG) whose broker-side stop
+    filled went undetected for three consecutive days because nothing
+    on this path ever checked). `reconcile()` now runs on EVERY call,
+    dry-run or order-enabled, BEFORE any market-data fetch -- a stale
+    local position with a stop that no longer genuinely rests at the
+    broker must never be allowed to influence a signal-generation-only
+    run either, since that is exactly the scenario that went
+    undetected. See that function's own docstring for the full
+    six-scenario table; any of its fail-closed exceptions propagates
+    uncaught out of this function, exactly like any other real failure
+    here -- `main()`'s existing broad `except Exception` already
+    notifies and re-raises, no new exception handling was added for
+    this."""
     config = PortfolioBacktestConfig(
         maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
         maximum_total_open_risk_percent=LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT,
@@ -961,9 +993,30 @@ def run_daily_decision(
     pending_exits_before = dict(runner_state.pending_exits)
 
     live_orders_enabled = enable_equity_orders or enable_crypto_orders
-    trading_client = order_submission.get_trading_client() if live_orders_enabled else None
+    if trading_client is None:
+        trading_client = order_submission.get_trading_client()
+
+    reconciliation_result = broker_reconciliation.reconcile(
+        trading_client,
+        runner_state,
+        # No hardcoded default here on purpose: broker_reconciliation.py's
+        # own default (_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX) is the
+        # CONTROL ARM's account suffix -- reusing it here would compare
+        # the LIVE account against the wrong account and fail-closed on
+        # every real run. LIVE_ACCOUNT_NUMBER_SUFFIX is read from the
+        # environment (set once the owner supplies the real, masked
+        # 4-character value); unset -> None -> verify_account_identity
+        # skips the comparison (still makes the real get_account() call,
+        # still logs the masked account, just doesn't compare it) and
+        # prints a loud, unmissable warning every run until it is set.
+        expected_account_suffix=os.getenv("LIVE_ACCOUNT_NUMBER_SUFFIX"),
+        orders_enabled=live_orders_enabled,
+    )
+    if reconciliation_result.order_status_updates:
+        save_position_state(runner_state, state_path, guard_path=guard_path)
+
     needs_review: list[dict] = []
-    if enable_equity_orders and trading_client is not None:
+    if enable_equity_orders:
         needs_review.extend(_reconcile_pending_equity_orders(trading_client, runner_state))
 
     cash = get_live_cash_balance()
@@ -1030,7 +1083,7 @@ def run_daily_decision(
     }
 
     equity_order_actions: list[dict] = []
-    if enable_equity_orders and trading_client is not None:
+    if enable_equity_orders:
         equity_order_actions, more_review = _execute_equity_orders(
             trading_client,
             runner_state=runner_state,
@@ -1041,7 +1094,7 @@ def run_daily_decision(
         needs_review.extend(more_review)
 
     crypto_order_actions: list[dict] = []
-    if enable_crypto_orders and trading_client is not None:
+    if enable_crypto_orders:
         crypto_order_actions, more_review = _execute_crypto_orders(
             trading_client,
             runner_state=runner_state,
