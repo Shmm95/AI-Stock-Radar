@@ -246,12 +246,25 @@ def transition_intent(
     broker_status: str | None = None,
     last_error: str | None = None,
     increment_attempt: bool = False,
+    quantity: float | None = None,
+    notional: float | None = None,
+    stop_price: float | None = None,
 ) -> OrderIntent:
     """Validates the transition against `_VALID_TRANSITIONS`, updates
     the intent in place, and re-writes it durably. Raises
     `InvalidTransitionError` rather than silently allowing an
     out-of-order state change (e.g. PREPARED -> COMMITTED directly) --
-    fail-closed, same as this journal's other guarantees."""
+    fail-closed, same as this journal's other guarantees.
+
+    `quantity`/`notional`/`stop_price` -- added for the write-ahead
+    "blind" intent case (see `scripts/run_control_arm_decision.py`'s
+    `_write_blind_prepared_intents`): a blind PREPARED intent is written
+    before the real fill quantity/price are known, so this lets the
+    SAME on-disk intent be updated with the real numbers at the same
+    time it transitions PREPARED -> SUBMITTING, instead of requiring a
+    second, separate write. Same `is not None` convention as
+    `broker_order_id`/`broker_status`/`last_error` above -- only set if
+    a caller actually passes a value."""
     allowed = _VALID_TRANSITIONS.get(intent.status, frozenset())
     if new_status not in allowed:
         raise InvalidTransitionError(
@@ -265,6 +278,12 @@ def transition_intent(
         intent.broker_status = broker_status
     if last_error is not None:
         intent.last_error = last_error
+    if quantity is not None:
+        intent.quantity = quantity
+    if notional is not None:
+        intent.notional = notional
+    if stop_price is not None:
+        intent.stop_price = stop_price
     if increment_attempt:
         intent.attempt_count += 1
     if new_status in (COMMITTED, TERMINAL):

@@ -175,53 +175,64 @@ must never gate trading. A one-time (marker-file-guarded, not per-run)
 with Healthchecks not configured, so the gap doesn't go unnoticed
 forever, without spamming the owner on every subsequent cron invocation.
 
-INTENT JOURNAL ORDERING GAP (found by an independent audit, guarded not
-yet fully fixed): `_run_intent_protocol` (see its own docstring) writes
-PREPARED intents from `decision["queued_for_next_run"]`/`["executed_today"]`
--- i.e. AFTER `rdd.run_daily_decision()` has already returned, and (for a
-real order, a case that has never yet happened in production -- this
-control arm has never passed `--enable-equity-orders`/
-`--enable-crypto-orders`) after any real broker call
-`_execute_equity_orders`/`_execute_crypto_orders` inside that function
-would already have made. This defeats the entire point of a WRITE-AHEAD
-journal for exactly the case it exists to protect: a crash between the
-real broker call and this wrapper regaining control would leave zero
-on-disk evidence of what was attempted, one atomic black-box call
-(`run_daily_decision()`) providing no hook to intervene earlier without
-editing that frozen file.
+INTENT JOURNAL ORDERING GAP (found by an independent audit; the
+write-ahead mechanism below is now BUILT and sandbox-tested, but real
+order activation stays manually gated -- see "STILL GUARDED" below):
+`_run_intent_protocol` originally only wrote PREPARED intents from
+`decision["queued_for_next_run"]`/`["executed_today"]` -- i.e. AFTER
+`rdd.run_daily_decision()` had already returned, and (for a real order,
+a case that has never yet happened in production -- this control arm
+has never passed `--enable-equity-orders`/`--enable-crypto-orders`)
+after any real broker call `_execute_equity_orders`/`_execute_crypto_orders`
+inside that function would already have made. That defeated the entire
+point of a WRITE-AHEAD journal for exactly the case it exists to
+protect: a crash between the real broker call and this wrapper
+regaining control would leave zero on-disk evidence of what was
+attempted, one atomic black-box call (`run_daily_decision()`) providing
+no hook to intervene earlier without editing that frozen file.
 
-GUARDED FOR NOW: `_guard_against_premature_order_activation` (called as
-the very first thing `_execute()` does, before any other check) makes it
-impossible to pass either order-enabling flag at all until this is
-actually fixed -- fail-closed on the gap itself, not a partial or
-uncertain workaround.
-
-DESIGNED, NOT YET BUILT -- the concrete fix for whenever real order
-activation is approved: BEFORE calling `rdd.run_daily_decision()`, this
-wrapper would need to independently compute the SAME set of tickers that
-call is about to submit real orders for (today's `queued_for_next_run`
-entries becoming today's Open-fill attempts, i.e. yesterday's queued
-signals -- NOT re-deriving the frozen engine's own signal-selection
-logic, which would risk drifting from it; rather, reading what is
-ALREADY queued in the freshly-loaded `pending_buys`/`pending_exits`
-BEFORE this run touches them, since those are exactly what
-`_execute_pending_buys_at_open`/`_execute_pending_exits_at_open` are
-about to act on this run), write a "blind" PREPARED intent for each
-(using the SAME deterministic `client_order_id` formula already used
-post-hoc, so the SAME intent record is what gets found/updated
-afterward, never a second, divergent one), THEN call
-`rdd.run_daily_decision()`, THEN reconcile: an intent whose ticker
-appears in the real result's `executed_today`/`equity_order_actions`
-transitions SUBMITTING -> BROKER_ACKNOWLEDGED -> COMMITTED as today;
+THE FIX, NOW BUILT: `_write_blind_prepared_intents` runs BEFORE
+`rdd.run_daily_decision()` is called, reading the SAME `pending_buys`/
+`pending_exits` (already TTL-adjusted, freshly loaded from this exact
+state file) that `_execute_pending_buys_at_open`/
+`_execute_pending_exits_at_open` are about to act on inside that call --
+NOT re-deriving the frozen engine's own signal-selection logic, only
+reading what it already queued. It writes a "blind" PREPARED intent for
+each candidate (the SAME deterministic `client_order_id` formula
+`_run_intent_protocol` uses post-hoc, so the SAME intent record is what
+gets found/updated afterward, never a second, divergent one; idempotent
+for a leftover PREPARED intent from an interrupted prior run -- see that
+function's own docstring for the crash-recovery case and
+`StrayPreparedIntentConflictError` for the fail-closed case beyond it).
+`_verify_write_ahead_evidence_before_broker_call` then confirms, by
+actually reading the on-disk journal (not by trusting a flag), that
+every candidate really has durable evidence, right before
+`rdd.run_daily_decision()` is called. AFTER that call returns,
+`_run_intent_protocol` correlates: an intent whose ticker appears in the
+real result's `executed_today.entries`/`.exits` transitions
+SUBMITTING -> BROKER_ACKNOWLEDGED -> COMMITTED as today (its
+quantity/notional/stop_price updated with the now-known real numbers);
 a "blind" intent that did NOT materialize (the engine decided
-differently this bar than the pre-run snapshot implied -- possible if
-`FREEZE`/a stop triggered first, changing outcomes) transitions to
-TERMINAL as an abandoned guess, never COMMITTED. This still cannot
-inject a checkpoint DURING `run_daily_decision()`'s own internal broker
-call -- only editing that frozen file could -- but it closes the
-window this module docstring's own gap describes: the intent would be
-durably PREPARED before the call that might submit a real order starts,
-not after it returns.
+differently this bar than the pre-run snapshot implied -- e.g. the
+position cap was full, FREEZE blocked new entries, or a stop/condition
+changed the outcome before that ticker's turn) transitions to TERMINAL
+as an abandoned guess, never COMMITTED. This still cannot inject a
+checkpoint DURING `run_daily_decision()`'s own internal broker call --
+only editing that frozen file could -- but it closes the window this
+section used to describe: the intent is durably PREPARED before the
+call that might submit a real order starts, not after it returns.
+
+STILL GUARDED: `_guard_against_premature_order_activation` (called as
+the very first thing `_execute()` does, before any other check) still
+makes it impossible to pass either order-enabling flag unless the
+manual, source-level `_WRITE_AHEAD_JOURNAL_OWNER_APPROVED` flag (see its
+own comment, just above that guard) is True -- "sandbox-tested" is
+deliberately NOT treated as equivalent to "proven safe with a real
+broker in real production use." That flag stays False until the owner
+explicitly flips it after real production validation; this task did not
+flip it. Even if it were True, `_verify_write_ahead_evidence_before_broker_call`
+is the real, runtime-checked enforcement (see its own docstring) -- the
+early guard passing is necessary, not sufficient.
 
 Isolation from the live deployment is NOT implemented in this file --
 it comes entirely from process cwd (`data/live/STOP`, `data/live/FREEZE`,
@@ -572,12 +583,149 @@ def _hash_state_file(state_path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _run_intent_protocol(decision: dict, pre_state_hash: str | None) -> list[order_intent.OrderIntent]:
-    """PHASE 1 SCAFFOLD -- see order_intent.py's own module docstring
-    for the full "why." Creates one durable intent per real signal this
-    run's decision produced (today's queued-for-next-run buys and
-    today's executed entries), and walks each through PREPARED ->
-    SUBMITTING -> BROKER_ACKNOWLEDGED.
+class StrayPreparedIntentConflictError(RuntimeError):
+    """Raised by `_write_blind_prepared_intents` when a candidate's
+    deterministic `client_order_id` already has an on-disk intent in a
+    NON-PREPARED, non-terminal status (SUBMITTING/BROKER_ACKNOWLEDGED/
+    UNCERTAIN) -- meaning a PRIOR run got further than this pre-write
+    step before crashing/exiting, or before this control arm's normal
+    end-of-run cleanup ran. This pre-write step only knows how to safely
+    resume from a leftover PREPARED intent (the idempotent
+    crash-before-`rdd.run_daily_decision()` case -- see the "crash
+    simulation" test in tests/test_run_control_arm_decision_guards.py);
+    anything further along needs real broker-side reconciliation, which
+    is explicitly out of scope here -- the same already-documented gap
+    as `broker_reconciliation.py`'s own docstring note that it does not
+    yet inspect `order_intent.list_intents()` either. Fail-closed rather
+    than silently creating a second, divergent intent for the same
+    `client_order_id`."""
+
+
+def _write_blind_prepared_intents(
+    runner_state,
+    expected_session_date: str,
+    pre_state_hash: str | None,
+) -> list[order_intent.OrderIntent]:
+    """THE FIX for this module's own "INTENT JOURNAL ORDERING GAP"
+    docstring section ("blind" pre-run PREPARED intents): writes one
+    durable PREPARED intent for every candidate already queued in
+    `runner_state.pending_buys`/`pending_exits` -- the SAME,
+    TTL-adjusted dicts `rdd.run_daily_decision()` is about to load fresh
+    from this exact `position_state.json` file, i.e. exactly what
+    `_execute_pending_buys_at_open`/`_execute_pending_exits_at_open`
+    (inside that frozen, never-reimplemented call) are about to attempt
+    at today's Open. Called BEFORE that call, and therefore before any
+    real broker call it might make.
+
+    Real quantity/notional/stop_price are not yet known at this point
+    (the frozen engine decides the real fill/rejection when it actually
+    processes each ticker) -- `quantity`/`stop_price` are left `None`;
+    `notional` is filled with the pending signal's own
+    `reference_price` (the best "intended price" this pre-run snapshot
+    can offer) and gets overwritten with the real fill/exit price by
+    `_run_intent_protocol` once that exists.
+
+    `client_order_id` uses the EXACT SAME deterministic formula
+    (`rdd._deterministic_client_order_id(ticker, action_kind,
+    expected_session_date)`) that `_run_intent_protocol` computes
+    AFTER the run for a materialized entry/exit -- `expected_session_date`
+    is the real, Alpaca-calendar-confirmed session date for today,
+    verified equal to `decision["as_of_bar_timestamp_equity"]` by
+    `_verify_actual_equity_session` right after the fetch (module
+    docstring's "MARKET HOLIDAY / SESSION-DATE VERIFICATION" section) --
+    so the id computed here always resolves back to the SAME intent
+    `_run_intent_protocol` looks for afterward, never a second,
+    divergent one.
+
+    IDEMPOTENT for a leftover PREPARED intent from an interrupted prior
+    run (a crash between this function returning and
+    `rdd.run_daily_decision()` being called): reuses it rather than
+    creating a duplicate -- the candidate is still genuinely pending
+    (never consumed), so the SAME client_order_id, SAME PREPARED intent
+    is still exactly correct. Raises `StrayPreparedIntentConflictError`
+    (fail-closed) if a leftover intent for that client_order_id exists
+    in any OTHER non-terminal status -- see that exception's own
+    docstring.
+    """
+    candidates: list[tuple[str, str, object]] = []
+    for ticker, pending in sorted(runner_state.pending_buys.items()):
+        candidates.append((ticker, "ENTRY_MARKET_BUY", pending))
+    for ticker, pending in sorted(runner_state.pending_exits.items()):
+        candidates.append((ticker, "SIGNAL_EXIT_MARKET_SELL", pending))
+
+    intents: list[order_intent.OrderIntent] = []
+    for ticker, action_kind, pending in candidates:
+        client_order_id = rdd._deterministic_client_order_id(ticker, action_kind, str(expected_session_date))
+        existing = order_intent.find_intent_by_client_order_id(client_order_id)
+        if existing is not None and existing.status == order_intent.PREPARED:
+            intent = existing
+            print(
+                f"[CONTROL] Blind intent {intent.intent_id} ({ticker} {action_kind}): "
+                f"reused existing PREPARED intent left by an interrupted prior run "
+                f"(idempotent, same client_order_id)."
+            )
+        elif existing is not None:
+            raise StrayPreparedIntentConflictError(
+                f"{ticker} {action_kind}: an intent for client_order_id={client_order_id!r} "
+                f"already exists in status={existing.status!r} (intent_id={existing.intent_id}), "
+                f"not PREPARED -- this pre-write step cannot safely resume past PREPARED. "
+                f"Needs real reconciliation before this run can proceed."
+            )
+        else:
+            intent = order_intent.create_intent(
+                client_order_id=client_order_id,
+                account_identity=ACCOUNT_IDENTITY,
+                ticker=ticker,
+                side="BUY" if action_kind == "ENTRY_MARKET_BUY" else "SELL",
+                order_type="market",
+                action_kind=action_kind,
+                source_signal_timestamp=str(expected_session_date),
+                quantity=None,
+                notional=pending.signal.reference_price,
+                stop_price=None,
+                pre_state_hash=pre_state_hash,
+            )
+            print(
+                f"[CONTROL] Blind intent {intent.intent_id} ({ticker} {action_kind}): "
+                f"PREPARED (write-ahead, before rdd.run_daily_decision())."
+            )
+        intents.append(intent)
+    return intents
+
+
+def _run_intent_protocol(
+    decision: dict,
+    pre_state_hash: str | None,
+    blind_intents: list[order_intent.OrderIntent] | None = None,
+) -> list[order_intent.OrderIntent]:
+    """See `order_intent.py`'s own module docstring for the full state
+    machine. Correlates this run's REAL decision output against the
+    "blind" PREPARED intents `_write_blind_prepared_intents` already
+    wrote before `rdd.run_daily_decision()` was called (`blind_intents`
+    -- `None` only when this function is called directly, e.g. from a
+    unit test that does not exercise the pre-write step; production
+    always passes the real list).
+
+    For every entry/exit this run's decision actually materialized
+    (`executed_today.entries`/`executed_today.exits`), the matching
+    blind intent (found by the SAME deterministic `client_order_id`
+    formula, see `_write_blind_prepared_intents`'s own docstring) is
+    reused and updated with the now-known real quantity/price, then
+    walked PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED. If no blind
+    intent exists for that id (the `blind_intents=None` direct-call
+    case, or a candidate that only appeared THIS run with no prior
+    pending state -- structurally rare but not assumed impossible), a
+    fresh intent is created instead, exactly like this function's
+    original (pre-write-ahead) behavior.
+
+    Every blind intent that did NOT materialize this run (the frozen
+    engine decided differently than the pre-run snapshot implied --
+    e.g. the position cap was full, FREEZE blocked new entries, or a
+    stop/condition changed the outcome before that ticker's turn) is
+    closed PREPARED -> TERMINAL as an abandoned guess, never COMMITTED
+    -- see module docstring's "INTENT JOURNAL ORDERING GAP" section,
+    "a 'blind' intent that did NOT materialize ... transitions to
+    TERMINAL as an abandoned guess."
 
     NO REAL BROKER CALL IS MADE ANYWHERE IN THIS FUNCTION.
     BROKER_ACKNOWLEDGED here means "the local decision is confirmed as
@@ -587,41 +735,68 @@ def _run_intent_protocol(decision: dict, pre_state_hash: str | None) -> list[ord
     exists today; this control arm has never enabled
     --enable-equity-orders/--enable-crypto-orders in production).
 
-    Returns the created intents so the caller can transition them to
-    COMMITTED only after `position_state.json` has actually been
-    durably re-saved with today's stamp (see main()'s own ordering).
+    Returns the created/updated/closed intents so the caller can
+    transition the materialized ones to COMMITTED only after
+    `position_state.json` has actually been durably re-saved with
+    today's stamp (see main()'s own ordering).
     """
     equity_date = decision.get("as_of_bar_timestamp_equity") or decision.get("as_of_bar_timestamp")
-    signals: list[tuple[str, dict, str]] = []
-    for entry in decision.get("queued_for_next_run", {}).get("buys", []):
-        signals.append(("QUEUED_ENTRY_SIGNAL", entry, "reference_close"))
+    materialized: list[tuple[str, dict, str, str]] = []
     for entry in decision.get("executed_today", {}).get("entries", []):
-        signals.append(("ENTRY_MARKET_BUY", entry, "fill_price"))
+        materialized.append(("ENTRY_MARKET_BUY", entry, "fill_price", "BUY"))
+    for entry in decision.get("executed_today", {}).get("exits", []):
+        materialized.append(("SIGNAL_EXIT_MARKET_SELL", entry, "exit_price", "SELL"))
+
+    blind_by_client_order_id: dict[str, order_intent.OrderIntent] = {
+        blind.client_order_id: blind for blind in (blind_intents or [])
+    }
 
     intents: list[order_intent.OrderIntent] = []
-    for action_kind, entry, price_field in signals:
+    materialized_client_order_ids: set[str] = set()
+    for action_kind, entry, price_field, side in materialized:
         ticker = entry["ticker"]
         client_order_id = rdd._deterministic_client_order_id(ticker, action_kind, str(equity_date))
-        intent = order_intent.create_intent(
-            client_order_id=client_order_id,
-            account_identity=ACCOUNT_IDENTITY,
-            ticker=ticker,
-            side="BUY",
-            order_type="market",
-            action_kind=action_kind,
-            source_signal_timestamp=str(equity_date),
-            quantity=entry.get("quantity"),
-            notional=entry.get(price_field),
-            stop_price=entry.get("stop_loss_price"),
-            pre_state_hash=pre_state_hash,
+        materialized_client_order_ids.add(client_order_id)
+        intent = blind_by_client_order_id.get(client_order_id)
+        if intent is None:
+            intent = order_intent.create_intent(
+                client_order_id=client_order_id,
+                account_identity=ACCOUNT_IDENTITY,
+                ticker=ticker,
+                side=side,
+                order_type="market",
+                action_kind=action_kind,
+                source_signal_timestamp=str(equity_date),
+                quantity=entry.get("quantity"),
+                notional=entry.get(price_field),
+                stop_price=entry.get("stop_loss_price"),
+                pre_state_hash=pre_state_hash,
+            )
+        intent = order_intent.transition_intent(
+            intent, order_intent.SUBMITTING, increment_attempt=True,
+            quantity=entry.get("quantity"), notional=entry.get(price_field), stop_price=entry.get("stop_loss_price"),
         )
-        order_intent.transition_intent(intent, order_intent.SUBMITTING, increment_attempt=True)
-        order_intent.transition_intent(
+        intent = order_intent.transition_intent(
             intent, order_intent.BROKER_ACKNOWLEDGED,
             broker_status="local_decision_confirmed -- no real broker call made (Phase 1 scaffold)",
         )
         intents.append(intent)
         print(f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED")
+
+    for client_order_id, blind in blind_by_client_order_id.items():
+        if client_order_id in materialized_client_order_ids:
+            continue
+        closed = order_intent.transition_intent(
+            blind, order_intent.TERMINAL,
+            last_error=(
+                "attempted_but_not_executed -- this pre-run write-ahead candidate did not "
+                "appear in this run's executed_today (cap full / rejected / FREEZE / a stop "
+                "or another condition changed the outcome before this ticker was reached)."
+            ),
+        )
+        print(f"[CONTROL] Intent {closed.intent_id} ({closed.ticker} {closed.action_kind}): PREPARED -> TERMINAL (attempted_but_not_executed)")
+        intents.append(closed)
+
     return intents
 
 
@@ -826,31 +1001,97 @@ def _notify_healthchecks_not_configured_once() -> None:
     )
 
 
+# MANUAL, SOURCE-LEVEL GATE -- not flipped by the task that built the
+# write-ahead mechanism below. See module docstring's "INTENT JOURNAL
+# ORDERING GAP" section: `_write_blind_prepared_intents` +
+# `_verify_write_ahead_evidence_before_broker_call` now exist and are
+# covered by real, deterministic tests (see
+# tests/test_run_control_arm_decision_guards.py) -- but "sandbox-tested"
+# is not "proven safe with a real broker in real production use," and
+# this control arm has still never enabled --enable-equity-orders/
+# --enable-crypto-orders in production. Only the owner, after real
+# production validation, should ever flip this to True. Until then it
+# stays False and `_guard_against_premature_order_activation` blocks
+# exactly as before -- zero behavior change in production from the task
+# that added this mechanism.
+_WRITE_AHEAD_JOURNAL_OWNER_APPROVED = False
+
+
 def _guard_against_premature_order_activation(arguments: argparse.Namespace) -> None:
-    """Hard, unconditional, zero-API-call guard -- see module docstring's
-    "INTENT JOURNAL ORDERING GAP" section for the full "why". Real order
+    """Hard, zero-API-call guard -- see module docstring's "INTENT
+    JOURNAL ORDERING GAP" section for the full "why". Real order
     submission (`--enable-equity-orders`/`--enable-crypto-orders`) is
-    BLOCKED until a genuine write-ahead intent-journal-before-broker-call
-    guarantee actually exists: today, `_run_intent_protocol` only runs
-    AFTER `rdd.run_daily_decision()` has already returned (and, for a
-    real order, already called the broker) -- a crash between the real
-    broker call and that point would leave ZERO write-ahead journal
-    evidence, defeating the entire purpose of `order_intent.py`'s
-    PREPARED-before-broker-call design. Raises immediately, before any
-    other check or API call, if either flag is set -- this is
-    deliberately the FIRST thing `_execute()` does."""
-    if arguments.enable_equity_orders or arguments.enable_crypto_orders:
+    BLOCKED unless `_WRITE_AHEAD_JOURNAL_OWNER_APPROVED` is True (see
+    that constant's own comment -- a manual, source-level flag this
+    guard does not and cannot flip itself). Called as the FIRST thing
+    `_execute()` does, before any other check or API call.
+
+    This early guard is deliberately NOT the only enforcement point: it
+    cannot yet know whether write-ahead evidence genuinely exists for
+    THIS invocation's own candidates (`runner_state.pending_buys`/
+    `pending_exits` are not even loaded yet at this point in `_execute()`
+    -- see its own docstring's "trading_client -- INJECTION SEAM"
+    section for the overall call order). Even when
+    `_WRITE_AHEAD_JOURNAL_OWNER_APPROVED` is True, the REAL, runtime
+    check is `_verify_write_ahead_evidence_before_broker_call`, called
+    later, once state is loaded and `_write_blind_prepared_intents` has
+    actually run for this invocation -- it reads `order_intent.py`'s own
+    on-disk journal and fails closed if evidence is missing for even one
+    candidate. This function alone passing a True flag is a necessary,
+    not sufficient, condition for `rdd.run_daily_decision()` ever being
+    called with a real order-enabling flag."""
+    if not (arguments.enable_equity_orders or arguments.enable_crypto_orders):
+        return
+    if not _WRITE_AHEAD_JOURNAL_OWNER_APPROVED:
         raise RuntimeError(
             "Real order activation (--enable-equity-orders/--enable-crypto-orders) "
-            "is BLOCKED: the intent journal currently records PREPARED "
-            "AFTER rdd.run_daily_decision() returns, not before its real "
-            "broker call would happen -- a crash between the two would "
-            "leave zero write-ahead evidence, defeating the entire "
-            "purpose of the journal (see order_intent.py's own module "
-            "docstring). See this file's own module docstring, 'INTENT "
-            "JOURNAL ORDERING GAP', for the designed-but-not-yet-built "
-            "fix (a 'blind' pre-run PREPARED intent set). Do not pass "
-            "either flag until that gap is actually closed."
+            "is BLOCKED: _WRITE_AHEAD_JOURNAL_OWNER_APPROVED is False. The "
+            "write-ahead intent mechanism (_write_blind_prepared_intents / "
+            "_verify_write_ahead_evidence_before_broker_call) now exists and is "
+            "sandbox-tested, but this manual, source-level flag has not been "
+            "set by the owner after real production validation -- see this "
+            "constant's own comment just above this function. Do not pass "
+            "either flag until the owner explicitly approves and flips it."
+        )
+
+
+def _verify_write_ahead_evidence_before_broker_call(
+    runner_state,
+    expected_session_date: str,
+    arguments: argparse.Namespace,
+) -> None:
+    """The REAL runtime gate `_guard_against_premature_order_activation`'s
+    own docstring refers to. A no-op unless either order-enabling flag is
+    set (today: never true in production). Confirms, by actually reading
+    `order_intent.py`'s on-disk journal via
+    `order_intent.find_intent_by_client_order_id` (not by trusting the
+    static `_WRITE_AHEAD_JOURNAL_OWNER_APPROVED` flag alone), that a
+    durable, non-terminal intent genuinely exists for EVERY candidate in
+    `runner_state.pending_buys`/`pending_exits` -- i.e. that
+    `_write_blind_prepared_intents` really ran, for real, for THIS exact
+    invocation, not merely that the function exists in this file. Called
+    right after that pre-write step, right before `rdd.run_daily_decision()`.
+    Fail-closed: raises `RuntimeError` if evidence is missing for even one
+    candidate while either order-enabling flag is set."""
+    if not (arguments.enable_equity_orders or arguments.enable_crypto_orders):
+        return
+    missing: list[str] = []
+    for ticker in runner_state.pending_buys:
+        client_order_id = rdd._deterministic_client_order_id(ticker, "ENTRY_MARKET_BUY", str(expected_session_date))
+        intent = order_intent.find_intent_by_client_order_id(client_order_id)
+        if intent is None or intent.status not in _INTENT_NON_TERMINAL_STATUSES:
+            missing.append(f"{ticker} (BUY, client_order_id={client_order_id!r})")
+    for ticker in runner_state.pending_exits:
+        client_order_id = rdd._deterministic_client_order_id(ticker, "SIGNAL_EXIT_MARKET_SELL", str(expected_session_date))
+        intent = order_intent.find_intent_by_client_order_id(client_order_id)
+        if intent is None or intent.status not in _INTENT_NON_TERMINAL_STATUSES:
+            missing.append(f"{ticker} (EXIT, client_order_id={client_order_id!r})")
+    if missing:
+        raise RuntimeError(
+            f"Write-ahead evidence missing for {len(missing)} candidate(s) about to be "
+            f"acted on by rdd.run_daily_decision() with a real order-enabling flag set: "
+            f"{missing}. Refusing to proceed -- _write_blind_prepared_intents did not "
+            f"durably record a non-terminal intent for every candidate this run would act on."
         )
 
 
@@ -1161,6 +1402,30 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
 
                 pre_state_hash = _hash_state_file(arguments.state_path)
 
+                # WRITE-AHEAD INTENT JOURNAL -- closes this module docstring's
+                # own "INTENT JOURNAL ORDERING GAP": write one durable
+                # "blind" PREPARED intent per candidate already queued in
+                # reconciliation_state.pending_buys/pending_exits (TTL-
+                # adjusted above, the SAME dicts rdd.run_daily_decision()
+                # is about to load fresh from this exact state file) --
+                # BEFORE that call, and therefore before any real broker
+                # call it might make. See _write_blind_prepared_intents's
+                # own docstring for the full design and the crash-recovery
+                # (idempotent reuse) case.
+                blind_intents = _write_blind_prepared_intents(
+                    reconciliation_state, expected_session_date, pre_state_hash
+                )
+
+                # The REAL runtime gate for real order activation -- see
+                # _guard_against_premature_order_activation's own
+                # docstring. No-op today (never true in production, see
+                # that guard), but genuinely verifies write-ahead evidence
+                # exists on disk for this exact invocation whenever either
+                # order-enabling flag IS set.
+                _verify_write_ahead_evidence_before_broker_call(
+                    reconciliation_state, expected_session_date, arguments
+                )
+
                 result = rdd.run_daily_decision(
                     state_path=arguments.state_path,
                     decision_log_directory=arguments.decision_log_directory,
@@ -1238,10 +1503,13 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                             f"the exit condition valid -- closed as {outcome_label}, not re-queued."
                         )
 
-                # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED protocol --
-                # see _run_intent_protocol's own docstring for exactly what
+                # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED (materialized)
+                # or PREPARED -> TERMINAL (abandoned guess) -- correlates
+                # against the blind intents written above, before
+                # rdd.run_daily_decision() was ever called. See
+                # _run_intent_protocol's own docstring for exactly what
                 # this does and does not represent (no real broker call yet).
-                intents = _run_intent_protocol(decision, pre_state_hash)
+                intents = _run_intent_protocol(decision, pre_state_hash, blind_intents=blind_intents)
 
                 # Stamp last_processed_equity_date/crypto_date AFTER the
                 # audit checks above pass, deliberately -- if this run's own
@@ -1255,6 +1523,15 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                 # durably re-saved above -- COMMITTED is meant to mean
                 # "local state reflects this," not merely "we decided to."
                 for intent in intents:
+                    # Abandoned "blind" guesses (see _run_intent_protocol's
+                    # own docstring) are already TERMINAL by this point --
+                    # TERMINAL has no further valid transition (see
+                    # order_intent.py's _VALID_TRANSITIONS), and "COMMITTED"
+                    # would be a false claim for a candidate that was never
+                    # actually acted on this run. Only materialized
+                    # (BROKER_ACKNOWLEDGED) intents commit.
+                    if intent.status != order_intent.BROKER_ACKNOWLEDGED:
+                        continue
                     order_intent.transition_intent(intent, order_intent.COMMITTED)
                     print(f"[CONTROL] Intent {intent.intent_id} ({intent.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
 
