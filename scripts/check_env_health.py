@@ -64,12 +64,26 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The five keys this file is allowed to contain -- anything else is a
+# The keys this file is allowed to contain -- anything else is a
 # typo or a leftover from a bad edit, not a legitimate field.
+#
+# LIVE_ACCOUNT_NUMBER_SUFFIX added 2026-08-22 (independent audit
+# finding #1): run_daily_decision.py's mandatory account-identity check
+# (src/live/broker_reconciliation.py) reads this from the live system's
+# own .env -- without it in KNOWN_KEYS, this script would flag it as an
+# unrecognized/leftover key the first time it's actually set, a false
+# positive purely from this schema not knowing about it yet. NOT in
+# REQUIRED_KEYS: this script is shared between the live .env and
+# .env.control (see --expected-account-suffix's own default/override),
+# and .env.control never needs this specific key.
 KNOWN_KEYS = frozenset(
-    {"ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_BASE_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+    {
+        "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_BASE_URL",
+        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "LIVE_ACCOUNT_NUMBER_SUFFIX",
+    }
 )
 REQUIRED_KEYS = frozenset({"ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"})
+EXPECTED_LIVE_ACCOUNT_NUMBER_SUFFIX_LENGTH = 4
 
 # Real, MEASURED lengths -- never a guess. ALPACA_API_KEY (26) and
 # ALPACA_SECRET_KEY (44) were confirmed this session from TWO
@@ -236,6 +250,19 @@ def check_layer2_field_schema(path: Path) -> list[Finding]:
             )
         if not _TELEGRAM_TOKEN_RE.match(token):
             findings.append(Finding(2, "FAIL", "TELEGRAM_BOT_TOKEN does not match <numeric_bot_id>:<token> format"))
+
+    if "LIVE_ACCOUNT_NUMBER_SUFFIX" in values:
+        suffix = values["LIVE_ACCOUNT_NUMBER_SUFFIX"]
+        if len(suffix) != EXPECTED_LIVE_ACCOUNT_NUMBER_SUFFIX_LENGTH:
+            findings.append(
+                Finding(
+                    2, "FAIL",
+                    f"LIVE_ACCOUNT_NUMBER_SUFFIX length is {len(suffix)}, expected exactly "
+                    f"{EXPECTED_LIVE_ACCOUNT_NUMBER_SUFFIX_LENGTH} -- run_daily_decision.py's own "
+                    f"mandatory account-identity check requires exactly this length (see "
+                    f"scripts/run_daily_decision.py's _require_live_account_suffix)",
+                )
+            )
 
     if values.get("TELEGRAM_CHAT_ID"):
         chat_id = values["TELEGRAM_CHAT_ID"]
