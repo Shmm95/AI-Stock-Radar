@@ -41,20 +41,75 @@ def test_trend_rsi_config_is_isolated_never_imported_by_the_engine():
 def test_signal_rules_match_the_real_frozen_entry_condition():
     """_is_entry_setup's literal source text is the ground truth --
     this test greps it directly rather than trusting a second,
-    hand-maintained copy of the thresholds could never drift."""
+    hand-maintained copy of the thresholds could never drift.
+
+    REAL GAP FOUND AND FIXED (2026-08-22, independent audit):
+    `indicator_type`, `requires_close_above_fast_ma`,
+    `requires_fresh_crossover_not_continuation`, and
+    `regime_gate_required` were listed on `SignalRules` but never
+    actually READ by this test -- the assertions hardcoded "EMA" and
+    checked the corresponding source patterns UNCONDITIONALLY, so the
+    test would have stayed green even if one of these fields were
+    flipped in the schema without the real engine changing to match
+    (or vice versa). Every one of the four now drives its own
+    assertion, both directions (pattern present when the flag is True,
+    ABSENT when False), so a drift in either the schema or the engine
+    is actually caught."""
     source = inspect.getsource(engine._is_entry_setup)
     rules = strategy_config.TREND_RSI_STRATEGY_CONFIG.signal_rules
 
-    assert f'row["EMA{rules.fast_ma_period}"]) > float(row["EMA{rules.slow_ma_period}"]' in source
-    assert f'row["Close"]) > float(row["EMA{rules.fast_ma_period}"]' in source
+    ma_crossover_pattern = (
+        f'row["{rules.indicator_type}{rules.fast_ma_period}"]) > '
+        f'float(row["{rules.indicator_type}{rules.slow_ma_period}"]'
+    )
+    assert ma_crossover_pattern in source
+
+    close_above_fast_ma_pattern = f'row["Close"]) > float(row["{rules.indicator_type}{rules.fast_ma_period}"]'
+    if rules.requires_close_above_fast_ma:
+        assert close_above_fast_ma_pattern in source
+    else:
+        assert close_above_fast_ma_pattern not in source
+
     assert f'{int(rules.rsi_lower_bound)} <= float(row["RSI{rules.rsi_period}"]) <= {int(rules.rsi_upper_bound)}' in source
-    assert 'row.get("RegimeAllowed"' in source
+
+    if rules.regime_gate_required:
+        assert 'row.get("RegimeAllowed"' in source
+    else:
+        assert 'row.get("RegimeAllowed"' not in source
 
     build_signal_source = inspect.getsource(engine._build_entry_signal)
     # The real guard clause: `if not _is_entry_setup(current) or _is_entry_setup(previous): return None`
     # -- i.e. proceeds only when current IS a setup and previous was NOT,
     # which is the fresh-crossover-only property SignalRules claims.
-    assert "not _is_entry_setup(current) or _is_entry_setup(previous)" in build_signal_source
+    fresh_crossover_pattern = "not _is_entry_setup(current) or _is_entry_setup(previous)"
+    if rules.requires_fresh_crossover_not_continuation:
+        assert fresh_crossover_pattern in build_signal_source
+    else:
+        assert fresh_crossover_pattern not in build_signal_source
+
+
+def test_signal_rules_flags_would_actually_catch_a_drift():
+    """Direct reproduction of the gap the previous test's own docstring
+    describes: constructs a SignalRules claiming a property the real
+    engine does NOT have, and proves the same conditional-assertion
+    logic would reject it -- not just that today's real values happen
+    to match."""
+    source = inspect.getsource(engine._is_entry_setup)
+    build_signal_source = inspect.getsource(engine._build_entry_signal)
+
+    drifted = strategy_config.SignalRules(
+        indicator_type="SMA",  # real engine uses EMA -- this must NOT match
+        requires_close_above_fast_ma=False,  # real engine DOES require this -- claiming False must NOT match
+        requires_fresh_crossover_not_continuation=False,  # real engine DOES require this
+        regime_gate_required=False,  # real engine DOES require this
+    )
+
+    assert f'row["{drifted.indicator_type}20"])' not in source  # SMA20 never appears; real engine uses EMA20
+    # requires_close_above_fast_ma=False claims the pattern is ABSENT --
+    # but it IS present in the real engine, so this claim is wrong.
+    assert 'row["Close"]) > float(row["EMA20"]' in source  # real pattern present despite the drifted claim
+    assert 'row.get("RegimeAllowed"' in source  # present despite drifted.regime_gate_required=False
+    assert "not _is_entry_setup(current) or _is_entry_setup(previous)" in build_signal_source  # present despite drifted flag
 
 
 def test_risk_management_rules_match_portfolio_backtest_config_defaults():
