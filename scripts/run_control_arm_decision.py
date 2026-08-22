@@ -1432,6 +1432,18 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     enable_equity_orders=arguments.enable_equity_orders,
                     enable_crypto_orders=arguments.enable_crypto_orders,
                     freeze=freeze,
+                    # REAL BUG FOUND AND FIXED (2026-08-22, independent
+                    # audit): without these two, run_daily_decision()
+                    # would build its OWN fresh trading client and run a
+                    # SECOND, redundant broker_reconciliation.reconcile()
+                    # internally -- using the wrong (LIVE, not control-arm)
+                    # expected account suffix, and 3-4 wasted real API
+                    # calls -- on top of THIS run's own reconciliation
+                    # already done above (reconciliation_client, already
+                    # identity-verified against THIS account). Reuse that
+                    # same client, skip the internal duplicate.
+                    trading_client=reconciliation_client,
+                    skip_broker_reconciliation=True,
                 )
 
                 decision = result["decision"]

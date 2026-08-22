@@ -128,8 +128,9 @@ def test_broker_closed_local_still_open_halts_before_any_market_data_fetch(
     monkeypatch.setattr(runner, "prepare_live_market_data", _poison_prepare_market_data)
     monkeypatch.setattr(
         runner, "get_live_cash_balance",
-        lambda: (_ for _ in ()).throw(AssertionError("get_live_cash_balance() called before reconciliation")),
+        lambda client=None: (_ for _ in ()).throw(AssertionError("get_live_cash_balance() called before reconciliation")),
     )
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "TEST")  # matches _FakeAccount's account
 
     with pytest.raises(br.StopOrderInvariantViolationError, match="CEG"):
         runner.run_daily_decision(
@@ -175,7 +176,8 @@ def test_clean_broker_state_reconciles_without_raising(monkeypatch: pytest.Monke
         raise RuntimeError("REACHED_MARKET_DATA_FETCH")
 
     monkeypatch.setattr(runner, "prepare_live_market_data", _fake_prepare)
-    monkeypatch.setattr(runner, "get_live_cash_balance", lambda: 100_000.0)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "TEST")  # matches _FakeAccount's account
 
     with pytest.raises(RuntimeError, match="REACHED_MARKET_DATA_FETCH"):
         runner.run_daily_decision(
@@ -184,3 +186,257 @@ def test_clean_broker_state_reconciles_without_raising(monkeypatch: pytest.Monke
             guard_path=guard_path,
             trading_client=_CleanFakeClient(),
         )
+
+
+# --- Independent audit finding #1: LIVE_ACCOUNT_NUMBER_SUFFIX is ---
+# --- mandatory, not an optional skip-and-warn.                    ---
+
+
+class _PoisonReconciliationClient:
+    """Any real broker call here means the mandatory suffix check
+    failed to stop the run BEFORE reconcile() was ever reached."""
+
+    def get_account(self):
+        raise AssertionError("get_account() was called -- the mandatory suffix check should have raised first.")
+
+    def get_orders(self, *args, **kwargs):
+        raise AssertionError("get_orders() was called -- the mandatory suffix check should have raised first.")
+
+    def get_all_positions(self):
+        raise AssertionError("get_all_positions() was called -- the mandatory suffix check should have raised first.")
+
+
+@pytest.mark.parametrize(
+    "raw_suffix",
+    [
+        None,  # unset entirely
+        "",  # blank
+        "   ",  # whitespace-only
+        "AB",  # too short
+        "ABCDE",  # too long
+    ],
+)
+def test_missing_or_malformed_live_account_suffix_fails_closed_before_any_broker_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw_suffix: str | None
+):
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+    ps.save_position_state(ps.LiveRunnerState(), state_path, guard_path=guard_path)
+
+    if raw_suffix is None:
+        monkeypatch.delenv("LIVE_ACCOUNT_NUMBER_SUFFIX", raising=False)
+    else:
+        monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", raw_suffix)
+
+    def _poison_prepare(tickers):
+        raise AssertionError("prepare_live_market_data() was called -- the suffix check should have raised first.")
+
+    monkeypatch.setattr(runner, "prepare_live_market_data", _poison_prepare)
+    monkeypatch.setattr(
+        runner, "get_live_cash_balance",
+        lambda client=None: (_ for _ in ()).throw(AssertionError("get_live_cash_balance() called before the suffix check")),
+    )
+
+    with pytest.raises(br.AccountIdentityMismatchError):
+        runner.run_daily_decision(
+            state_path=state_path,
+            decision_log_directory=tmp_path / "decisions",
+            guard_path=guard_path,
+            trading_client=_PoisonReconciliationClient(),
+        )
+
+
+def test_valid_four_character_live_account_suffix_passes_the_mandatory_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Contrast case: a real, valid 4-character suffix must NOT be
+    rejected -- not a blanket "always fail" regression."""
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+    ps.save_position_state(ps.LiveRunnerState(), state_path, guard_path=guard_path)
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "  TEST  ")  # real value, incidental whitespace -- must be stripped
+
+    class _CleanClient:
+        def get_account(self):
+            return _FakeAccount()
+
+        def get_orders(self, *args, **kwargs):
+            return []
+
+        def get_all_positions(self):
+            return []
+
+    def _fake_prepare(tickers):
+        raise RuntimeError("REACHED_MARKET_DATA_FETCH")
+
+    monkeypatch.setattr(runner, "prepare_live_market_data", _fake_prepare)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+
+    with pytest.raises(RuntimeError, match="REACHED_MARKET_DATA_FETCH"):
+        runner.run_daily_decision(
+            state_path=state_path,
+            decision_log_directory=tmp_path / "decisions",
+            guard_path=guard_path,
+            trading_client=_CleanClient(),
+        )
+
+
+# --- Independent audit finding #3: orders_enabled=True (real ---
+# --- production combination) and Scenario C's early/durable save. ---
+
+
+def test_orders_enabled_combination_reconciles_and_reaches_market_data(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The real production flag combination (--enable-equity-orders)
+    was never exercised against this wiring before -- must reconcile
+    cleanly and still reach the market-data fetch, same as the
+    dry-run case."""
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+    ps.save_position_state(ps.LiveRunnerState(), state_path, guard_path=guard_path)
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "TEST")
+
+    class _CleanClient:
+        def get_account(self):
+            return _FakeAccount()
+
+        def get_orders(self, *args, **kwargs):
+            return []
+
+        def get_all_positions(self):
+            return []
+
+    def _fake_prepare(tickers):
+        raise RuntimeError("REACHED_MARKET_DATA_FETCH")
+
+    monkeypatch.setattr(runner, "prepare_live_market_data", _fake_prepare)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+
+    with pytest.raises(RuntimeError, match="REACHED_MARKET_DATA_FETCH"):
+        runner.run_daily_decision(
+            state_path=state_path,
+            decision_log_directory=tmp_path / "decisions",
+            guard_path=guard_path,
+            trading_client=_CleanClient(),
+            enable_equity_orders=True,
+        )
+
+
+def test_scenario_c_resolution_saves_state_before_market_data_fetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A stale (non-terminal locally, no longer open at the broker)
+    order that Scenario C can safely resolve must be durably saved to
+    disk BEFORE the market-data fetch -- proves the early-save path
+    (reconciliation_result.order_status_updates non-empty ->
+    save_position_state) is really reached, not just present in code."""
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+
+    state = ps.LiveRunnerState()
+    position = _MutablePosition(
+        ticker="XYZ", asset_class="EQUITY", entry_timestamp="2026-08-20T00:00:00Z",
+        entry_portfolio_bar_index=1, quantity=5.0, entry_price=50.0, entry_fee=0.0,
+        stop_loss_price=45.0, highest_close=50.0, trailing_close_percent=7.5,
+        initial_risk_amount=10.0, signal_score=0.0, signal_reason="test",
+    )
+    state.positions["XYZ"] = position
+    state.submitted_actions["XYZ|ENTRY_MARKET_BUY|2026-08-20"] = {
+        "order_id": "entry-order-1",
+        "client_order_id": "XYZ-ENTRY-MARKET-BUY-2026-08-20",
+        "status": "new",  # stale -- no longer open at the broker (see _CleanClient below)
+        "kind": "ENTRY_MARKET_BUY",
+    }
+    ps.save_position_state(state, state_path, guard_path=guard_path)
+
+    class _FilledOrder:
+        id = "entry-order-1"
+        client_order_id = "XYZ-ENTRY-MARKET-BUY-2026-08-20"
+        symbol = "XYZ"
+        side = "buy"
+        status = "filled"
+        filled_qty = "5.0"
+
+    class _ScenarioCClient:
+        def get_account(self):
+            return _FakeAccount()
+
+        def get_orders(self, *args, **kwargs):
+            return []  # entry order no longer open -- Scenario C candidate
+
+        def get_all_positions(self):
+            return [_FakePosition(symbol="XYZ", qty="5")]
+
+        def get_order_by_id(self, order_id):
+            assert order_id == "entry-order-1"
+            return _FilledOrder()
+
+    def _fake_prepare(tickers):
+        raise RuntimeError("REACHED_MARKET_DATA_FETCH")
+
+    monkeypatch.setattr(runner, "prepare_live_market_data", _fake_prepare)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "TEST")
+
+    with pytest.raises(RuntimeError, match="REACHED_MARKET_DATA_FETCH"):
+        runner.run_daily_decision(
+            state_path=state_path,
+            decision_log_directory=tmp_path / "decisions",
+            guard_path=guard_path,
+            trading_client=_ScenarioCClient(),
+        )
+
+    # Real, on-disk confirmation: the status correction was saved BEFORE
+    # the (poisoned, never-reached) market-data fetch.
+    reloaded = ps.load_position_state(state_path, guard_path=guard_path)
+    assert reloaded.submitted_actions["XYZ|ENTRY_MARKET_BUY|2026-08-20"]["status"] == "filled"
+
+
+# --- Independent audit finding #6 (second half): skip_broker_reconciliation ---
+# --- really skips the internal reconciliation, for run_control_arm_decision.py's ---
+# --- own reuse of this function.                                              ---
+
+
+def test_skip_broker_reconciliation_true_never_touches_the_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A poison client (any real call raises) proves
+    skip_broker_reconciliation=True genuinely skips reconcile() and the
+    mandatory suffix check entirely -- no LIVE_ACCOUNT_NUMBER_SUFFIX
+    needed either, since the whole block that would read it is skipped."""
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+    ps.save_position_state(ps.LiveRunnerState(), state_path, guard_path=guard_path)
+    monkeypatch.delenv("LIVE_ACCOUNT_NUMBER_SUFFIX", raising=False)
+
+    def _fake_prepare(tickers):
+        raise RuntimeError("REACHED_MARKET_DATA_FETCH")
+
+    monkeypatch.setattr(runner, "prepare_live_market_data", _fake_prepare)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+
+    with pytest.raises(RuntimeError, match="REACHED_MARKET_DATA_FETCH"):
+        runner.run_daily_decision(
+            state_path=state_path,
+            decision_log_directory=tmp_path / "decisions",
+            guard_path=guard_path,
+            trading_client=_PoisonReconciliationClient(),
+            skip_broker_reconciliation=True,
+        )
+
+
+def test_run_control_arm_decision_reuses_its_own_client_and_skips_duplicate_reconciliation():
+    """Real source-text check (same discipline as test_strategy_config.py's
+    drift-detection tests): confirms the actual call site, not a
+    restated claim -- catches a future edit silently dropping either
+    kwarg."""
+    import inspect
+
+    import scripts.run_control_arm_decision as carm
+
+    source = inspect.getsource(carm)
+    call_start = source.index("result = rdd.run_daily_decision(")
+    call_text = source[call_start:call_start + 1200]
+    assert "trading_client=reconciliation_client" in call_text
+    assert "skip_broker_reconciliation=True" in call_text

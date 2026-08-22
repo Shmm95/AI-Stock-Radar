@@ -413,6 +413,42 @@ def _build_state(
     )
 
 
+def _require_live_account_suffix() -> str:
+    """MANDATORY, fail-closed (2026-08-22, independent audit finding
+    #1): a missing, blank, or malformed `LIVE_ACCOUNT_NUMBER_SUFFIX`
+    must refuse to proceed, never silently skip account-identity
+    verification. `broker_reconciliation.verify_account_identity`'s own
+    `expected_suffix=None`-or-falsy skip-and-warn path is a generic
+    library capability for callers that legitimately want it -- this
+    caller (the real live trading entrypoint) is not one of them, and
+    enforces its own strict policy here rather than relying on that
+    library default. Real Alpaca account numbers observed elsewhere in
+    this codebase (`_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX = "XO4Y"`)
+    are exactly 4 characters -- enforced here, not assumed to always be
+    4 by the underlying library function itself (which accepts any
+    non-empty string, deliberately, since a caller could theoretically
+    have a different-length real value)."""
+    raw = os.environ.get("LIVE_ACCOUNT_NUMBER_SUFFIX")
+    suffix = (raw or "").strip()
+    if not suffix:
+        raise broker_reconciliation.AccountIdentityMismatchError(
+            "LIVE_ACCOUNT_NUMBER_SUFFIX is not set (or is blank) in the "
+            "environment. Real account-identity verification is MANDATORY "
+            "for this live entrypoint -- refusing to proceed rather than "
+            "silently skipping the check. Set it to the real account's "
+            "masked 4-character suffix before running this script."
+        )
+    if len(suffix) != 4:
+        raise broker_reconciliation.AccountIdentityMismatchError(
+            f"LIVE_ACCOUNT_NUMBER_SUFFIX is set but is not exactly 4 "
+            f"characters (got length {len(suffix)}). Refusing to proceed -- "
+            f"a malformed expected suffix is as dangerous as a missing one "
+            f"(it could accidentally match, or never match, an unrelated "
+            f"account). The raw value is never logged here."
+        )
+    return suffix
+
+
 def _reconcile_pending_equity_orders(
     client: TradingClient, runner_state: LiveRunnerState
 ) -> list[dict]:
@@ -946,6 +982,7 @@ def run_daily_decision(
     freeze: bool = False,
     guard_path: Path = ps.HIGH_WATER_MARK_PATH,
     trading_client: TradingClient | None = None,
+    skip_broker_reconciliation: bool = False,
 ) -> dict:
     """`guard_path` overrides the rollback high-water-mark file's location;
     defaults to the real, out-of-repo path. Only override in tests -- see
@@ -980,7 +1017,22 @@ def run_daily_decision(
     uncaught out of this function, exactly like any other real failure
     here -- `main()`'s existing broad `except Exception` already
     notifies and re-raises, no new exception handling was added for
-    this."""
+    this.
+
+    `skip_broker_reconciliation` -- REAL BUG FOUND AND FIXED (2026-08-22,
+    independent audit): `scripts/run_control_arm_decision.py` already
+    runs its OWN, correctly-configured `broker_reconciliation.reconcile()`
+    (its own account's identity suffix, before this function is even
+    called) -- calling this function afterward, unmodified, meant a
+    SECOND, redundant reconciliation ran here too, on a freshly built
+    client (never the caller's already-verified one) with
+    `LIVE_ACCOUNT_NUMBER_SUFFIX` -- the wrong suffix entirely for that
+    account, and unset in that deployment anyway, so the second pass's
+    identity check was silently skipped. That caller now passes both
+    `trading_client=<its own already-verified client>` and
+    `skip_broker_reconciliation=True`; every other real caller leaves
+    this `False` (the unchanged, default behavior) and gets the real
+    reconciliation this function's own docstring describes above."""
     config = PortfolioBacktestConfig(
         maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
         maximum_total_open_risk_percent=LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT,
@@ -996,30 +1048,35 @@ def run_daily_decision(
     if trading_client is None:
         trading_client = order_submission.get_trading_client()
 
-    reconciliation_result = broker_reconciliation.reconcile(
-        trading_client,
-        runner_state,
-        # No hardcoded default here on purpose: broker_reconciliation.py's
-        # own default (_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX) is the
-        # CONTROL ARM's account suffix -- reusing it here would compare
-        # the LIVE account against the wrong account and fail-closed on
-        # every real run. LIVE_ACCOUNT_NUMBER_SUFFIX is read from the
-        # environment (set once the owner supplies the real, masked
-        # 4-character value); unset -> None -> verify_account_identity
-        # skips the comparison (still makes the real get_account() call,
-        # still logs the masked account, just doesn't compare it) and
-        # prints a loud, unmissable warning every run until it is set.
-        expected_account_suffix=os.getenv("LIVE_ACCOUNT_NUMBER_SUFFIX"),
-        orders_enabled=live_orders_enabled,
-    )
-    if reconciliation_result.order_status_updates:
-        save_position_state(runner_state, state_path, guard_path=guard_path)
+    if not skip_broker_reconciliation:
+        # MANDATORY, fail-closed -- see _require_live_account_suffix's own
+        # docstring for why this is no longer an optional skip-and-warn
+        # path for this specific caller (independent audit finding #1).
+        live_account_suffix = _require_live_account_suffix()
+
+        reconciliation_result = broker_reconciliation.reconcile(
+            trading_client,
+            runner_state,
+            expected_account_suffix=live_account_suffix,
+            # Independent, not blended (audit finding: a single boolean
+            # contradicted this file's own --enable-equity-orders/
+            # --enable-crypto-orders independence contract) -- see
+            # reconcile()'s own docstring for the false-alarm/false-pass
+            # this fixes.
+            equity_orders_enabled=enable_equity_orders,
+            crypto_orders_enabled=enable_crypto_orders,
+        )
+        if reconciliation_result.order_status_updates:
+            save_position_state(runner_state, state_path, guard_path=guard_path)
 
     needs_review: list[dict] = []
     if enable_equity_orders:
         needs_review.extend(_reconcile_pending_equity_orders(trading_client, runner_state))
 
-    cash = get_live_cash_balance()
+    # Reuses the SAME already-verified trading_client reconciliation just
+    # used, rather than building a second, separate connection -- see
+    # get_live_cash_balance's own docstring for the real bug this closes.
+    cash = get_live_cash_balance(trading_client)
     prepared = prepare_live_market_data(LIVE_CONTROLLED_TICKERS)
     bars_today, equity_date, crypto_date = _bars_today_by_asset_class(prepared)
     # Crypto is real-time; equity's own date is only ever equal to or

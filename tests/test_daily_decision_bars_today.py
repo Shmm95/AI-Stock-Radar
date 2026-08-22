@@ -154,7 +154,8 @@ def test_run_daily_decision_end_to_end_does_not_crash_on_weekend_dates(
     }
 
     monkeypatch.setattr(runner, "prepare_live_market_data", lambda tickers: prepared)
-    monkeypatch.setattr(runner, "get_live_cash_balance", lambda: 100_000.0)
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+    monkeypatch.setenv("LIVE_ACCOUNT_NUMBER_SUFFIX", "TEST")  # matches _FakeReconciliationClient's account
 
     result = runner.run_daily_decision(
         state_path=tmp_path / "position_state.json",
