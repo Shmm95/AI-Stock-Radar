@@ -13,11 +13,14 @@ Alpaca; these tests call it directly with a plain namespace.
 
 from __future__ import annotations
 
+import inspect
+import re
 from types import SimpleNamespace
 
 import pytest
 
 import scripts.run_control_arm_decision as carm
+import src.live.broker_reconciliation as broker_reconciliation
 
 
 def test_equity_orders_flag_is_blocked():
@@ -63,3 +66,49 @@ def test_execute_calls_the_guard_first_zero_api_calls():
     )
     with pytest.raises(RuntimeError, match="BLOCKED"):
         carm._execute(args, trading_client=PoisonClient())
+
+
+# --- Independent audit finding #1 (2026-08-22): reconcile() call-site regression ---
+
+
+def test_reconcile_call_site_kwargs_bind_against_the_real_signature():
+    """REAL REGRESSION FOUND AND FIXED (2026-08-22, independent audit):
+    broker_reconciliation.reconcile()'s signature moved from a single
+    blended `orders_enabled` to independent `equity_orders_enabled`/
+    `crypto_orders_enabled` when run_daily_decision.py's own caller was
+    fixed for the same reason -- this file's own call site was never
+    updated to match, so every real control-arm run raised a real
+    TypeError (unexpected keyword argument 'orders_enabled') before
+    ever reaching rdd.run_daily_decision(). Extracts the real kwargs
+    used at the call site from source text (never a hand-copied guess)
+    and binds them against reconcile()'s REAL, current signature -- a
+    future rename/signature drift on either side fails this test
+    loudly instead of only failing on the real server."""
+    source = inspect.getsource(carm._execute)
+    call_start = source.index("broker_reconciliation.reconcile(")
+    call_text = source[call_start:call_start + 1400]
+
+    assert "equity_orders_enabled=arguments.enable_equity_orders" in call_text
+    assert "crypto_orders_enabled=arguments.enable_crypto_orders" in call_text
+    # The old, removed blended kwarg (bare "orders_enabled=", not the
+    # "equity_"/"crypto_"-prefixed forms above) must never come back.
+    assert not re.search(r"(?<![a-z_])orders_enabled=", call_text)
+
+    signature = inspect.signature(broker_reconciliation.reconcile)
+    signature.bind(
+        object(), object(),
+        expected_account_suffix="XXXX",
+        equity_orders_enabled=True,
+        crypto_orders_enabled=True,
+    )  # raises TypeError on any kwarg-name mismatch -- the real regression's exact failure mode
+
+
+def test_reconcile_call_site_no_longer_uses_the_removed_blended_kwarg():
+    """Direct reproduction of the real failure: calling reconcile() the
+    way this file's call site used to (before the fix) must raise
+    TypeError -- confirms the old call shape is genuinely incompatible
+    with the current signature, not just cosmetically different."""
+    with pytest.raises(TypeError):
+        inspect.signature(broker_reconciliation.reconcile).bind(
+            object(), object(), orders_enabled=True,
+        )

@@ -1289,15 +1289,22 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                 )
                 reconciliation_result = broker_reconciliation.reconcile(
                     reconciliation_client, reconciliation_state,
-                    # See broker_reconciliation.reconcile()'s own
-                    # docstring, "ORDERS-DISABLED / DRY-RUN AWARENESS":
-                    # matches run_daily_decision()'s own
-                    # live_orders_enabled gate exactly (same two flags,
-                    # same or), so a local-only simulated position is
-                    # never mistaken for a real reconciliation anomaly
-                    # while this control arm never actually submits
-                    # orders.
-                    orders_enabled=arguments.enable_equity_orders or arguments.enable_crypto_orders,
+                    # REAL REGRESSION FOUND AND FIXED (2026-08-22,
+                    # independent audit): reconcile()'s signature moved
+                    # from a single blended `orders_enabled` to two
+                    # independent flags (see that function's own
+                    # docstring, "ORDERS-DISABLED / DRY-RUN AWARENESS")
+                    # when the equity/crypto split was fixed for
+                    # run_daily_decision.py's own caller -- this call
+                    # site was never updated to match, so every real
+                    # control-arm run has been raising a real TypeError
+                    # (unexpected keyword argument 'orders_enabled')
+                    # before ever reaching run_daily_decision(). Each
+                    # ticker's own asset-class flag now passed through
+                    # directly, exactly as run_daily_decision.py's own
+                    # call already does.
+                    equity_orders_enabled=arguments.enable_equity_orders,
+                    crypto_orders_enabled=arguments.enable_crypto_orders,
                 )
                 if reconciliation_result.order_status_updates:
                     print(
