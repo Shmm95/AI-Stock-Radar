@@ -165,6 +165,7 @@ import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -286,13 +287,110 @@ def _deterministic_client_order_id(*parts: str) -> str:
     return sanitized[:_CLIENT_ORDER_ID_MAX_LENGTH]
 
 
+# REAL BUG FOUND AND FIXED (2026-08-22, independent audit finding #2):
+# scripts/run_control_arm_decision.py's write-ahead intent journal built
+# its own "blind" client_order_id using the literal action-kind string
+# "ENTRY_MARKET_BUY" (underscore -- the same spelling order_intent.py
+# uses for its `action_kind` field), while this file's own real-order
+# call sites below built theirs using "ENTRY-MARKET-BUY" (dash) --
+# `_deterministic_client_order_id` only substitutes "/", never "_", so
+# these produced two DIFFERENT strings for the exact same real
+# ticker+action+date. The journal's own client_order_id therefore never
+# matched what was actually submitted to Alpaca -- any future broker-side
+# correlation (Scenario C's client_order_id match in
+# broker_reconciliation.py, or a human cross-checking the journal against
+# the broker) would silently fail to find it. ONE canonical mapping from
+# the semantic action_kind (the spelling order_intent.py's own state
+# machine and `_PENDING_SIGNAL_ACTION_KIND_FAMILIES` already use) to the
+# exact literal segment fed into `_deterministic_client_order_id` closes
+# this -- every real-order call site below, and every caller building a
+# journal id for one of these two action kinds (see
+# run_control_arm_decision.py's `_write_blind_prepared_intents`/
+# `_run_intent_protocol`/`_verify_write_ahead_evidence_before_broker_call`),
+# now goes through `client_order_id_for_action` instead of hand-choosing a
+# literal. Only the two action kinds that ever reach a real broker order
+# are listed -- QUEUED_ENTRY_SIGNAL/QUEUED_EXIT_SIGNAL (pending-signal
+# tracking ids) have no broker-side counterpart to stay consistent with,
+# and keep using `_deterministic_client_order_id` directly.
+_ACTION_KIND_ORDER_ID_SEGMENT: dict[str, str] = {
+    "ENTRY_MARKET_BUY": "ENTRY-MARKET-BUY",
+    "SIGNAL_EXIT_MARKET_SELL": "SIGNAL-EXIT-MARKET-SELL",
+}
+
+
+def client_order_id_for_action(ticker: str, action_kind: str, date: str) -> str:
+    """The one canonical id-building call for any action kind that can
+    reach a real broker order -- see `_ACTION_KIND_ORDER_ID_SEGMENT`'s own
+    comment for the real cross-file id-mismatch bug this closes. Raises
+    `KeyError` (fail-closed, not a silent fallback to the raw
+    `action_kind` string) if `action_kind` is not one of the known,
+    broker-reaching kinds -- exactly the same "fail closed on an
+    unrecognized kind" discipline `broker_reconciliation._resolve_scenario_c`
+    already uses for its own `_KNOWN_ORDER_SIDES_BY_KIND` lookup."""
+    segment = _ACTION_KIND_ORDER_ID_SEGMENT[action_kind]
+    return _deterministic_client_order_id(ticker, segment, date)
+
+
 def _order_status_str(order: Order) -> str:
     status = order.status
     return str(status.value if hasattr(status, "value") else status)
 
 
+# INJECTION-SEAM CALLBACK (2026-08-22, independent audit finding #3,
+# approach (B) -- explicitly chosen over a direct `order_intent` import
+# here: order_intent.py's own module docstring states "nothing here is
+# wired into run_daily_decision.py (never modified) or any real
+# order-submission code path" -- a direct import would break that
+# documented boundary. This optional callback keeps the same one-directional
+# dependency `trading_client: TradingClient | None = None` already
+# establishes elsewhere in this file (see run_daily_decision()'s own
+# docstring): this module defines the seam and calls it if given one, but
+# never imports or knows anything about order_intent.py itself.
+#
+# THE REAL GAP THIS CLOSES: `scripts/run_control_arm_decision.py`'s
+# `_run_intent_protocol` only transitions PREPARED -> SUBMITTING ->
+# BROKER_ACKNOWLEDGED AFTER `run_daily_decision()` returns -- i.e. after
+# every real broker call inside `_execute_equity_orders`/
+# `_execute_crypto_orders` has already happened. A crash DURING one of
+# those real broker calls leaves the on-disk journal at PREPARED for
+# every candidate, with no way to tell which one (if any) actually
+# reached the broker before the crash. Calling this hook immediately
+# BEFORE each real broker call/query, and again immediately after it
+# resolves, lets a caller (the control arm) durably record SUBMITTING
+# right at the moment a broker call is about to happen -- for the exact
+# ticker/action about to be attempted, not a blanket pre-run guess.
+#
+# CONTRACT: `hook(phase, *, ticker, action_kind, client_order_id, order=None)`.
+# `phase` is `"SUBMITTING"` (called BEFORE the broker is queried/called for
+# this client_order_id -- may fire even when the order turns out to
+# already exist, since the query itself is what "SUBMITTING" durably
+# guards against a crash during) or `"BROKER_ACKNOWLEDGED"` (called AFTER
+# that query/call resolves successfully, `order` is the real `Order`).
+# Never called on a raised exception -- the exception propagates uncaught
+# exactly as before this parameter existed; a SUBMITTING-with-no-following-
+# BROKER_ACKNOWLEDGED journal entry left behind by a real crash is exactly
+# the durable evidence this hook exists to create, not a bug in the hook.
+# `None` (the default, every call site in this file that does not pass one
+# explicitly) means "no journal integration" -- zero behavior change for
+# any caller that does not opt in.
+OrderIntentHook = Callable[..., None]
+
+
+def _call_order_intent_hook(
+    hook: OrderIntentHook | None, phase: str, *, ticker: str, action_kind: str, client_order_id: str, order=None
+) -> None:
+    if hook is not None:
+        hook(phase, ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order)
+
+
 def _resolve_or_submit_order(
-    client: TradingClient, *, client_order_id: str, submit
+    client: TradingClient,
+    *,
+    client_order_id: str,
+    submit,
+    order_intent_hook: OrderIntentHook | None = None,
+    ticker: str = "",
+    action_kind: str = "",
 ) -> tuple[Order, bool]:
     """The actual fix: check the broker BEFORE calling `submit`, via
     `order_submission.get_order_by_client_order_id` (a plain,
@@ -302,11 +400,31 @@ def _resolve_or_submit_order(
     `submit` is never invoked -- a lost, never-written, or rolled-back
     local ledger entry can no longer cause a real duplicate, because
     the decision no longer depends on the local ledger at all. Returns
-    (order, already_existed)."""
+    (order, already_existed).
+
+    `order_intent_hook`/`ticker`/`action_kind` -- see `OrderIntentHook`'s
+    own module-level comment. `SUBMITTING` fires before the broker query
+    below; `BROKER_ACKNOWLEDGED` fires after it resolves, whether the
+    order already existed or was freshly submitted -- both are a real,
+    confirmed broker response, and either way this function's own crash
+    window (the one this hook exists to narrow) has closed by the time
+    either return path is reached."""
+    _call_order_intent_hook(
+        order_intent_hook, "SUBMITTING", ticker=ticker, action_kind=action_kind, client_order_id=client_order_id
+    )
     existing = order_submission.get_order_by_client_order_id(client, client_order_id)
     if existing is not None:
+        _call_order_intent_hook(
+            order_intent_hook, "BROKER_ACKNOWLEDGED",
+            ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=existing,
+        )
         return existing, True
-    return submit(), False
+    order = submit()
+    _call_order_intent_hook(
+        order_intent_hook, "BROKER_ACKNOWLEDGED",
+        ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order,
+    )
+    return order, False
 
 
 def _recommended_exit_order_type(*, exit_reason: str, asset_class: str) -> str:
@@ -450,7 +568,7 @@ def _require_live_account_suffix() -> str:
 
 
 def _reconcile_pending_equity_orders(
-    client: TradingClient, runner_state: LiveRunnerState
+    client: TradingClient, runner_state: LiveRunnerState, *, order_intent_hook: OrderIntentHook | None = None
 ) -> list[dict]:
     """Catch up on entry orders submitted, but not confirmed, on a previous run.
 
@@ -494,6 +612,9 @@ def _reconcile_pending_equity_orders(
                             stop_price=position.stop_loss_price,
                             client_order_id=stop_client_order_id,
                         ),
+                        order_intent_hook=order_intent_hook,
+                        ticker=ticker,
+                        action_kind="PROTECTIVE_STOP",
                     )
                     stop_record = {
                         "order_id": str(stop_order.id),
@@ -523,6 +644,7 @@ def _execute_equity_orders(
     equity_date: str,
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
+    order_intent_hook: OrderIntentHook | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Submit real equity orders for today's decisions. Never called for crypto.
 
@@ -545,7 +667,7 @@ def _execute_equity_orders(
         action_key = f"{ticker}|ENTRY_MARKET_BUY|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
-            client_order_id = _deterministic_client_order_id(ticker, "ENTRY-MARKET-BUY", equity_date)
+            client_order_id = client_order_id_for_action(ticker, "ENTRY_MARKET_BUY", equity_date)
             order, already_existed = _resolve_or_submit_order(
                 client,
                 client_order_id=client_order_id,
@@ -553,6 +675,9 @@ def _execute_equity_orders(
                     client, ticker=ticker, side=OrderSide.BUY, quantity=position.quantity,
                     client_order_id=client_order_id,
                 ),
+                order_intent_hook=order_intent_hook,
+                ticker=ticker,
+                action_kind="ENTRY_MARKET_BUY",
             )
             status = (
                 _order_status_str(order) if already_existed
@@ -589,6 +714,9 @@ def _execute_equity_orders(
                         stop_price=position.stop_loss_price,
                         client_order_id=stop_client_order_id,
                     ),
+                    order_intent_hook=order_intent_hook,
+                    ticker=ticker,
+                    action_kind="PROTECTIVE_STOP",
                 )
                 stop_record = {
                     "order_id": str(stop_order.id),
@@ -713,9 +841,7 @@ def _execute_equity_orders(
         action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{equity_date}"
         record = runner_state.submitted_actions.get(action_key)
         if record is None:
-            client_order_id = _deterministic_client_order_id(
-                trade.ticker, "SIGNAL-EXIT-MARKET-SELL", equity_date
-            )
+            client_order_id = client_order_id_for_action(trade.ticker, "SIGNAL_EXIT_MARKET_SELL", equity_date)
             order, already_existed = _resolve_or_submit_order(
                 client,
                 client_order_id=client_order_id,
@@ -723,6 +849,9 @@ def _execute_equity_orders(
                     client, ticker=trade.ticker, side=OrderSide.SELL, quantity=trade.quantity,
                     client_order_id=client_order_id,
                 ),
+                order_intent_hook=order_intent_hook,
+                ticker=trade.ticker,
+                action_kind="SIGNAL_EXIT_MARKET_SELL",
             )
             status = (
                 _order_status_str(order) if already_existed
@@ -788,6 +917,7 @@ def _execute_crypto_orders(
     crypto_date: str,
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
+    order_intent_hook: OrderIntentHook | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Submit real crypto orders for today's decisions. Never called for equity.
 
@@ -843,7 +973,7 @@ def _execute_crypto_orders(
             action_key = f"{ticker}|ENTRY_MARKET_BUY|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
-                client_order_id = _deterministic_client_order_id(ticker, "ENTRY-MARKET-BUY", crypto_date)
+                client_order_id = client_order_id_for_action(ticker, "ENTRY_MARKET_BUY", crypto_date)
                 order, already_existed = _resolve_or_submit_order(
                     client,
                     client_order_id=client_order_id,
@@ -855,6 +985,9 @@ def _execute_crypto_orders(
                         time_in_force=TimeInForce.IOC,
                         client_order_id=client_order_id,
                     ),
+                    order_intent_hook=order_intent_hook,
+                    ticker=ticker,
+                    action_kind="ENTRY_MARKET_BUY",
                 )
                 status = (
                     _order_status_str(order) if already_existed
@@ -905,12 +1038,20 @@ def _execute_crypto_orders(
             action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
-                client_order_id = _deterministic_client_order_id(
-                    trade.ticker, "SIGNAL-EXIT-MARKET-SELL", crypto_date
-                )
+                client_order_id = client_order_id_for_action(trade.ticker, "SIGNAL_EXIT_MARKET_SELL", crypto_date)
                 # Checked before spending a call on available_quantity --
                 # if this exact intent already happened, no quantity
-                # decision is needed at all.
+                # decision is needed at all. Does not go through
+                # _resolve_or_submit_order (the extra available-quantity
+                # lookup below does not fit that helper's plain
+                # check-then-submit shape) -- the SUBMITTING/
+                # BROKER_ACKNOWLEDGED hook calls are inlined here instead,
+                # at the same two real moments: immediately before this
+                # existence query, and immediately after it resolves.
+                _call_order_intent_hook(
+                    order_intent_hook, "SUBMITTING",
+                    ticker=trade.ticker, action_kind="SIGNAL_EXIT_MARKET_SELL", client_order_id=client_order_id,
+                )
                 existing_order = order_submission.get_order_by_client_order_id(client, client_order_id)
                 if existing_order is not None:
                     record = {
@@ -921,6 +1062,11 @@ def _execute_crypto_orders(
                         "client_order_id": client_order_id,
                     }
                     runner_state.submitted_actions[action_key] = record
+                    _call_order_intent_hook(
+                        order_intent_hook, "BROKER_ACKNOWLEDGED",
+                        ticker=trade.ticker, action_kind="SIGNAL_EXIT_MARKET_SELL",
+                        client_order_id=client_order_id, order=existing_order,
+                    )
                 else:
                     available_quantity = _query_available_crypto_quantity(client, alpaca_symbol)
                     if available_quantity is None:
@@ -943,6 +1089,11 @@ def _execute_crypto_orders(
                         quantity=available_quantity,
                         time_in_force=TimeInForce.IOC,
                         client_order_id=client_order_id,
+                    )
+                    _call_order_intent_hook(
+                        order_intent_hook, "BROKER_ACKNOWLEDGED",
+                        ticker=trade.ticker, action_kind="SIGNAL_EXIT_MARKET_SELL",
+                        client_order_id=client_order_id, order=order,
                     )
                     status = order_submission.wait_for_fill_or_timeout(client, str(order.id))
                     record = {
@@ -983,11 +1134,23 @@ def run_daily_decision(
     guard_path: Path = ps.HIGH_WATER_MARK_PATH,
     trading_client: TradingClient | None = None,
     skip_broker_reconciliation: bool = False,
+    order_intent_hook: OrderIntentHook | None = None,
 ) -> dict:
     """`guard_path` overrides the rollback high-water-mark file's location;
     defaults to the real, out-of-repo path. Only override in tests -- see
     `load_position_state`'s docstring for why a tmp_path-only test must
     not touch the real, machine-wide guard file.
+
+    `order_intent_hook` -- injection-seam callback (2026-08-22, independent
+    audit finding #3, approach (B)), same one-directional-dependency
+    discipline as `trading_client` above: this function never imports
+    `order_intent.py` itself (see that module's own docstring for why),
+    it only calls this optional hook, if given one, at the real
+    SUBMITTING/BROKER_ACKNOWLEDGED moments around every real broker order
+    call this function makes. See `OrderIntentHook`'s own module-level
+    comment for the full contract and the real crash-window gap this
+    closes. `None` (the default, every real production invocation today)
+    means zero behavior change from before this parameter existed.
 
     `trading_client` -- injection seam, test-harness-only, mirrors
     `scripts/run_control_arm_decision.py`'s own `_execute(...,
@@ -1071,7 +1234,9 @@ def run_daily_decision(
 
     needs_review: list[dict] = []
     if enable_equity_orders:
-        needs_review.extend(_reconcile_pending_equity_orders(trading_client, runner_state))
+        needs_review.extend(
+            _reconcile_pending_equity_orders(trading_client, runner_state, order_intent_hook=order_intent_hook)
+        )
 
     # Reuses the SAME already-verified trading_client reconciliation just
     # used, rather than building a second, separate connection -- see
@@ -1147,6 +1312,7 @@ def run_daily_decision(
             equity_date=equity_date,
             newly_opened=newly_opened,
             closed_trades=state.trades,
+            order_intent_hook=order_intent_hook,
         )
         needs_review.extend(more_review)
 
@@ -1158,6 +1324,7 @@ def run_daily_decision(
             crypto_date=crypto_date,
             newly_opened=newly_opened,
             closed_trades=state.trades,
+            order_intent_hook=order_intent_hook,
         )
         needs_review.extend(more_review)
 

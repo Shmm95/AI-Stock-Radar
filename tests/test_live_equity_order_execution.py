@@ -493,3 +493,138 @@ def test_crypto_positions_never_reach_order_submission(monkeypatch: pytest.Monke
     assert actions == []
     assert review == []
     assert state.submitted_actions == {}
+
+
+# ---------------------------------------------------------------------------
+# Independent audit finding #2 (2026-08-22): cross-file client_order_id
+# consistency between run_daily_decision.py's real order-submission call
+# sites and scripts/run_control_arm_decision.py's write-ahead journal.
+# ---------------------------------------------------------------------------
+
+
+def test_entry_buy_uses_client_order_id_for_action(monkeypatch: pytest.MonkeyPatch):
+    """REAL REGRESSION FOUND AND FIXED (2026-08-22, independent audit
+    finding #2): the real equity BUY call site must build its
+    client_order_id through the ONE canonical
+    `client_order_id_for_action` mapping -- the same one
+    scripts/run_control_arm_decision.py's write-ahead journal now also
+    uses -- not a hand-picked literal that could silently drift from it
+    again."""
+    captured: dict[str, str] = {}
+
+    def capture_and_submit(*a, **k):
+        captured["client_order_id"] = k["client_order_id"]
+        return FakeOrder("entry-1")
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", capture_and_submit)
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1"))
+
+    state = LiveRunnerState()
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-18",
+        newly_opened={"CEG": equity_position(ticker="CEG")}, closed_trades=[],
+    )
+
+    expected = runner.client_order_id_for_action("CEG", "ENTRY_MARKET_BUY", "2026-08-18")
+    assert captured["client_order_id"] == expected == "CEG-ENTRY-MARKET-BUY-2026-08-18"
+
+
+# ---------------------------------------------------------------------------
+# Independent audit finding #3 (2026-08-22), approach (B): order_intent_hook
+# injection seam -- SUBMITTING must fire BEFORE the real broker call, not
+# only after run_daily_decision() returns.
+# ---------------------------------------------------------------------------
+
+
+def test_order_intent_hook_fires_submitting_before_and_acknowledged_after(monkeypatch: pytest.MonkeyPatch):
+    """REAL GAP FOUND AND FIXED (2026-08-22, independent audit finding
+    #3): before this hook existed, nothing inside run_daily_decision.py
+    ever signaled "a broker call is about to happen" -- the write-ahead
+    journal only learned about SUBMITTING after this whole function had
+    already returned. Proves the hook fires SUBMITTING strictly BEFORE
+    the broker call, and BROKER_ACKNOWLEDGED strictly after -- using a
+    fake `submit` that raises if called before SUBMITTING was recorded,
+    reproducing the exact crash-window ordering guarantee this hook
+    exists to provide."""
+    calls: list[str] = []
+
+    def recording_submit(*a, **k):
+        assert calls == ["SUBMITTING"], f"broker call happened before SUBMITTING was recorded: {calls}"
+        calls.append("SUBMIT_CALLED")
+        return FakeOrder("entry-1")
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", recording_submit)
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1"))
+
+    hook_events: list[tuple] = []
+
+    def hook(phase, *, ticker, action_kind, client_order_id, order=None):
+        calls.append(phase)
+        hook_events.append((phase, ticker, action_kind, client_order_id, order))
+
+    state = LiveRunnerState()
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-14",
+        newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        order_intent_hook=hook,
+    )
+
+    entry_events = [e for e in hook_events if e[2] == "ENTRY_MARKET_BUY"]
+    assert [e[0] for e in entry_events] == ["SUBMITTING", "BROKER_ACKNOWLEDGED"]
+    assert entry_events[0][3] == entry_events[1][3]  # same client_order_id both times
+    assert entry_events[1][4].id == "entry-1"  # real order passed on acknowledgment
+
+
+def test_order_intent_hook_is_none_by_default_zero_behavior_change(monkeypatch: pytest.MonkeyPatch):
+    """No hook given -- the default, every real production call today --
+    must behave exactly as before this parameter existed."""
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("entry-1"))
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1"))
+
+    state = LiveRunnerState()
+    actions, review = runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-14",
+        newly_opened={"AAPL": equity_position()}, closed_trades=[],
+    )
+    assert review == []
+    assert state.submitted_actions["AAPL|ENTRY_MARKET_BUY|2026-08-14"]["status"] == "filled"
+
+
+def test_order_intent_hook_fires_even_when_order_already_existed(monkeypatch: pytest.MonkeyPatch):
+    """The idempotent-resolve path (`_resolve_or_submit_order` finds an
+    existing broker order and never calls `submit`) must still fire
+    both hook phases -- a real crash-then-retry scenario reaches the
+    broker query again, and the journal must still be told the broker
+    has genuinely acknowledged this client_order_id."""
+
+    class ExistingOrder:
+        id = "already-there"
+        status = "filled"
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("submit() must never be called when the order already exists at the broker")
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: ExistingOrder())
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", fail_if_called)
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1"))
+
+    hook_phases: list[str] = []
+
+    def hook(phase, *, ticker, action_kind, client_order_id, order=None):
+        if action_kind == "ENTRY_MARKET_BUY":
+            hook_phases.append(phase)
+
+    state = LiveRunnerState()
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-14",
+        newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        order_intent_hook=hook,
+    )
+
+    assert hook_phases == ["SUBMITTING", "BROKER_ACKNOWLEDGED"]

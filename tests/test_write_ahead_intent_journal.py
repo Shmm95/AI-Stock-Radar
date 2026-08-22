@@ -84,7 +84,14 @@ def test_a_blind_prepared_intent_written_to_real_disk_before_run(tmp_path):
 
     reloaded = order_intent.load_intent(intent.intent_id)
     assert reloaded.status == order_intent.PREPARED
-    assert reloaded.client_order_id == carm.rdd._deterministic_client_order_id("MDCP", "ENTRY_MARKET_BUY", "2026-08-17")
+    # REAL BUG FOUND AND FIXED (2026-08-22, independent audit finding
+    # #2): must use client_order_id_for_action -- the same canonical
+    # mapping the real broker-order call sites in run_daily_decision.py
+    # use -- not the raw _deterministic_client_order_id with a
+    # hand-picked literal (that was the bug: "ENTRY_MARKET_BUY" here
+    # vs. "ENTRY-MARKET-BUY" there produced two different ids for the
+    # same real ticker+action+date).
+    assert reloaded.client_order_id == carm.rdd.client_order_id_for_action("MDCP", "ENTRY_MARKET_BUY", "2026-08-17")
 
 
 def test_a_blind_prepared_intent_written_for_a_pending_exit_too():
@@ -242,6 +249,95 @@ def test_c_materialized_blind_intent_is_reused_updated_and_committable():
     assert committed.status == order_intent.COMMITTED
     reloaded = order_intent.load_intent(blind_intent.intent_id)
     assert reloaded.status == order_intent.COMMITTED
+
+
+# --- Independent audit finding #3 (2026-08-22), approach (B):
+# _order_intent_hook_for_run + _run_intent_protocol's idempotent handling
+# of an intent the hook already advanced DURING run_daily_decision() ---
+
+
+class _FakeBrokerOrder:
+    def __init__(self, order_id: str, status: str = "filled") -> None:
+        self.id = order_id
+        self.status = status
+
+
+def test_order_intent_hook_for_run_advances_the_matching_blind_intent():
+    """The hook must transition the SAME on-disk intent
+    _write_blind_prepared_intents already wrote -- not create a second,
+    divergent one -- and record the REAL broker order id/status, not a
+    placeholder."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG", price=75.0)
+    blind_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-18", pre_state_hash="h")
+    blind_intent = blind_intents[0]
+    client_order_id = blind_intent.client_order_id
+
+    hook = carm._order_intent_hook_for_run(blind_intents)
+    hook("SUBMITTING", ticker="CEG", action_kind="ENTRY_MARKET_BUY", client_order_id=client_order_id)
+
+    mid_flight = order_intent.load_intent(blind_intent.intent_id)
+    assert mid_flight.status == order_intent.SUBMITTING  # durable evidence exists even if a crash happens right here
+
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="ENTRY_MARKET_BUY",
+        client_order_id=client_order_id, order=_FakeBrokerOrder("real-broker-order-123", status="filled"),
+    )
+    acknowledged = order_intent.load_intent(blind_intent.intent_id)
+    assert acknowledged.status == order_intent.BROKER_ACKNOWLEDGED
+    assert acknowledged.broker_order_id == "real-broker-order-123"
+    assert acknowledged.broker_status == "filled"
+
+
+def test_order_intent_hook_for_run_is_a_no_op_for_an_unjournaled_action_kind():
+    """PROTECTIVE_STOP is never pre-journaled (only pending_buys/pending_exits
+    are) -- a hook call for it must be a silent no-op, never an error."""
+    hook = carm._order_intent_hook_for_run([])
+    hook("SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP", client_order_id="CEG-PROTECTIVE-STOP-FOR-xyz")
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-xyz", order=_FakeBrokerOrder("stop-1"),
+    )  # must not raise
+
+
+def test_run_intent_protocol_does_not_re_transition_an_intent_the_hook_already_advanced():
+    """REAL BUG THIS WOULD HAVE BEEN WITHOUT THE FIX: if
+    _run_intent_protocol blindly re-ran its own PREPARED -> SUBMITTING ->
+    BROKER_ACKNOWLEDGED transitions on an intent the real hook already
+    advanced to BROKER_ACKNOWLEDGED during run_daily_decision(), it would
+    raise InvalidTransitionError (BROKER_ACKNOWLEDGED has no self-
+    transition) and the whole run would crash AFTER real orders had
+    already been placed -- the worst possible time to fail. Must instead
+    recognize the already-advanced intent and reuse it as-is."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG", price=75.0)
+    blind_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-18", pre_state_hash="h")
+    blind_intent = blind_intents[0]
+
+    hook = carm._order_intent_hook_for_run(blind_intents)
+    hook("SUBMITTING", ticker="CEG", action_kind="ENTRY_MARKET_BUY", client_order_id=blind_intent.client_order_id)
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="ENTRY_MARKET_BUY",
+        client_order_id=blind_intent.client_order_id,
+        order=_FakeBrokerOrder("real-broker-order-123", status="filled"),
+    )
+
+    decision = {
+        "as_of_bar_timestamp_equity": "2026-08-18",
+        "executed_today": {
+            "entries": [
+                {"ticker": "CEG", "quantity": 5.0, "fill_price": 75.2, "stop_loss_price": 70.0},
+            ],
+            "exits": [],
+        },
+    }
+    result_intents = carm._run_intent_protocol(decision, pre_state_hash="h", blind_intents=blind_intents)
+
+    assert len(result_intents) == 1
+    result = result_intents[0]
+    assert result.intent_id == blind_intent.intent_id
+    assert result.status == order_intent.BROKER_ACKNOWLEDGED
+    assert result.broker_order_id == "real-broker-order-123"  # the REAL hook-recorded value, not overwritten
 
 
 # --- Guard's new conditional logic ---

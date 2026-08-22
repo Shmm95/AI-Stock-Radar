@@ -655,7 +655,17 @@ def _write_blind_prepared_intents(
 
     intents: list[order_intent.OrderIntent] = []
     for ticker, action_kind, pending in candidates:
-        client_order_id = rdd._deterministic_client_order_id(ticker, action_kind, str(expected_session_date))
+        # REAL BUG FOUND AND FIXED (2026-08-22, independent audit finding
+        # #2): this used to call rdd._deterministic_client_order_id
+        # directly with the underscore-spelled action_kind literal
+        # ("ENTRY_MARKET_BUY"), while run_daily_decision.py's own real
+        # broker-call sites built their client_order_id with a
+        # dash-spelled literal ("ENTRY-MARKET-BUY") -- two different
+        # strings for the same real ticker+action+date, so this
+        # journal's own id never matched what actually got submitted to
+        # Alpaca. rdd.client_order_id_for_action is the one shared,
+        # canonical mapping both files now go through.
+        client_order_id = rdd.client_order_id_for_action(ticker, action_kind, str(expected_session_date))
         existing = order_intent.find_intent_by_client_order_id(client_order_id)
         if existing is not None and existing.status == order_intent.PREPARED:
             intent = existing
@@ -691,6 +701,78 @@ def _write_blind_prepared_intents(
             )
         intents.append(intent)
     return intents
+
+
+def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) -> "rdd.OrderIntentHook":
+    """Builds the real callback passed as `rdd.run_daily_decision(...,
+    order_intent_hook=...)` (2026-08-22, independent audit finding #3,
+    approach (B) -- see rdd.OrderIntentHook's own module-level comment
+    for the full contract and why a callback, not a direct import,
+    closes this gap).
+
+    THE REAL GAP THIS CLOSES: before this hook existed, SUBMITTING was
+    only ever recorded by `_run_intent_protocol`, AFTER
+    `rdd.run_daily_decision()` returned -- i.e. after every real broker
+    call inside `_execute_equity_orders`/`_execute_crypto_orders` had
+    already happened. A crash DURING one of those real calls left every
+    candidate's on-disk intent stuck at PREPARED, with no way to tell
+    which one (if any) actually reached the broker before the crash.
+    This hook transitions the matching blind-written PREPARED intent to
+    SUBMITTING immediately BEFORE, and to BROKER_ACKNOWLEDGED
+    immediately AFTER, EACH real broker call -- for the exact
+    ticker/action about to be attempted, not a blanket pre-run guess.
+
+    `blind_intents` is the SAME list `_write_blind_prepared_intents`
+    already wrote before this run's `rdd.run_daily_decision()` call,
+    keyed here by `client_order_id` for lookup. A hook call for a
+    `client_order_id` with no matching blind intent (e.g.
+    `PROTECTIVE_STOP`, never pre-journaled -- only `pending_buys`/
+    `pending_exits` are) is a silent no-op, not an error -- not every
+    real broker call this hook fires around has a corresponding pre-run
+    journal entry, and creating one on the fly here would defeat the
+    whole "durable BEFORE the call" point.
+
+    Inert today: `_guard_against_premature_order_activation` blocks
+    `--enable-equity-orders`/`--enable-crypto-orders` entirely (see that
+    function's own docstring), so `_execute_equity_orders`/
+    `_execute_crypto_orders` -- and therefore this hook -- never run in
+    production. Built now so the real fix is ready and tested the
+    moment the owner ever flips `_WRITE_AHEAD_JOURNAL_OWNER_APPROVED`,
+    rather than needing a second round of protected-file changes then.
+    """
+    blind_by_client_order_id: dict[str, order_intent.OrderIntent] = {
+        intent.client_order_id: intent for intent in blind_intents
+    }
+
+    def hook(phase: str, *, ticker: str, action_kind: str, client_order_id: str, order=None) -> None:
+        intent = blind_by_client_order_id.get(client_order_id)
+        if intent is None:
+            return  # no pre-run journal entry for this call (e.g. PROTECTIVE_STOP) -- nothing to transition
+        if phase == "SUBMITTING":
+            if intent.status != order_intent.PREPARED:
+                return  # already advanced (e.g. a retry within the same run) -- do not re-transition
+            intent = order_intent.transition_intent(intent, order_intent.SUBMITTING, increment_attempt=True)
+            blind_by_client_order_id[client_order_id] = intent
+            print(
+                f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): PREPARED -> "
+                f"SUBMITTING (real broker call about to start, client_order_id={client_order_id!r})."
+            )
+        elif phase == "BROKER_ACKNOWLEDGED":
+            if intent.status != order_intent.SUBMITTING:
+                return  # nothing to acknowledge if SUBMITTING was never durably recorded
+            intent = order_intent.transition_intent(
+                intent, order_intent.BROKER_ACKNOWLEDGED,
+                broker_order_id=str(order.id) if order is not None else None,
+                broker_status=rdd._order_status_str(order) if order is not None else None,
+            )
+            blind_by_client_order_id[client_order_id] = intent
+            print(
+                f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): SUBMITTING -> "
+                f"BROKER_ACKNOWLEDGED (real broker order_id={intent.broker_order_id!r}, "
+                f"status={intent.broker_status!r})."
+            )
+
+    return hook
 
 
 def _run_intent_protocol(
@@ -755,7 +837,9 @@ def _run_intent_protocol(
     materialized_client_order_ids: set[str] = set()
     for action_kind, entry, price_field, side in materialized:
         ticker = entry["ticker"]
-        client_order_id = rdd._deterministic_client_order_id(ticker, action_kind, str(equity_date))
+        # Same fix as _write_blind_prepared_intents above -- see its own
+        # comment for the real id-mismatch bug this closes.
+        client_order_id = rdd.client_order_id_for_action(ticker, action_kind, str(equity_date))
         materialized_client_order_ids.add(client_order_id)
         intent = blind_by_client_order_id.get(client_order_id)
         if intent is None:
@@ -772,6 +856,37 @@ def _run_intent_protocol(
                 stop_price=entry.get("stop_loss_price"),
                 pre_state_hash=pre_state_hash,
             )
+
+        # REAL ORDER-INTENT HOOK ALREADY RAN (2026-08-22, independent
+        # audit finding #3, approach (B)): if rdd.run_daily_decision()
+        # was given an order_intent_hook (see _order_intent_hook_for_run
+        # below) and this candidate's real broker call actually
+        # happened, the hook has ALREADY transitioned this exact intent
+        # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED, with the REAL
+        # broker order id/status, DURING run_daily_decision() -- not a
+        # post-hoc guess. Re-running the two-step transition below on an
+        # intent that is no longer PREPARED would raise
+        # InvalidTransitionError (SUBMITTING/BROKER_ACKNOWLEDGED have no
+        # self-transition). This intent already carries the real,
+        # hook-recorded data; nothing further to do here.
+        #
+        # STILL PREPARED (today's only reachable case in production --
+        # real order submission has never been enabled here, so
+        # _execute_equity_orders/_execute_crypto_orders, and therefore
+        # the hook, never run): falls through to the original post-hoc
+        # PREPARED -> SUBMITTING -> BROKER_ACKNOWLEDGED transition,
+        # unchanged from before this task -- this is a "local decision
+        # confirmed" bookkeeping transition, not a real broker
+        # acknowledgment (see the broker_status string below).
+        if intent.status in (order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED):
+            print(
+                f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): already "
+                f"{intent.status} (real order_intent_hook already ran during "
+                f"run_daily_decision()) -- not re-transitioning."
+            )
+            intents.append(intent)
+            continue
+
         intent = order_intent.transition_intent(
             intent, order_intent.SUBMITTING, increment_attempt=True,
             quantity=entry.get("quantity"), notional=entry.get(price_field), stop_price=entry.get("stop_loss_price"),
@@ -1075,14 +1190,19 @@ def _verify_write_ahead_evidence_before_broker_call(
     candidate while either order-enabling flag is set."""
     if not (arguments.enable_equity_orders or arguments.enable_crypto_orders):
         return
+    # Same fix as _write_blind_prepared_intents -- see its own comment
+    # for the real id-mismatch bug this closes. This function must use
+    # the exact same id formula that function used, or it would always
+    # report every candidate as "missing" even when the journal is
+    # genuinely complete.
     missing: list[str] = []
     for ticker in runner_state.pending_buys:
-        client_order_id = rdd._deterministic_client_order_id(ticker, "ENTRY_MARKET_BUY", str(expected_session_date))
+        client_order_id = rdd.client_order_id_for_action(ticker, "ENTRY_MARKET_BUY", str(expected_session_date))
         intent = order_intent.find_intent_by_client_order_id(client_order_id)
         if intent is None or intent.status not in _INTENT_NON_TERMINAL_STATUSES:
             missing.append(f"{ticker} (BUY, client_order_id={client_order_id!r})")
     for ticker in runner_state.pending_exits:
-        client_order_id = rdd._deterministic_client_order_id(ticker, "SIGNAL_EXIT_MARKET_SELL", str(expected_session_date))
+        client_order_id = rdd.client_order_id_for_action(ticker, "SIGNAL_EXIT_MARKET_SELL", str(expected_session_date))
         intent = order_intent.find_intent_by_client_order_id(client_order_id)
         if intent is None or intent.status not in _INTENT_NON_TERMINAL_STATUSES:
             missing.append(f"{ticker} (EXIT, client_order_id={client_order_id!r})")
@@ -1451,6 +1571,14 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     # same client, skip the internal duplicate.
                     trading_client=reconciliation_client,
                     skip_broker_reconciliation=True,
+                    # Independent audit finding #3, approach (B): the
+                    # real fix for the SUBMITTING-timing gap -- see
+                    # _order_intent_hook_for_run's own docstring. Inert
+                    # today (real order submission is still blocked by
+                    # _guard_against_premature_order_activation), wired
+                    # now so it is already correct and tested once real
+                    # orders are ever enabled.
+                    order_intent_hook=_order_intent_hook_for_run(blind_intents),
                 )
 
                 decision = result["decision"]
