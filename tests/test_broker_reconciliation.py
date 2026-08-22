@@ -635,3 +635,51 @@ def test_clean_pass_reports_expected_broker_call_count():
     assert client.get_orders_call_count == 2  # before + after, one attempt
     assert client.get_all_positions_call_count == 1
     assert client.get_order_by_id_call_count == 0  # nothing stale to resolve in a clean pass
+
+
+# ---------------------------------------------------------------------------
+# Independent audit finding #5 (2026-08-22): bare (separator-less) crypto
+# symbol form -- a theoretical risk (alpaca-py issue #537 referenced by the
+# audit; no open crypto position exists on the real server today, so this
+# has never actually been observed against production data). Closed
+# defensively before the first real crypto position exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "broker_symbol,expected",
+    [
+        ("BTC/USD", "BTC-USD"),
+        ("ETH/USD", "ETH-USD"),
+        ("BTCUSD", "BTC-USD"),  # bare form, no separator
+        ("ETHUSD", "ETH-USD"),
+        ("UNIUSD", "UNI-USD"),
+        ("BTCEUR", "BTC-EUR"),
+        ("BTCGBP", "BTC-GBP"),
+    ],
+)
+def test_normalize_broker_symbol_handles_bare_and_slash_crypto_forms(broker_symbol, expected):
+    assert br._normalize_broker_symbol(broker_symbol) == expected
+
+
+@pytest.mark.parametrize("equity_symbol", ["AAPL", "PINS", "UNH", "JPM", "XOM", "A", "AA"])
+def test_normalize_broker_symbol_is_a_no_op_for_real_equity_tickers(equity_symbol):
+    """Guards against the bare-crypto-form regex ever misfiring on a real
+    equity ticker -- none in either universe ends in USD/EUR/GBP, but this
+    proves the narrow match, not just asserts the absence of a collision
+    in today's ticker lists."""
+    assert br._normalize_broker_symbol(equity_symbol) == equity_symbol
+
+
+def test_bare_crypto_position_reconciles_cleanly_end_to_end():
+    """Real reproduction, one level up from the unit test above: an open
+    BTC-USD position reported by the broker with NO separator at all
+    (`BTCUSD`) must reconcile cleanly, exactly like the already-covered
+    slash form (BTC/USD) does above."""
+    runner_state = LiveRunnerState()
+    crypto_position = make_position("BTC-USD", 1.0)
+    crypto_position.asset_class = "CRYPTO"
+    runner_state.positions["BTC-USD"] = crypto_position
+    client = FakeClient(positions=[FakePosition(symbol="BTCUSD", qty="1.0")])
+    result = br.reconcile(client, runner_state, equity_orders_enabled=True, crypto_orders_enabled=True)
+    assert result.broker_position_count == 1

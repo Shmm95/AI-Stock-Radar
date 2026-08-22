@@ -137,6 +137,7 @@ fail-closed (`UnreconciledLocalOrderError`), never as a silent pass.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -251,6 +252,15 @@ def _mask_account_number(account_number: str) -> str:
     return "..." + str(account_number)[-4:]
 
 
+# Quote currencies `_is_crypto_ticker` (portfolio_backtest_engine.py)
+# itself recognizes as a local crypto ticker's suffix -- kept in sync
+# with that function's own tuple deliberately, not invented separately.
+_BARE_CRYPTO_QUOTE_CURRENCIES: tuple[str, ...] = ("USD", "EUR", "GBP")
+_BARE_CRYPTO_SYMBOL_RE = re.compile(
+    r"^([A-Z]{2,10})(" + "|".join(_BARE_CRYPTO_QUOTE_CURRENCIES) + r")$"
+)
+
+
 def _normalize_broker_symbol(symbol: str) -> str:
     """REAL BUG FOUND AND FIXED (2026-08-22, independent audit): this
     module was written and tested only against the control arm's
@@ -268,8 +278,30 @@ def _normalize_broker_symbol(symbol: str) -> str:
     any run holding a real crypto position, making this module unusable
     against the live 83-ticker universe (which holds BTC-USD/ETH-USD/
     UNI-USD) even though every check it performs is otherwise correct.
-    A no-op for any equity symbol (no slash present)."""
-    return symbol.replace("/", "-")
+    A no-op for any equity symbol (no slash present).
+
+    BARE (SEPARATOR-LESS) FORM ALSO HANDLED (2026-08-22, independent
+    audit finding #5): a theoretical, not-yet-directly-observed risk --
+    some Alpaca SDK/API paths have been reported (alpaca-py issue #537
+    referenced by the audit) to return a crypto position's `symbol` with
+    NO separator at all (`BTCUSD`, not `BTC/USD`). No open crypto
+    position exists on the server today (verified by the audit via a
+    real canary read), so this has never actually been exercised against
+    production data -- closed defensively before the first real crypto
+    position exists, not in response to an observed failure. Only
+    matches a symbol that is ENTIRELY uppercase letters ending in one of
+    the same quote currencies `_is_crypto_ticker` recognizes, with a
+    non-empty base part -- deliberately narrow so this can never
+    misfire on a plain equity ticker (no real ticker in either universe
+    ends in USD/EUR/GBP; confirmed by reading `live_universe.py`/
+    `control_universe.py`)."""
+    if "/" in symbol:
+        return symbol.replace("/", "-")
+    match = _BARE_CRYPTO_SYMBOL_RE.match(symbol.upper())
+    if match:
+        base, quote = match.groups()
+        return f"{base}-{quote}"
+    return symbol
 
 
 def verify_account_identity(
