@@ -62,10 +62,12 @@ THE FOUR SCENARIOS (exact case table this task specified):
         classified "in-flight" in the error detail (fill not yet
         broker-confirmed) rather than lumped in with an unexplained
         absence -- still fail-closed either way, just a better diagnostic.
-        EXCEPT when `orders_enabled=False` (`reconcile()`'s own
-        parameter) -- see "ORDERS-DISABLED / DRY-RUN AWARENESS" in
-        `reconcile()`'s own docstring: this scenario is EXPECTED, not
-        raised, while real order submission is disabled.
+        EXCEPT when the ticker's OWN asset class's flag
+        (`equity_orders_enabled`/`crypto_orders_enabled`, `reconcile()`'s
+        own parameters) is `False` -- see "ORDERS-DISABLED / DRY-RUN
+        AWARENESS" in `reconcile()`'s own docstring: this scenario is
+        EXPECTED, not raised, while real order submission is disabled
+        for that asset class.
 
   C. A local order record is non-terminal (still "new"/"accepted"/etc.)
      but no longer appears in the broker's open-orders list.
@@ -249,6 +251,27 @@ def _mask_account_number(account_number: str) -> str:
     return "..." + str(account_number)[-4:]
 
 
+def _normalize_broker_symbol(symbol: str) -> str:
+    """REAL BUG FOUND AND FIXED (2026-08-22, independent audit): this
+    module was written and tested only against the control arm's
+    equity-only 44-ticker universe, and had ZERO crypto-symbol handling
+    anywhere (confirmed by grep -- no reference to "crypto"/"BTC"/"/"
+    existed in this file before this fix). Local state's own convention
+    is dash (`BTC-USD`, matching `live_universe.py`/`data_preparer.py`),
+    but Alpaca's real crypto positions/orders report their symbol with
+    a slash (`BTC/USD` -- confirmed already handled the other direction
+    in `data_preparer.py`'s own `_alpaca_symbol`/`crypto_stop_monitor.py`'s
+    `check_and_execute_crypto_stops`). Without this normalization, EVERY
+    open crypto position/order would silently mismatch on symbol alone
+    -- `unknown_at_broker`/`missing_at_broker` would BOTH fire for the
+    exact same real position, a guaranteed fail-closed false alarm on
+    any run holding a real crypto position, making this module unusable
+    against the live 83-ticker universe (which holds BTC-USD/ETH-USD/
+    UNI-USD) even though every check it performs is otherwise correct.
+    A no-op for any equity symbol (no slash present)."""
+    return symbol.replace("/", "-")
+
+
 def verify_account_identity(
     client: TradingClient,
     *,
@@ -260,22 +283,34 @@ def verify_account_identity(
     should use this masked value in any log/notification, never the raw
     `account.account_number` field.
 
-    `expected_suffix=None` -- deliberate, explicit opt-out (added for
-    `run_daily_decision.py`'s own live-account caller, which has no
-    known-safe suffix value hardcoded anywhere in this codebase, and
-    must never silently reuse `_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX`
-    -- that would compare the LIVE account against the CONTROL ARM's
-    own suffix and fail every real run). Still makes the real
-    `get_account()` call and still returns the masked value for
-    logging; only the comparison/raise is skipped. Prints a loud,
-    unmissable notice every time this path is taken, so an unconfigured
-    check is never silently permanent -- see the caller for how to
-    supply a real value once known."""
+    `expected_suffix=None` (or empty-string -- see below) -- deliberate,
+    explicit opt-out (added for `run_daily_decision.py`'s own
+    live-account caller, which has no known-safe suffix value hardcoded
+    anywhere in this codebase, and must never silently reuse
+    `_EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX` -- that would compare the
+    LIVE account against the CONTROL ARM's own suffix and fail every
+    real run). Still makes the real `get_account()` call and still
+    returns the masked value for logging; only the comparison/raise is
+    skipped. Prints a loud, unmissable notice every time this path is
+    taken, so an unconfigured check is never silently permanent -- see
+    the caller for how to supply a real value once known.
+
+    REAL BUG FOUND AND FIXED (2026-08-22, independent audit): treating
+    ONLY `None` as "not configured" left a genuine bypass -- Python's
+    `str.endswith("")` is unconditionally `True` for any string, so an
+    `expected_suffix` that was empty-but-not-None (e.g.
+    `LIVE_ACCOUNT_NUMBER_SUFFIX` set to a blank value in the
+    environment -- an easy real misconfiguration, not a contrived
+    one) would silently pass the comparison for ANY account instead of
+    skipping it -- worse than the `None` case, since it looks
+    VERIFIED rather than honestly skipped. Any falsy `expected_suffix`
+    (`None` or `""`) now takes the same explicit skip-and-warn path;
+    only a genuinely non-empty string is ever compared."""
     account = client.get_account()
     account_number = str(account.account_number)
     masked = _mask_account_number(account_number)
 
-    if expected_suffix is None:
+    if not expected_suffix:
         print(
             f"[CONTROL] WARNING: account-identity verification SKIPPED (no "
             f"expected suffix configured) -- connected account: {masked}. "
@@ -438,7 +473,7 @@ def _resolve_scenario_c(
             f"Fail-closed."
         )
 
-    broker_symbol = str(getattr(broker_order, "symbol", ""))
+    broker_symbol = _normalize_broker_symbol(str(getattr(broker_order, "symbol", "")))
     if broker_symbol != ticker:
         raise UnreconciledLocalOrderError(
             f"Order {order_id} ({action_key}): symbol mismatch -- local "
@@ -513,7 +548,8 @@ def reconcile(
     runner_state: Any,
     *,
     expected_account_suffix: str | None = _EXPECTED_CONTROL_ACCOUNT_NUMBER_SUFFIX,
-    orders_enabled: bool = True,
+    equity_orders_enabled: bool = True,
+    crypto_orders_enabled: bool = True,
 ) -> ReconciliationResult:
     """Full reconciliation pass. Mutates `runner_state.submitted_actions[...]
     ["status"]` in place ONLY for the narrow Scenario C success case (see
@@ -532,30 +568,59 @@ def reconcile(
     equity_stop_orders invariant) also exits before any mutation is
     possible.
 
-    `orders_enabled` -- ORDERS-DISABLED / DRY-RUN AWARENESS (added after
-    an independent audit found a real, latent false-alarm bug): when
-    real order submission is disabled (the control arm's current, only
-    real-world mode -- `--enable-equity-orders`/`--enable-crypto-orders`
-    never passed), `run_daily_decision()`'s frozen per-bar engine STILL
-    populates `runner_state.positions` with its own purely SIMULATED
-    bar-by-bar bookkeeping -- that is what makes the control arm's local
-    state a genuine, continuous forward-test track record at all, not
-    reimplementable or suppressible from this wrapper without either
-    editing the frozen engine (forbidden) or freezing `position_state.json`
-    entirely (which would silently defeat the whole point of running the
-    control arm -- no continuous simulated portfolio, no forward-test
-    signal, just one-off dry-run log lines). No real order was EVER
-    submitted for these positions, so their absence at the broker is
-    EXPECTED, not an anomaly -- comparing them against the broker at all
-    is a category error, not a legitimate reconciliation question. When
-    `orders_enabled=False`, Scenario B (`MissingBrokerPositionError`) is
-    never raised; a local-only position is logged as an expected,
-    simulated-only entry instead. Scenario A (broker has something local
-    doesn't) is DELIBERATELY left fully active even in this mode -- a
-    real position unexpectedly appearing on what should be an
-    orders-disabled paper account is still a genuine anomaly worth
-    stopping for. Every other check (account identity, snapshot
-    consistency, short-position guard, Scenario C/D order comparisons,
+    ONE KNOWN CAVEAT to the "zero mutation on a raise" claim above,
+    noted rather than restructured (independent audit, 2026-08-22 --
+    flagged as a documentation gap, not fixed by changing the actual
+    Scenario C/D ordering, which is well-tested and not being touched
+    here): Scenario D's `unknown_broker_orders` check runs AFTER
+    Scenario C's mutation pass, not before. If Scenario C successfully
+    resolves one or more candidates AND Scenario D then raises
+    `UnknownBrokerOrderError`, `runner_state.submitted_actions[...]
+    ["status"]` HAS been mutated in memory for those Scenario C
+    candidates at the moment of the raise -- the "on a raise, nothing
+    is mutated" guarantee is not literally true for this one
+    combination. In practice this does not corrupt anything on disk:
+    every real caller (`run_daily_decision.py`, `run_control_arm_decision.py`)
+    only calls `save_position_state` after `reconcile()` returns
+    NORMALLY (see each caller's own `if reconciliation_result.
+    order_status_updates:` guard) -- a raised exception means that save
+    never happens, so the in-memory-only mutation is simply discarded
+    along with the rest of that run's local state. A future caller that
+    ever persisted `runner_state` inside an `except` handler around
+    `reconcile()` would need to account for this; none does today.
+
+    `equity_orders_enabled`/`crypto_orders_enabled` -- ORDERS-DISABLED /
+    DRY-RUN AWARENESS (added after an independent audit found a real,
+    latent false-alarm bug), SPLIT INTO TWO INDEPENDENT FLAGS (a second
+    real bug found and fixed 2026-08-22: a single blended `orders_enabled`
+    boolean contradicted `run_daily_decision.py`'s own
+    `--enable-equity-orders`/`--enable-crypto-orders` independence
+    contract -- those two flags gate two completely separate code
+    blocks there, confirmed by direct read, so "crypto enabled, equity
+    not" must never apply the strict, orders-enabled comparison to a
+    local-only simulated EQUITY position, and vice versa). When real
+    order submission is disabled for an asset class, `run_daily_decision()`'s
+    frozen per-bar engine STILL populates `runner_state.positions` with
+    its own purely SIMULATED bar-by-bar bookkeeping for that asset class
+    -- that is what makes the control arm's local state a genuine,
+    continuous forward-test track record at all, not reimplementable or
+    suppressible from this wrapper without either editing the frozen
+    engine (forbidden) or freezing `position_state.json` entirely (which
+    would silently defeat the whole point of running the control arm --
+    no continuous simulated portfolio, no forward-test signal, just
+    one-off dry-run log lines). No real order was EVER submitted for
+    these positions, so their absence at the broker is EXPECTED, not an
+    anomaly -- comparing them against the broker at all is a category
+    error, not a legitimate reconciliation question. When the relevant
+    flag is `False` for a ticker's own asset class, Scenario B
+    (`MissingBrokerPositionError`) is never raised for it; a local-only
+    position is logged as an expected, simulated-only entry instead.
+    Scenario A (broker has something local doesn't) is DELIBERATELY left
+    fully active regardless of either flag -- a real position
+    unexpectedly appearing on what should be an orders-disabled paper
+    account is still a genuine anomaly worth stopping for. Every other
+    check (account identity, snapshot consistency, short-position guard,
+    Scenario C/D order comparisons,
     the equity_stop_orders invariant, local-terminal-but-broker-open) is
     completely unaffected by this parameter -- `submitted_actions`/
     `equity_stop_orders` are never populated at all while orders are
@@ -565,7 +630,7 @@ def reconcile(
     account_number_masked = verify_account_identity(client, expected_suffix=expected_account_suffix)
     snapshot = fetch_consistent_broker_snapshot(client)
 
-    broker_positions = {str(p.symbol): p for p in snapshot.positions}
+    broker_positions = {_normalize_broker_symbol(str(p.symbol)): p for p in snapshot.positions}
     local_positions = dict(runner_state.positions)
 
     for symbol, position in broker_positions.items():
@@ -591,27 +656,63 @@ def reconcile(
         )
 
     missing_at_broker = sorted(set(local_positions) - set(broker_positions))
-    if missing_at_broker and not orders_enabled:
-        # Expected, not an anomaly -- see this function's own docstring,
-        # "ORDERS-DISABLED / DRY-RUN AWARENESS". No automatic mutation
-        # either way; this is purely informational.
-        print(
-            f"[CONTROL] Dry-run mode (orders disabled): {len(missing_at_broker)} "
-            f"local-only simulated position(s) not compared against the "
-            f"broker -- no real order was ever submitted for these, so "
-            f"their absence at the broker is expected: {missing_at_broker}"
+    if missing_at_broker:
+        # REAL BUG FOUND AND FIXED (2026-08-22, independent audit): a
+        # single blended `orders_enabled` boolean contradicts
+        # run_daily_decision.py's own --enable-equity-orders/
+        # --enable-crypto-orders independence contract (confirmed by
+        # direct read: those two flags gate completely separate code
+        # blocks there). Passing their OR through here meant "crypto
+        # orders enabled, equity orders not" would incorrectly apply
+        # the STRICT (orders-enabled) comparison to a local-only
+        # simulated EQUITY position too, risking a false
+        # MissingBrokerPositionError for a position that was never
+        # supposed to have a real broker order in the first place.
+        # Each missing ticker is now judged against ITS OWN asset
+        # class's flag.
+        equity_missing = sorted(
+            t for t in missing_at_broker if local_positions[t].asset_class == "EQUITY"
         )
-    elif missing_at_broker:
-        in_flight = sorted(t for t in missing_at_broker if _has_open_entry_buy(runner_state, t))
-        unexplained = sorted(t for t in missing_at_broker if t not in in_flight)
-        raise MissingBrokerPositionError(
-            f"Local state holds position(s) not present at the broker: "
-            f"{missing_at_broker}. Fail-closed -- no automatic local "
-            f"position deletion. In-flight (open ENTRY BUY order still "
-            f"outstanding, fill not yet broker-confirmed): {in_flight}. "
-            f"Unexplained (no open entry order accounts for the absence): "
-            f"{unexplained}. Investigate before proceeding."
+        crypto_missing = sorted(
+            t for t in missing_at_broker if local_positions[t].asset_class == "CRYPTO"
         )
+
+        equity_dry_run = equity_missing and not equity_orders_enabled
+        crypto_dry_run = crypto_missing and not crypto_orders_enabled
+        equity_anomaly = equity_missing and equity_orders_enabled
+        crypto_anomaly = crypto_missing and crypto_orders_enabled
+
+        if equity_dry_run:
+            # Expected, not an anomaly -- see this function's own docstring,
+            # "ORDERS-DISABLED / DRY-RUN AWARENESS". No automatic mutation
+            # either way; this is purely informational.
+            print(
+                f"[CONTROL] Dry-run mode (equity orders disabled): "
+                f"{len(equity_missing)} local-only simulated EQUITY "
+                f"position(s) not compared against the broker -- no real "
+                f"order was ever submitted for these, so their absence at "
+                f"the broker is expected: {equity_missing}"
+            )
+        if crypto_dry_run:
+            print(
+                f"[CONTROL] Dry-run mode (crypto orders disabled): "
+                f"{len(crypto_missing)} local-only simulated CRYPTO "
+                f"position(s) not compared against the broker -- no real "
+                f"order was ever submitted for these, so their absence at "
+                f"the broker is expected: {crypto_missing}"
+            )
+        if equity_anomaly or crypto_anomaly:
+            anomalous = sorted((equity_missing if equity_anomaly else []) + (crypto_missing if crypto_anomaly else []))
+            in_flight = sorted(t for t in anomalous if _has_open_entry_buy(runner_state, t))
+            unexplained = sorted(t for t in anomalous if t not in in_flight)
+            raise MissingBrokerPositionError(
+                f"Local state holds position(s) not present at the broker: "
+                f"{anomalous}. Fail-closed -- no automatic local "
+                f"position deletion. In-flight (open ENTRY BUY order still "
+                f"outstanding, fill not yet broker-confirmed): {in_flight}. "
+                f"Unexplained (no open entry order accounts for the absence): "
+                f"{unexplained}. Investigate before proceeding."
+            )
 
     for ticker in sorted(set(local_positions) & set(broker_positions)):
         local_qty = Decimal(str(local_positions[ticker].quantity))

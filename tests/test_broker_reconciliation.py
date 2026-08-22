@@ -286,11 +286,11 @@ def test_orders_disabled_suppresses_scenario_b_false_alarm():
     """The frozen engine populates `positions` with its own purely
     simulated bookkeeping even while real orders are disabled -- no real
     order was ever submitted for these, so their absence at the broker
-    must NOT be a Scenario B anomaly when `orders_enabled=False`."""
+    must NOT be a Scenario B anomaly when `equity_orders_enabled=False`."""
     runner_state = LiveRunnerState()
     runner_state.positions["AAA"] = make_position("AAA", 10.0)
     client = FakeClient(positions=[])
-    result = br.reconcile(client, runner_state, orders_enabled=False)
+    result = br.reconcile(client, runner_state, equity_orders_enabled=False, crypto_orders_enabled=False)
     assert result.local_position_count == 1
     assert runner_state.positions["AAA"].quantity == 10.0  # untouched either way
 
@@ -298,14 +298,49 @@ def test_orders_disabled_suppresses_scenario_b_false_alarm():
 def test_orders_enabled_still_raises_the_same_gap():
     """Contrast case: the EXACT same local-only-position scenario, but
     with orders actually enabled -- must still fail closed exactly as
-    before this fix (orders_enabled=True is also the default)."""
+    before this fix (both flags default True)."""
     runner_state = LiveRunnerState()
     runner_state.positions["AAA"] = make_position("AAA", 10.0)
     client = FakeClient(positions=[])
     with pytest.raises(br.MissingBrokerPositionError):
-        br.reconcile(client, runner_state, orders_enabled=True)
+        br.reconcile(client, runner_state, equity_orders_enabled=True, crypto_orders_enabled=True)
     with pytest.raises(br.MissingBrokerPositionError):
-        br.reconcile(client, runner_state)  # default is orders_enabled=True
+        br.reconcile(client, runner_state)  # default is both True
+
+
+def test_real_crypto_symbol_slash_normalizes_to_local_dash_convention():
+    """REAL bug reproduction: before the fix, a real open BTC-USD
+    position would have appeared as BOTH unknown_at_broker (broker's
+    real "BTC/USD" symbol never matched local "BTC-USD") AND
+    missing_at_broker (local "BTC-USD" never matched broker's real
+    symbol set) -- a guaranteed false alarm on every run holding any
+    real crypto position, making this module unusable against the live
+    universe. Must reconcile cleanly once normalized."""
+    runner_state = LiveRunnerState()
+    crypto_position = make_position("BTC-USD", 1.0)
+    crypto_position.asset_class = "CRYPTO"
+    runner_state.positions["BTC-USD"] = crypto_position
+    client = FakeClient(positions=[FakePosition(symbol="BTC/USD", qty="1.0")])
+
+    result = br.reconcile(client, runner_state)  # both flags default True -- must NOT raise
+    assert result.local_position_count == 1
+    assert result.broker_position_count == 1
+
+
+def test_equity_disabled_crypto_enabled_only_suppresses_equity_anomaly():
+    """REAL bug reproduction: a single blended orders_enabled boolean
+    would have either wrongly suppressed a genuine crypto anomaly, or
+    wrongly raised for a legitimately dry-run equity position. Each
+    ticker's own asset class must be judged against its own flag."""
+    runner_state = LiveRunnerState()
+    runner_state.positions["AAA"] = make_position("AAA", 10.0)  # EQUITY, dry-run -- expected absence
+    crypto_position = make_position("BTC-USD", 1.0)
+    crypto_position.asset_class = "CRYPTO"
+    runner_state.positions["BTC-USD"] = crypto_position  # CRYPTO, orders enabled -- real anomaly
+    client = FakeClient(positions=[])
+
+    with pytest.raises(br.MissingBrokerPositionError, match="BTC-USD"):
+        br.reconcile(client, runner_state, equity_orders_enabled=False, crypto_orders_enabled=True)
 
 
 def test_position_quantity_mismatch_fails_closed():
