@@ -121,9 +121,47 @@ def test_real_artifact_resolution_produces_a_real_partial_resolution():
     gap (never claims 100% resolution)."""
     result = load_and_resolve()
     summary = result.summary
-    assert summary["total_input_events"] < 273  # grouping collapses some multi-source duplicates
-    assert summary["resolved_count"] > 0
-    assert summary["still_unresolved_count"] > 0  # a real, honest remaining gap -- not silently zeroed
+    assert summary["input_event_count"] == 273
+    assert summary["resolved_group_count"] > 0
+    assert summary["remaining_input_event_count"] > 0  # a real, honest remaining gap -- not silently zeroed
+    # REAL BUG FOUND AND FIXED (2026-08-22, independent audit): the
+    # previous version of this test only asserted `total_input_events <
+    # 273`, a weak check that a since-fixed accounting bug (adding a
+    # GROUP count to a RAW-ENTRY count) satisfied by pure coincidence,
+    # never catching that the resulting number (193) corresponded to no
+    # real quantity at all (the true distinct-group count is 179). This
+    # is the real invariant: every raw input event is accounted for
+    # exactly once, either promoted into a resolved group or left in
+    # remaining -- must always hold exactly, not approximately.
+    assert (
+        summary["promoted_input_event_count"] + summary["remaining_input_event_count"]
+        == summary["input_event_count"]
+    )
+
+
+def test_summary_field_units_are_not_accidentally_conflated():
+    """Direct reproduction of the real accounting bug: resolved_group_count
+    is GROUP-level, remaining_input_event_count is RAW-ENTRY-level --
+    a group with more than one raw input entry (the real FOX/ADD case)
+    proves these are genuinely different units, not two views of the
+    same number."""
+    events = [
+        _event("2015-09-18", "FOX", "ADD", ["wikipedia"]),
+        _event("2015-09-21", "FOX", "ADD", ["fja05680"]),
+        _event("2019-03-19", "FOX", "ADD", ["lawcal"]),  # all 3 stay in ONE unresolved group
+        _event("2020-06-01", "ABCD", "ADD", ["wikipedia"]),
+        _event("2020-06-04", "ABCD", "ADD", ["lawcal"]),  # resolves to ONE group
+    ]
+    result = resolve_unresolved_events(events)
+    summary = result.summary
+    assert summary["input_event_count"] == 5
+    assert summary["resolved_group_count"] == 1  # ABCD/ADD, one group
+    assert summary["promoted_input_event_count"] == 2  # both ABCD/ADD raw entries
+    assert summary["remaining_input_event_count"] == 3  # all 3 FOX/ADD raw entries, one group
+    # The real bug this reproduces: resolved_group_count (1) +
+    # remaining_input_event_count (3) = 4, NOT 5 -- proving these two
+    # fields must never be added together as if they were the same unit.
+    assert summary["resolved_group_count"] + summary["remaining_input_event_count"] != summary["input_event_count"]
 
 
 def test_real_fox_ticker_recycling_case_stays_unresolved_in_the_real_artifact():

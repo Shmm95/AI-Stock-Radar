@@ -84,6 +84,28 @@ class ResolvedEvent:
 
 @dataclass(frozen=True)
 class ResolutionResult:
+    """`resolved` is GROUP-level (one `ResolvedEvent` per promoted
+    (ticker, action) group, however many raw input entries fed into
+    it -- see `ResolvedEvent.source_dates`, one entry per raw input
+    event it consumed). `still_unresolved` is RAW-ENTRY-level (every
+    individual input dict belonging to a non-promoted group, via
+    `list.extend`, not deduplicated to one-per-group).
+
+    REAL BUG FOUND AND FIXED (2026-08-22, independent audit): mixing
+    those two units in one arithmetic expression
+    (`len(resolved) + len(still_unresolved)`) does not equal ANY real,
+    meaningful quantity -- not the true input count (`input_event_count`
+    below), and not the true distinct-group count either. Confirmed on
+    the real artifact: 273 raw inputs -> 179 distinct groups (107
+    resolved + 72 still-unresolved groups), while
+    `len(still_unresolved)` (86) counts RAW ENTRIES in those 72 groups,
+    not the group count itself -- the old
+    `len(resolved) + len(still_unresolved)` = 107 + 86 = 193 was a
+    coincidence of arithmetic, not a real count of anything.
+    `summary` below now reports four separately-named, individually
+    correct quantities instead."""
+
+    input_event_count: int
     resolved: tuple[ResolvedEvent, ...]
     still_unresolved: tuple[dict, ...]
 
@@ -92,10 +114,13 @@ class ResolutionResult:
         by_method: dict[str, int] = {}
         for event in self.resolved:
             by_method[event.resolution_method] = by_method.get(event.resolution_method, 0) + 1
+        promoted_input_event_count = sum(len(event.source_dates) for event in self.resolved)
+        remaining_input_event_count = len(self.still_unresolved)
         return {
-            "total_input_events": len(self.resolved) + len(self.still_unresolved),
-            "resolved_count": len(self.resolved),
-            "still_unresolved_count": len(self.still_unresolved),
+            "input_event_count": self.input_event_count,
+            "resolved_group_count": len(self.resolved),
+            "promoted_input_event_count": promoted_input_event_count,
+            "remaining_input_event_count": remaining_input_event_count,
             "resolved_by_method": by_method,
         }
 
@@ -152,7 +177,11 @@ def resolve_unresolved_events(
         else:
             still_unresolved.extend(group)
 
-    return ResolutionResult(resolved=tuple(resolved), still_unresolved=tuple(still_unresolved))
+    return ResolutionResult(
+        input_event_count=len(unresolved_events),
+        resolved=tuple(resolved),
+        still_unresolved=tuple(still_unresolved),
+    )
 
 
 def load_and_resolve(
@@ -167,4 +196,8 @@ if __name__ == "__main__":
     result = load_and_resolve()
     print(json.dumps(result.summary, indent=2))
     print()
-    print(f"{len(result.still_unresolved)} events remain a documented gap (single-source-only or wide date spread).")
+    print(
+        f"{len(result.still_unresolved)} raw input events "
+        f"({len({(e['ticker'], e['action']) for e in result.still_unresolved})} distinct (ticker, action) groups) "
+        f"remain a documented gap (single-source-only or wide date spread)."
+    )
