@@ -29,7 +29,25 @@ data/backtests/
 # correlation/backtest-sanity reports) explicitly tagged
 # RESEARCH_CANDIDATE_NOT_OFFICIAL inside each file. Same status as
 # data/backtests/ above -- local only, never committed.
-data/research/
+#
+# EXCEPTION: the cross-sectional-momentum-native-proxy PRE-REGISTRATION
+# artifact is deliberately committed for real -- unlike the
+# RESEARCH_CANDIDATE_NOT_OFFICIAL snapshots above, it is a frozen,
+# performance-blind record (status=FROZEN_BEFORE_MARKET_DATA_FETCH_AND_BACKTEST)
+# written and committed BEFORE any market data fetch or backtest result
+# exists, and its entire evidentiary value depends on that commit being
+# real and durable, not local-only. The corresponding RESULT artifact
+# (equity_cross_sectional_momentum_native_proxy_result_*.json) is NOT
+# exempted here -- it stays gitignored/local like every other
+# data/research/ artifact unless a future task explicitly commits it.
+#
+# `data/research/*`, not `data/research/`, deliberately -- git cannot
+# re-include a file via `!pattern` below if a PARENT DIRECTORY itself is
+# excluded (confirmed via `git check-ignore -v`, not assumed); excluding
+# only the directory's contents, not the directory entry itself, is what
+# makes the negation exception below actually take effect.
+data/research/*
+!data/research/equity_cross_sectional_momentum_native_proxy_preregistration_*.json
 
 # Live-trading runtime state (position state, decision logs, reports)
 # plus the emergency STOP/FREEZE flag files scripts/run_daily_decision.py
@@ -53,11 +71,21 @@ data/live/
 # research -- ignoring it would silently break `git archive`-based
 # deploys with ModuleNotFoundError on the control arm's first real run.
 # Committed for real instead.
+#
+# src/research/batch_fetch_pilot/, src/strategy/strategy_config.py, and
+# src/research/cross_sectional_momentum/ ALSO deliberately removed from
+# this list (Levent's explicit approval, 2026-08-21, same "no longer a
+# draft, real content" precedent as pit_universe/ above): batch_fetch_pilot/
+# now holds a real, already-run feasibility pilot plus
+# identity_safe_batch_fetch.py (closes its own documented FB/META
+# ticker-recycling gap); strategy_config.py now holds TREND_RSI's real
+# SignalRules/RiskManagementRules, drift-tested against the frozen
+# engine; cross_sectional_momentum/ is the equity cross-sectional 12-1
+# momentum native-universe proxy study (provenance confirmed with
+# Levent 2026-08-21). All three committed for real instead.
 docs/SHARED_CACHE_LAYER_DESIGN_V1.md
 docs/UNIVERSE_MECHANISMS_MAP.md
 docs/UNIVERSE_ROBUSTNESS_STEPS.md
 src/research/backtest_metadata.py
-src/research/batch_fetch_pilot/
 src/research/grid_trading_prototype/
 src/research/performance_report_v1/
-src/strategy/strategy_config.py
