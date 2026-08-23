@@ -9,6 +9,7 @@ script's exit behavior or mask a real trading-flow error.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 import run_daily_decision as runner  # noqa: E402
+
+
+@contextmanager
+def _fake_lock(state_path):
+    yield {}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_single_instance_lock(monkeypatch: pytest.MonkeyPatch):
+    """`main()` now acquires `single_instance_lock` (independent-audit-
+    round-3 finding #4) -- its default `lock_path` is the REAL,
+    out-of-repo guard file, never test-isolated by `tmp_path` alone
+    (same discipline this codebase's other tests already establish for
+    `position_state.py`'s own guard-directory-derived paths). Every test
+    in this file calls `runner.main()` with a bare `sys.argv`, so none
+    of them pass a real, isolated `--state-path` either -- faking the
+    lock itself is simplest and keeps this file's own focus (Telegram
+    notification wiring) undiluted by lock mechanics."""
+    monkeypatch.setattr(runner, "single_instance_lock", _fake_lock)
 
 
 def test_no_orders_produces_a_clear_no_action_message():

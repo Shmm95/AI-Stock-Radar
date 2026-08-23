@@ -205,6 +205,7 @@ from src.live.position_state import (
     load_position_state,
     save_position_state,
 )
+from src.live.single_instance_lock import single_instance_lock
 from src.notify.telegram_notifier import send_telegram_message
 
 DEFAULT_DECISION_LOG_DIRECTORY = Path("data/live/decisions")
@@ -1733,79 +1734,95 @@ def main() -> None:
     )
     arguments = parser.parse_args()
 
-    if STOP_FLAG_PATH.exists():
-        text = (
-            f"AI-Stock-Radar daily decision runner -- STOP flag detected "
-            f"({STOP_FLAG_PATH}); this run was skipped entirely, no API "
-            f"calls were made. Remove the file to resume."
-        )
-        print(text)
-        _notify_safe(text)
-        return
-
-    freeze = FREEZE_FLAG_PATH.exists()
-    if freeze:
-        text = (
-            f"AI-Stock-Radar daily decision runner -- FREEZE flag detected "
-            f"({FREEZE_FLAG_PATH}); this run will still fetch data and "
-            f"monitor/exit existing positions as usual, but will NOT open "
-            f"any new positions. Remove the file to resume normal entries."
-        )
-        print(text)
-        _notify_safe(text)
-
-    # Self-authorizes AFTER the STOP/FREEZE preflight above (independent
-    # audit finding "Madde E", 2026-08-22): this CLI entrypoint is one of
-    # this codebase's two blessed callers of run_daily_decision() with a
-    # real order-enabling flag -- see run_daily_decision()'s own
-    # `authorization` docstring and src.live.authorized_execution_context's
-    # module docstring for the full design and why this is a deliberate
-    # scope decision (the live cron's real --enable-equity-orders usage
-    # is unchanged by this). Only constructed when actually needed --
-    # the dry-run path (neither flag set, every non-live-order invocation)
-    # never touches this at all.
-    authorization = (
-        authorize_order_execution() if (arguments.enable_equity_orders or arguments.enable_crypto_orders) else None
-    )
-
-    try:
-        result = run_daily_decision(
-            state_path=arguments.state_path,
-            decision_log_directory=arguments.decision_log_directory,
-            enable_equity_orders=arguments.enable_equity_orders,
-            enable_crypto_orders=arguments.enable_crypto_orders,
-            freeze=freeze,
-            authorization=authorization,
-        )
-    except Exception as error:
-        # Notify, then re-raise unchanged -- the notification step must
-        # never mask a real failure or alter the script's exit code.
-        # If the notification itself could not be confirmed sent (bad
-        # credentials, network issue, notifier bug), that failure must
-        # ALSO be visible in the log -- otherwise a real crash can look
-        # identical to "the job silently produced no output at all",
-        # which is exactly the gap that let this failure mode go
-        # unnoticed in production. print() to stderr rather than the
-        # `logging` module: this failure path must be visible in
-        # whatever plain stdout/stderr capture the deployment already
-        # has, without depending on separate logging configuration.
-        notified = _notify_safe(_build_failure_notification_text(error))
-        if not notified:
-            print(
-                "WARNING: Telegram failure notification could not be confirmed "
-                "sent (check TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and network "
-                "reachability). The original error causing this run to fail "
-                f"follows: {type(error).__name__}: {error}",
-                file=sys.stderr,
+    # single_instance_lock (added 2026-08-23, independent-audit-round-3
+    # finding #4): this cron's own main() previously took no lock at
+    # all, while equity_session_orchestrator.py's own
+    # run_missing_session_replay() already did -- a delayed/overlapping
+    # daily run and an orchestrator invocation could both write
+    # arguments.state_path concurrently with no mutual exclusion
+    # whatsoever. Shares the EXACT SAME lock (`single_instance_lock`,
+    # keyed by `state_path`) that module already uses, closing the real
+    # cross-write race. NOT a zero-behavior-change: if this cron's own
+    # prior invocation is still genuinely running when cron fires again
+    # (e.g. a slow run overlapping its own next scheduled tick), this
+    # now fails closed with `SingleInstanceLockError` instead of
+    # silently running twice in parallel against the same state file --
+    # the correct, safer behavior, but a real, observable change from
+    # before this fix for that specific (already-anomalous) case.
+    with single_instance_lock(arguments.state_path):
+        if STOP_FLAG_PATH.exists():
+            text = (
+                f"AI-Stock-Radar daily decision runner -- STOP flag detected "
+                f"({STOP_FLAG_PATH}); this run was skipped entirely, no API "
+                f"calls were made. Remove the file to resume."
             )
-        raise
+            print(text)
+            _notify_safe(text)
+            return
 
-    print(json.dumps(result["decision"], indent=2, sort_keys=True, default=str))
-    print()
-    print(f"Decision log written to: {result['log_path'].resolve()}")
-    print(f"Position state updated at: {arguments.state_path.resolve()}")
+        freeze = FREEZE_FLAG_PATH.exists()
+        if freeze:
+            text = (
+                f"AI-Stock-Radar daily decision runner -- FREEZE flag detected "
+                f"({FREEZE_FLAG_PATH}); this run will still fetch data and "
+                f"monitor/exit existing positions as usual, but will NOT open "
+                f"any new positions. Remove the file to resume normal entries."
+            )
+            print(text)
+            _notify_safe(text)
 
-    _notify_safe(_build_daily_notification_text(result["decision"]))
+        # Self-authorizes AFTER the STOP/FREEZE preflight above (independent
+        # audit finding "Madde E", 2026-08-22): this CLI entrypoint is one of
+        # this codebase's two blessed callers of run_daily_decision() with a
+        # real order-enabling flag -- see run_daily_decision()'s own
+        # `authorization` docstring and src.live.authorized_execution_context's
+        # module docstring for the full design and why this is a deliberate
+        # scope decision (the live cron's real --enable-equity-orders usage
+        # is unchanged by this). Only constructed when actually needed --
+        # the dry-run path (neither flag set, every non-live-order invocation)
+        # never touches this at all.
+        authorization = (
+            authorize_order_execution() if (arguments.enable_equity_orders or arguments.enable_crypto_orders) else None
+        )
+
+        try:
+            result = run_daily_decision(
+                state_path=arguments.state_path,
+                decision_log_directory=arguments.decision_log_directory,
+                enable_equity_orders=arguments.enable_equity_orders,
+                enable_crypto_orders=arguments.enable_crypto_orders,
+                freeze=freeze,
+                authorization=authorization,
+            )
+        except Exception as error:
+            # Notify, then re-raise unchanged -- the notification step must
+            # never mask a real failure or alter the script's exit code.
+            # If the notification itself could not be confirmed sent (bad
+            # credentials, network issue, notifier bug), that failure must
+            # ALSO be visible in the log -- otherwise a real crash can look
+            # identical to "the job silently produced no output at all",
+            # which is exactly the gap that let this failure mode go
+            # unnoticed in production. print() to stderr rather than the
+            # `logging` module: this failure path must be visible in
+            # whatever plain stdout/stderr capture the deployment already
+            # has, without depending on separate logging configuration.
+            notified = _notify_safe(_build_failure_notification_text(error))
+            if not notified:
+                print(
+                    "WARNING: Telegram failure notification could not be confirmed "
+                    "sent (check TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID and network "
+                    "reachability). The original error causing this run to fail "
+                    f"follows: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+            raise
+
+        print(json.dumps(result["decision"], indent=2, sort_keys=True, default=str))
+        print()
+        print(f"Decision log written to: {result['log_path'].resolve()}")
+        print(f"Position state updated at: {arguments.state_path.resolve()}")
+
+        _notify_safe(_build_daily_notification_text(result["decision"]))
 
 
 if __name__ == "__main__":

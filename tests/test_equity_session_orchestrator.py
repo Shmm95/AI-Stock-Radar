@@ -22,6 +22,7 @@ docstrings below.
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ import pytest
 
 import scripts.run_control_arm_decision as carm
 import scripts.run_daily_decision as rdd
+import src.live.broker_reconciliation as broker_reconciliation
 import src.live.equity_session_detection as detection
 import src.live.equity_session_orchestrator as orchestrator
 import src.live.session_replay_journal as session_journal
@@ -38,6 +40,17 @@ import src.live.single_instance_lock as single_instance_lock_module
 from src.backtest.portfolio_backtest_engine import _MutablePosition, _PendingOrder
 from src.backtest.portfolio_backtest_models import PortfolioSignal
 from src.live import position_state as ps
+
+# Captured at MODULE IMPORT time, before any test's autouse fixture ever
+# runs -- this file's own `_isolate_everything` fixture monkeypatches
+# `broker_reconciliation.reconcile` to a no-op fake for every test
+# (since `orchestrator.broker_reconciliation` and `rdd.broker_reconciliation`
+# are THE SAME module object, that fake would otherwise also silently
+# neuter the REAL run_daily_decision()'s own internal reconcile() call).
+# `test_real_run_daily_decision_alone_does_not_persist_session_cursor`
+# restores this real reference for its own duration, since it
+# specifically needs the GENUINE function to exercise the real call path.
+_REAL_RECONCILE = broker_reconciliation.reconcile
 
 
 # --- shared fixtures / helpers ---------------------------------------------
@@ -62,11 +75,21 @@ def _isolate_everything(tmp_path, monkeypatch):
 
 
 class _FakeClient:
-    def __init__(self, suffix: str = "TEST") -> None:
+    def __init__(self, suffix: str = "TEST", *, is_open: bool = False) -> None:
         self._suffix = suffix
+        self._is_open = is_open
 
     def get_account(self):
         return SimpleNamespace(account_number=f"PA3HONFD{self._suffix}")
+
+    def get_clock(self):
+        # `is_open=False` by default -- most tests target the section-B
+        # eligible-replay path, which requires the broker's real clock
+        # to confirm the next execution window has NOT passed
+        # (independent-audit-round-3 finding #1). Tests that specifically
+        # exercise `NextExecutionWindowAlreadyPassedError` construct
+        # `_FakeClient(is_open=True)` instead.
+        return SimpleNamespace(is_open=self._is_open, timestamp=datetime.now(timezone.utc))
 
 
 def _paths(tmp_path):
@@ -156,7 +179,7 @@ def test_terminal_journal_entry_does_not_block_a_new_attempt(tmp_path, monkeypat
     )
     intent = session_journal.transition_session_intent(intent, session_journal.VERIFIED)
     intent = session_journal.transition_session_intent(intent, session_journal.COMMITTED)
-    session_journal.transition_session_intent(intent, session_journal.TERMINAL)
+    session_journal.transition_session_intent(intent, session_journal.TERMINAL, outcome=session_journal.SUCCEEDED)
     monkeypatch.setattr(
         orchestrator.detection, "detect_missing_equity_sessions",
         lambda *a, **k: _detection_result(expected_sessions=[]),
@@ -266,6 +289,8 @@ def test_missed_window_handled_when_newer_session_already_settled(tmp_path, monk
     never attempt a replay."""
     paths = _paths(tmp_path)
     state = _save_runner_state(paths, last_processed_equity_session_date="2026-08-18")
+    # Queued FROM 2026-08-18 (last_processed_session_before) -- due to
+    # fill at the very next Open, which is the missed 2026-08-19 session.
     state.pending_buys["AAPL"] = _PendingOrder(
         signal=PortfolioSignal(timestamp="2026-08-18", ticker="AAPL", action="BUY", reference_price=100.0),
         submitted_portfolio_bar_index=1,
@@ -323,6 +348,9 @@ def test_eligible_single_session_replay_succeeds_end_to_end(tmp_path, monkeypatc
     assert result.outcome == "REPLAYED_ONE_SESSION"
     assert result.replayed_session_date == "2026-08-20"
     assert result.provenance_log_path.is_file()
+    provenance = json.loads(result.provenance_log_path.read_text(encoding="utf-8"))
+    assert provenance["processing_mode"] == "DELAYED_SESSION"
+    assert provenance["outcome"] == "REPLAYED_ONE_SESSION"
 
     reloaded = ps.load_position_state(paths["state_path"], guard_path=paths["guard_path"])
     assert reloaded.last_processed_equity_session_date == "2026-08-20"
@@ -330,10 +358,11 @@ def test_eligible_single_session_replay_succeeds_end_to_end(tmp_path, monkeypatc
     intents = session_journal.list_session_intents()
     assert len(intents) == 1
     assert intents[0].status == session_journal.TERMINAL
+    assert intents[0].outcome == session_journal.SUCCEEDED
     assert intents[0].session_date == "2026-08-20"
 
 
-def test_replay_is_idempotent_for_an_already_terminal_session(tmp_path, monkeypatch):
+def test_replay_is_idempotent_for_an_already_succeeded_session(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
     detection_result = _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={})
@@ -347,7 +376,7 @@ def test_replay_is_idempotent_for_an_already_terminal_session(tmp_path, monkeypa
     )
     intent = session_journal.transition_session_intent(intent, session_journal.VERIFIED)
     intent = session_journal.transition_session_intent(intent, session_journal.COMMITTED)
-    session_journal.transition_session_intent(intent, session_journal.TERMINAL)
+    session_journal.transition_session_intent(intent, session_journal.TERMINAL, outcome=session_journal.SUCCEEDED)
 
     called = []
     monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
@@ -357,7 +386,32 @@ def test_replay_is_idempotent_for_an_already_terminal_session(tmp_path, monkeypa
     assert called == []
 
 
-def test_outcome_mismatch_raises_and_closes_journal_terminal_with_error(tmp_path, monkeypatch):
+def test_replay_of_a_previously_failed_session_raises_prior_attempt_failed(tmp_path, monkeypatch):
+    """independent-audit-round-3 finding #3b: the real bug this closes
+    -- a FAILED terminal record for the exact same session_id must
+    never be silently treated as done (or silently retried)."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    detection_result = _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={})
+    monkeypatch.setattr(orchestrator.detection, "detect_missing_equity_sessions", lambda *a, **k: detection_result)
+
+    bar_hash = orchestrator._bar_set_sha256({}, "2026-08-20")
+    session_id = session_journal.build_session_id("2026-08-20", bar_hash)
+    intent = session_journal.create_session_intent(
+        session_id=session_id, session_date="2026-08-20", bar_set_sha256=bar_hash,
+        replay_sequence_index=1, replay_sequence_total=1,
+    )
+    session_journal.transition_session_intent(intent, session_journal.TERMINAL, last_error="boom", outcome=session_journal.FAILED)
+
+    called = []
+    monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
+
+    with pytest.raises(orchestrator.PriorReplayAttemptFailedError):
+        _run(paths)
+    assert called == []
+
+
+def test_outcome_mismatch_raises_and_closes_journal_terminal_failed(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
     monkeypatch.setattr(
@@ -375,6 +429,7 @@ def test_outcome_mismatch_raises_and_closes_journal_terminal_with_error(tmp_path
     intents = session_journal.list_session_intents()
     assert len(intents) == 1
     assert intents[0].status == session_journal.TERMINAL
+    assert intents[0].outcome == session_journal.FAILED
     assert intents[0].last_error is not None
 
     # The cursor must NOT have been advanced on a mismatched outcome.
@@ -382,7 +437,7 @@ def test_outcome_mismatch_raises_and_closes_journal_terminal_with_error(tmp_path
     assert reloaded.last_processed_equity_session_date == "2026-08-19"
 
 
-def test_run_daily_decision_exception_closes_journal_terminal_and_reraises(tmp_path, monkeypatch):
+def test_run_daily_decision_exception_closes_journal_terminal_failed_and_reraises(tmp_path, monkeypatch):
     paths = _paths(tmp_path)
     _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
     monkeypatch.setattr(
@@ -401,29 +456,63 @@ def test_run_daily_decision_exception_closes_journal_terminal_and_reraises(tmp_p
     intents = session_journal.list_session_intents()
     assert len(intents) == 1
     assert intents[0].status == session_journal.TERMINAL
+    assert intents[0].outcome == session_journal.FAILED
     assert "network exploded" in intents[0].last_error
 
 
-# --- explicitly requested scenario 11: session-cursor persistence proof ----
+# --- independent audit round 3, finding #1: real next-open + stale-pending guards
 
 
-def test_session_cursor_persists_after_orchestrator_run_without_control_arm_wrapper(tmp_path, monkeypatch):
-    """Direct, explicit proof (owner-requested, separate from the design's
-    own scenario matrix) that `last_processed_equity_date`/
-    `last_processed_crypto_date`/`last_processed_equity_session_date`/
-    `last_processed_equity_bar_timestamp` genuinely persist to disk after
-    `run_missing_session_replay()` runs -- WITH NO involvement of
-    `run_control_arm_decision.py`'s own `_stamp_last_processed_dates`
-    (never imported or called anywhere in this test). This is the exact
-    root-cause bug this whole module exists to fix for the real LIVE
-    path: `run_daily_decision()`'s own internal save never populates
-    these fields (confirmed by direct inspection of its final
-    `LiveRunnerState(...)` construction), so before this module existed,
-    nothing ever durably recorded them for a real live run."""
-    assert "run_control_arm_decision" not in dir()  # sanity: this test never imports carm's stamping helper
-
+def test_next_execution_window_already_passed_blocks_replay(tmp_path, monkeypatch):
+    """The auditor's exact scenario: a session looks like the single
+    settled one, but the broker's own real clock says the market is
+    CURRENTLY open -- meaning today's own Open already passed too."""
     paths = _paths(tmp_path)
     _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
+    )
+    called = []
+    monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
+
+    with pytest.raises(orchestrator.NextExecutionWindowAlreadyPassedError):
+        _run(paths, trading_client=_FakeClient(is_open=True))
+    assert called == []
+
+
+def test_stale_pending_order_blocks_replay(tmp_path, monkeypatch):
+    """independent-audit-round-3 finding #1's second half: a pending
+    order queued from a date OTHER than the expected prior session must
+    block replay -- filling it now would price it against the wrong
+    session's real Open."""
+    paths = _paths(tmp_path)
+    state = _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    state.pending_buys["AAPL"] = _PendingOrder(
+        signal=PortfolioSignal(timestamp="2026-08-15", ticker="AAPL", action="BUY", reference_price=100.0),
+        submitted_portfolio_bar_index=1,
+    )
+    ps.save_position_state(state, paths["state_path"], guard_path=paths["guard_path"])
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
+    )
+    called = []
+    monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
+
+    with pytest.raises(orchestrator.StalePendingOrderError):
+        _run(paths)
+    assert called == []
+
+
+def test_pending_order_queued_from_the_expected_prior_session_does_not_block_replay(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    state = _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    state.pending_buys["AAPL"] = _PendingOrder(
+        signal=PortfolioSignal(timestamp="2026-08-19", ticker="AAPL", action="BUY", reference_price=100.0),
+        submitted_portfolio_bar_index=1,
+    )
+    ps.save_position_state(state, paths["state_path"], guard_path=paths["guard_path"])
     monkeypatch.setattr(
         orchestrator.detection, "detect_missing_equity_sessions",
         lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
@@ -432,8 +521,224 @@ def test_session_cursor_persists_after_orchestrator_run_without_control_arm_wrap
         orchestrator.rdd, "run_daily_decision",
         _fake_run_daily_decision_factory("2026-08-20", log_path=tmp_path / "decision.json"),
     )
+    result = _run(paths)
+    assert result.outcome == "REPLAYED_ONE_SESSION"
+
+
+# --- independent audit round 3, finding #3a/#3c: post-hoc data-drift check
+
+
+def _bars_frame(dates_and_values: dict[str, float]):
+    import pandas as pd
+
+    index = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in dates_and_values])
+    values = list(dates_and_values.values())
+    return pd.DataFrame(
+        {"Open": values, "High": values, "Low": values, "Close": values, "Volume": [100] * len(values)},
+        index=index,
+    )
+
+
+def test_post_replay_data_drift_raises_and_closes_journal_failed(tmp_path, monkeypatch):
+    """If the target session's real bar data changed between detection
+    and the moment run_daily_decision() finishes, the replay's own
+    outcome cannot be trusted -- must fail closed, not silently commit
+    a cursor advance against data that no longer matches what was
+    verified eligible."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    original_bars = {"AAPL": _bars_frame({"2026-08-20": 100.0})}
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker=original_bars),
+    )
+    monkeypatch.setattr(
+        orchestrator.rdd, "run_daily_decision",
+        _fake_run_daily_decision_factory("2026-08-20", log_path=tmp_path / "decision.json"),
+    )
+    # Post-hoc refetch returns DIFFERENT data (e.g. a late correction).
+    monkeypatch.setattr(
+        orchestrator.detection, "fetch_raw_ticker_bars_for_range",
+        lambda ticker, *, start, end: _bars_frame({"2026-08-20": 999.0}),
+    )
+
+    with pytest.raises(orchestrator.PostReplayDataDriftError):
+        _run(paths)
+
+    intents = session_journal.list_session_intents()
+    assert len(intents) == 1
+    assert intents[0].status == session_journal.TERMINAL
+    assert intents[0].outcome == session_journal.FAILED
+
+
+def test_post_replay_hash_matches_when_data_is_unchanged(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    stable_bars = {"AAPL": _bars_frame({"2026-08-20": 100.0})}
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker=stable_bars),
+    )
+    monkeypatch.setattr(
+        orchestrator.rdd, "run_daily_decision",
+        _fake_run_daily_decision_factory("2026-08-20", log_path=tmp_path / "decision.json"),
+    )
+    monkeypatch.setattr(
+        orchestrator.detection, "fetch_raw_ticker_bars_for_range",
+        lambda ticker, *, start, end: _bars_frame({"2026-08-20": 100.0}),
+    )
 
     result = _run(paths)
+    assert result.outcome == "REPLAYED_ONE_SESSION"
+
+
+# --- independent audit round 3, finding #4: reconciliation order-mode flags
+
+
+def test_preflight_reconciliation_treats_live_positions_as_order_backed(tmp_path, monkeypatch):
+    """independent-audit-round-3 finding #4: the orchestrator's own
+    preflight reconcile() call must pass equity_orders_enabled=True/
+    crypto_orders_enabled=True -- every LIVE position genuinely was
+    opened via a real broker order (unlike the control arm's simulated-
+    only positions), so Scenario B must apply to it strictly. Passing
+    False here would have silently suppressed MissingBrokerPositionError
+    for a real live position missing at the broker."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    captured = {}
+
+    def _capture_reconcile(client, runner_state, *, expected_account_suffix, equity_orders_enabled, crypto_orders_enabled):
+        captured["equity_orders_enabled"] = equity_orders_enabled
+        captured["crypto_orders_enabled"] = crypto_orders_enabled
+
+    monkeypatch.setattr(orchestrator.broker_reconciliation, "reconcile", _capture_reconcile)
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=[]),
+    )
+    _run(paths)
+    assert captured == {"equity_orders_enabled": True, "crypto_orders_enabled": True}
+
+
+# --- scenario 11 / independent-audit-round-3 finding #2: session-cursor
+# persistence proof -- REAL run_daily_decision(), not a fake stand-in ---
+
+
+def _integration_frame(*dates: str):
+    """Shape `_bars_today_by_asset_class`/the frozen engine's own steps
+    actually read -- EMA20 < EMA50 guarantees no new entry opens, same
+    trick `test_daily_decision_bars_today.py`'s own harness uses, so
+    these tests are only about session-cursor persistence, not
+    entry/exit decision logic."""
+    import pandas as pd
+
+    index = pd.DatetimeIndex([pd.Timestamp(d) for d in dates])
+    n = len(dates)
+    return pd.DataFrame(
+        {
+            "Open": [100.0] * n, "High": [101.0] * n, "Low": [99.0] * n, "Close": [100.0] * n,
+            "EMA20": [95.0] * n, "EMA50": [100.0] * n, "RSI14": [50.0] * n, "RegimeAllowed": [True] * n,
+        },
+        index=index,
+    )
+
+
+class _IntegrationFakeClient:
+    """Satisfies broker_reconciliation.reconcile()'s real calls against
+    an empty local state, PLUS get_clock() (independent-audit-round-3
+    finding #1's eligibility check) -- everything the REAL
+    run_daily_decision() + orchestrator preflight actually touch when
+    orders are disabled and reconciliation is skip-able."""
+
+    def __init__(self, *, is_open: bool = False) -> None:
+        self._is_open = is_open
+
+    def get_account(self):
+        return SimpleNamespace(account_number="PA3HONFDTEST")
+
+    def get_orders(self, *args, **kwargs):
+        return []
+
+    def get_all_positions(self):
+        return []
+
+    def get_clock(self):
+        return SimpleNamespace(is_open=self._is_open, timestamp=datetime.now(timezone.utc))
+
+
+def test_real_run_daily_decision_alone_does_not_persist_session_cursor(tmp_path, monkeypatch):
+    """independent-audit-round-3 finding #2 [P0]: the weaker, earlier
+    version of this test file only proved "the orchestrator's own
+    second-save mechanism works" against a FAKE run_daily_decision()
+    that never saved state at all -- it never actually re-confirmed the
+    claimed ROOT CAUSE ("a normal run of the REAL run_daily_decision()
+    still loses the session-cursor fields") using the genuine function.
+    This test closes that gap directly: calls the REAL
+    `rdd.run_daily_decision()` (only `prepare_live_market_data`/
+    `get_live_cash_balance` are faked -- pure I/O boundaries, not the
+    function under test), starting from a state file that already HAS
+    a session cursor set, and confirms it comes back `None` afterward."""
+    state_path = tmp_path / "position_state.json"
+    guard_path = tmp_path / "high_water_mark.json"
+    state = ps.LiveRunnerState()
+    state.last_processed_equity_session_date = "2026-08-06"
+    state.last_processed_equity_date = "2026-08-06"
+    state.last_processed_crypto_date = "2026-08-06"
+    state.last_processed_equity_bar_timestamp = "2026-08-06"
+    ps.save_position_state(state, state_path, guard_path=guard_path)
+
+    prepared = {
+        **{t: _integration_frame("2026-08-06", "2026-08-07") for t in ("AAPL", "MSFT")},
+        **{t: _integration_frame("2026-08-06", "2026-08-07") for t in ("BTC-USD", "ETH-USD")},
+    }
+    monkeypatch.setattr(rdd, "prepare_live_market_data", lambda tickers: prepared)
+    monkeypatch.setattr(rdd, "get_live_cash_balance", lambda client=None: 100_000.0)
+    # Restore the REAL reconcile() for this test only -- see the
+    # `_REAL_RECONCILE` module-level comment for why the autouse fixture's
+    # fake would otherwise also apply here.
+    monkeypatch.setattr(rdd.broker_reconciliation, "reconcile", _REAL_RECONCILE)
+
+    rdd.run_daily_decision(
+        state_path=state_path,
+        decision_log_directory=tmp_path / "decisions",
+        guard_path=guard_path,
+        trading_client=_IntegrationFakeClient(),
+    )
+
+    reloaded = ps.load_position_state(state_path, guard_path=guard_path)
+    assert reloaded.last_processed_equity_session_date is None
+    assert reloaded.last_processed_equity_date is None
+    assert reloaded.last_processed_crypto_date is None
+    assert reloaded.last_processed_equity_bar_timestamp is None
+
+
+def test_orchestrator_with_real_run_daily_decision_persists_session_cursor_end_to_end(tmp_path, monkeypatch):
+    """The other half of finding #2: the REAL fix, proven with the
+    GENUINE `run_daily_decision()` running inside the orchestrator's own
+    replay transaction -- not a fake stand-in for it.
+    `detect_missing_equity_sessions` is still monkeypatched (detection's
+    own internals are covered separately in
+    `test_equity_session_detection.py`); everything from "this session
+    is eligible" onward -- the actual `rdd.run_daily_decision()` call,
+    its real internal save, and this module's own second save -- is
+    genuine. `run_control_arm_decision.py` is never imported or called
+    anywhere in this test."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+
+    prepared = {
+        **{t: _integration_frame("2026-08-19", "2026-08-20") for t in ("AAPL", "MSFT")},
+        **{t: _integration_frame("2026-08-19", "2026-08-20") for t in ("BTC-USD", "ETH-USD")},
+    }
+    monkeypatch.setattr(rdd, "prepare_live_market_data", lambda tickers: prepared)
+    monkeypatch.setattr(rdd, "get_live_cash_balance", lambda client=None: 100_000.0)
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
+    )
+
+    result = _run(paths, trading_client=_IntegrationFakeClient())
+
     assert result.outcome == "REPLAYED_ONE_SESSION"
 
     reloaded = ps.load_position_state(paths["state_path"], guard_path=paths["guard_path"])
