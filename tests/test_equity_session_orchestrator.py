@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,21 +75,38 @@ def _isolate_everything(tmp_path, monkeypatch):
 
 
 class _FakeClient:
-    def __init__(self, suffix: str = "TEST", *, is_open: bool = False) -> None:
+    def __init__(self, suffix: str = "TEST", *, next_open_already_passed: bool = False) -> None:
         self._suffix = suffix
-        self._is_open = is_open
+        self._next_open_already_passed = next_open_already_passed
 
     def get_account(self):
         return SimpleNamespace(account_number=f"PA3HONFD{self._suffix}")
 
     def get_clock(self):
-        # `is_open=False` by default -- most tests target the section-B
-        # eligible-replay path, which requires the broker's real clock
-        # to confirm the next execution window has NOT passed
-        # (independent-audit-round-3 finding #1). Tests that specifically
-        # exercise `NextExecutionWindowAlreadyPassedError` construct
-        # `_FakeClient(is_open=True)` instead.
-        return SimpleNamespace(is_open=self._is_open, timestamp=datetime.now(timezone.utc))
+        # `is_open` is always False here -- independent-audit-round-3
+        # finding #1 (refined) no longer checks it at all; eligibility
+        # now compares this `timestamp` DIRECTLY against the next
+        # execution session's own real Open (see `get_calendar` below),
+        # which is the exact, precise thing that check needs, regardless
+        # of whatever `is_open` happens to report.
+        return SimpleNamespace(is_open=False, timestamp=datetime.now(timezone.utc))
+
+    def get_calendar(self, request):
+        # Controls whether the NEXT execution session's own real Open is
+        # before or after "now" -- `next_open_already_passed=True`
+        # simulates the EXACT scenario a pure `is_open` check could miss
+        # (e.g. checked hours after a real Close: is_open=False, but the
+        # target session's own Open has already passed). Default
+        # (`False`): most tests target the section-B eligible-replay
+        # path, which requires the broker's real clock to confirm the
+        # next execution window has NOT passed.
+        offset = timedelta(hours=-2) if self._next_open_already_passed else timedelta(hours=2)
+        open_utc = datetime.now(timezone.utc) + offset
+        naive_eastern_open = open_utc.astimezone(detection._EASTERN).replace(tzinfo=None)
+        entry = SimpleNamespace(
+            date=request.start, open=naive_eastern_open, close=naive_eastern_open + timedelta(hours=6, minutes=30),
+        )
+        return [entry]
 
 
 def _paths(tmp_path):
@@ -464,7 +481,7 @@ def test_run_daily_decision_exception_closes_journal_terminal_failed_and_reraise
 
 
 def test_next_execution_window_already_passed_blocks_replay(tmp_path, monkeypatch):
-    """The auditor's exact scenario: a session looks like the single
+    """The auditor's original scenario: a session looks like the single
     settled one, but the broker's own real clock says the market is
     CURRENTLY open -- meaning today's own Open already passed too."""
     paths = _paths(tmp_path)
@@ -477,7 +494,33 @@ def test_next_execution_window_already_passed_blocks_replay(tmp_path, monkeypatc
     monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
 
     with pytest.raises(orchestrator.NextExecutionWindowAlreadyPassedError):
-        _run(paths, trading_client=_FakeClient(is_open=True))
+        _run(paths, trading_client=_FakeClient(next_open_already_passed=True))
+    assert called == []
+
+
+def test_next_execution_window_already_passed_even_when_market_is_currently_closed(tmp_path, monkeypatch):
+    """The refined finding (2026-08-24): `is_open=False` alone must
+    NEVER be trusted as "safe to replay" -- a target session's own real
+    Open can have already passed hours ago (e.g. checked at 22:02 UTC,
+    well after a real Close) while `is_open` still correctly reports
+    `False` the whole time. Acceptance test, verbatim from the owner's
+    own spec: clock.is_open=False + broker time after the target
+    session's own Open -> NextExecutionWindowAlreadyPassedError, and
+    run_daily_decision() must be called zero times."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
+    )
+    called = []
+    monkeypatch.setattr(orchestrator.rdd, "run_daily_decision", lambda **k: called.append(1))
+
+    client = _FakeClient(next_open_already_passed=True)
+    assert client.get_clock().is_open is False  # the exact combination the old is_open-only check would have missed
+
+    with pytest.raises(orchestrator.NextExecutionWindowAlreadyPassedError):
+        _run(paths, trading_client=client)
     assert called == []
 
 
@@ -650,8 +693,8 @@ class _IntegrationFakeClient:
     run_daily_decision() + orchestrator preflight actually touch when
     orders are disabled and reconciliation is skip-able."""
 
-    def __init__(self, *, is_open: bool = False) -> None:
-        self._is_open = is_open
+    def __init__(self, *, next_open_already_passed: bool = False) -> None:
+        self._next_open_already_passed = next_open_already_passed
 
     def get_account(self):
         return SimpleNamespace(account_number="PA3HONFDTEST")
@@ -663,7 +706,16 @@ class _IntegrationFakeClient:
         return []
 
     def get_clock(self):
-        return SimpleNamespace(is_open=self._is_open, timestamp=datetime.now(timezone.utc))
+        return SimpleNamespace(is_open=False, timestamp=datetime.now(timezone.utc))
+
+    def get_calendar(self, request):
+        offset = timedelta(hours=-2) if self._next_open_already_passed else timedelta(hours=2)
+        open_utc = datetime.now(timezone.utc) + offset
+        naive_eastern_open = open_utc.astimezone(detection._EASTERN).replace(tzinfo=None)
+        entry = SimpleNamespace(
+            date=request.start, open=naive_eastern_open, close=naive_eastern_open + timedelta(hours=6, minutes=30),
+        )
+        return [entry]
 
 
 def test_real_run_daily_decision_alone_does_not_persist_session_cursor(tmp_path, monkeypatch):

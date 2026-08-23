@@ -61,9 +61,17 @@ addition to the module docstring updates above:
    own market session might ALREADY be open (e.g. a gap missed Monday,
    orchestrator invoked Tuesday mid-session -- Monday looks like the
    single settled session, but Tuesday's own Open has already passed
-   too). Fixed with a REAL broker-clock check
-   (`trading_client.get_clock().is_open`) immediately before replay --
-   see `NextExecutionWindowAlreadyPassedError`. A second, related gap:
+   too). Fixed with a REAL broker-clock check -- see
+   `NextExecutionWindowAlreadyPassedError`. REFINED 2026-08-24: the
+   first fix compared against `trading_client.get_clock().is_open`,
+   which is an imprecise proxy -- `is_open` is `False` both before a
+   session's Open (safe) and after its Close (already past, e.g.
+   checked at 22:02 UTC, hours after a real Close), and cannot
+   distinguish the two. `_next_execution_window_open_utc` now fetches
+   the real calendar entry for the next execution session and compares
+   the broker's own clock DIRECTLY against that session's real Open
+   timestamp -- correct even when `is_open=False` but the target
+   session's own Open has already passed. A second, related gap:
    nothing verified that `pending_buys`/`pending_exits` were actually
    queued FROM the session immediately preceding the replay target
    before trusting them -- see `_verify_pending_orders_are_fresh_for_replay`/
@@ -132,11 +140,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import GetCalendarRequest
 
 import scripts.run_daily_decision as rdd
 import src.live.broker_reconciliation as broker_reconciliation
@@ -272,6 +281,36 @@ def _bar_set_sha256(raw_bars_by_ticker: dict[str, Any], session_date: str) -> st
             row = frame.loc[[ts for ts in frame.index if ts.date().isoformat() == session_date][0]]
             parts.append(f"{ticker}:{row['Open']}:{row['High']}:{row['Low']}:{row['Close']}:{row['Volume']}")
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _next_execution_window_open_utc(trading_client: TradingClient, *, after_date_iso: str) -> tuple[str, datetime]:
+    """The real calendar entry for the very next session strictly after
+    `after_date_iso` (`latest_expected`, the session about to be
+    replayed) -- its real Open time is "the next execution window" this
+    module's own P0 eligibility check must confirm has not yet passed.
+    Same 14-day search pad `pending_signal_ttl.next_equity_session_date`
+    already established for this exact "find the next real session"
+    pattern; same Eastern-tz-then-UTC conversion
+    `equity_session_detection.py` already established (reused directly,
+    `detection._EASTERN`, never redefined here).
+
+    Returns `(session_date_iso, open_utc)`. Raises
+    `SessionReplayFailClosedError` if the calendar returns nothing in
+    that window -- a real production calendar always has a next session
+    within 14 days; an empty response here means something is deeply
+    wrong with the calendar fetch itself, never silently treated as
+    "no window to worry about"."""
+    start = date.fromisoformat(after_date_iso) + timedelta(days=1)
+    end = start + timedelta(days=14)
+    calendar = trading_client.get_calendar(GetCalendarRequest(start=start, end=end))
+    if not calendar:
+        raise SessionReplayFailClosedError(
+            f"No real equity session found in the 14 days after {after_date_iso} -- cannot verify "
+            f"whether the next execution window has passed. Fail-closed."
+        )
+    entry = calendar[0]
+    open_utc = entry.open.replace(tzinfo=detection._EASTERN).astimezone(timezone.utc)
+    return entry.date.isoformat(), open_utc
 
 
 def _verify_pending_orders_are_fresh_for_replay(runner_state: Any, *, last_processed_session_before: str) -> None:
@@ -574,17 +613,29 @@ def run_missing_session_replay(
                     f"recovery tool."
                 )
 
-            # Independent audit round 3, finding #1: "settled" alone
-            # does not prove the NEXT execution window hasn't ALSO
-            # passed -- ask the broker's own real-time clock directly,
-            # rather than inferring it from settle-buffer timing.
-            clock = trading_client.get_clock()
-            if clock.is_open:
+            # Independent audit round 3, finding #1 (refined 2026-08-24):
+            # "settled" alone does not prove the NEXT execution window
+            # hasn't ALSO passed. The first fix used `clock.is_open` as a
+            # proxy -- but `is_open` only answers "is a session ACTIVELY
+            # open right now," not "has this SPECIFIC target session's
+            # own Open already occurred" -- these are the same thing only
+            # while a session is genuinely in progress; `is_open` is
+            # `False` both BEFORE a session's Open (safe) AND AFTER its
+            # Close (also already past -- e.g. checked at 22:02 UTC,
+            # hours after a real Close), and `is_open` alone cannot tell
+            # those two apart. Replaced with a direct comparison: the
+            # broker's own authoritative clock against the real Open
+            # timestamp of the next execution session.
+            next_session_date, next_session_open_utc = _next_execution_window_open_utc(
+                trading_client, after_date_iso=latest_expected,
+            )
+            broker_now = trading_client.get_clock().timestamp
+            if broker_now > next_session_open_utc:
                 raise NextExecutionWindowAlreadyPassedError(
                     f"Refusing to auto-replay {latest_expected} -- the broker's real clock "
-                    f"reports the market is CURRENTLY OPEN (as_of {clock.timestamp}), meaning "
-                    f"today's own execution Open has already passed too, not just "
-                    f"{latest_expected}'s. Fail-closed; see module docstring finding #1."
+                    f"({broker_now.isoformat()}) is already past the next execution session's "
+                    f"({next_session_date}) own real Open ({next_session_open_utc.isoformat()}). "
+                    f"Fail-closed; see module docstring finding #1."
                 )
 
             _verify_pending_orders_are_fresh_for_replay(
