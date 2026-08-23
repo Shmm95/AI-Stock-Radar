@@ -94,6 +94,7 @@ def test_entry_buy_fills_and_places_stop(monkeypatch: pytest.MonkeyPatch):
         equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()},
         closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -124,6 +125,7 @@ def test_rerun_for_same_bar_never_resubmits(monkeypatch: pytest.MonkeyPatch):
     runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
     assert calls["submit"] == 1
 
@@ -131,6 +133,7 @@ def test_rerun_for_same_bar_never_resubmits(monkeypatch: pytest.MonkeyPatch):
     actions, _ = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert calls["submit"] == 1, "must not submit a second real order for the same bar"
@@ -155,6 +158,7 @@ def test_stop_placement_deferred_when_entry_not_yet_filled(monkeypatch: pytest.M
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert "AAPL" not in state.equity_stop_orders
@@ -180,7 +184,7 @@ def test_reconciliation_places_stop_once_deferred_entry_confirms(monkeypatch: py
         order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1")
     )
 
-    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state)
+    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state, authorization=runner.authorize_order_execution())
 
     assert review == []
     assert state.equity_stop_orders["AAPL"] == "stop-1"
@@ -200,7 +204,7 @@ def test_reconciliation_flags_rejected_entry(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(order_submission, "get_order_status", lambda *a, **k: "rejected")
 
-    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state)
+    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state, authorization=runner.authorize_order_execution())
 
     assert len(review) == 1
     assert review[0]["ticker"] == "AAPL"
@@ -227,6 +231,7 @@ def test_signal_exit_cancels_stop_before_selling_and_confirms_cancellation(
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -252,6 +257,7 @@ def test_signal_exit_never_sells_if_cancel_confirmation_fails(monkeypatch: pytes
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert not any(a["action"] == "SELL" for a in actions)
@@ -277,6 +283,7 @@ def test_signal_exit_skips_sell_when_stop_already_filled_first(monkeypatch: pyte
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert not any(a["action"] == "SELL" for a in actions)
@@ -322,6 +329,7 @@ def test_real_held_for_orders_rejection_scenario_is_prevented_by_correct_orderin
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert stop_state["canceled"] is True
@@ -341,6 +349,7 @@ def test_stop_loss_exit_never_submits_a_second_sell(monkeypatch: pytest.MonkeyPa
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="STOP_LOSS")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -361,6 +370,7 @@ def test_stop_loss_exit_flags_review_when_broker_stop_not_yet_filled(
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="GAP_STOP_LOSS")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert state.equity_stop_orders["AAPL"] == "stop-1"
@@ -396,6 +406,7 @@ def test_entry_buy_finds_existing_order_by_client_order_id_and_never_resubmits(
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -425,6 +436,7 @@ def test_signal_exit_finds_existing_order_by_client_order_id_and_never_resubmits
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-15",
         newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -465,7 +477,7 @@ def test_reconciliation_stop_finds_existing_order_by_client_order_id_and_never_r
         lambda client, client_order_id: ExistingStopOrder(),
     )
 
-    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state)
+    review = runner._reconcile_pending_equity_orders(client=None, runner_state=state, authorization=runner.authorize_order_execution())
 
     assert review == []
     assert state.equity_stop_orders["AAPL"] == "already-submitted-stop-1"
@@ -488,6 +500,7 @@ def test_crypto_positions_never_reach_order_submission(monkeypatch: pytest.Monke
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"BTC-USD": crypto_position}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []
@@ -525,6 +538,7 @@ def test_entry_buy_uses_client_order_id_for_action(monkeypatch: pytest.MonkeyPat
     runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-18",
         newly_opened={"CEG": equity_position(ticker="CEG")}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     expected = runner.client_order_id_for_action("CEG", "ENTRY_MARKET_BUY", "2026-08-18")
@@ -571,6 +585,7 @@ def test_order_intent_hook_fires_submitting_before_and_acknowledged_after(monkey
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
         order_intent_hook=hook,
+        authorization=runner.authorize_order_execution(),
     )
 
     entry_events = [e for e in hook_events if e[2] == "ENTRY_MARKET_BUY"]
@@ -591,6 +606,7 @@ def test_order_intent_hook_is_none_by_default_zero_behavior_change(monkeypatch: 
     actions, review = runner._execute_equity_orders(
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
     assert review == []
     assert state.submitted_actions["AAPL|ENTRY_MARKET_BUY|2026-08-14"]["status"] == "filled"
@@ -625,6 +641,7 @@ def test_order_intent_hook_fires_even_when_order_already_existed(monkeypatch: py
         client=None, runner_state=state, equity_date="2026-08-14",
         newly_opened={"AAPL": equity_position()}, closed_trades=[],
         order_intent_hook=hook,
+        authorization=runner.authorize_order_execution(),
     )
 
     assert hook_phases == ["SUBMITTING", "BROKER_ACKNOWLEDGED"]

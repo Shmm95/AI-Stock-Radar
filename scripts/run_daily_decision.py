@@ -188,6 +188,11 @@ from src.backtest.portfolio_backtest_engine import (
 from src.backtest.portfolio_backtest_models import PortfolioBacktestConfig, PortfolioTrade
 import src.live.broker_reconciliation as broker_reconciliation
 from src.live import order_submission
+from src.live.authorized_execution_context import (
+    AuthorizedExecutionContext,
+    authorize_order_execution,
+    require_authorized_execution_context,
+)
 from src.live.account_state import get_live_cash_balance
 from src.live.crypto_stop_monitor import DEFAULT_LOCK_PATH, _query_available_crypto_quantity
 from src.live.data_preparer import prepare_live_market_data
@@ -391,6 +396,7 @@ def _resolve_or_submit_order(
     order_intent_hook: OrderIntentHook | None = None,
     ticker: str = "",
     action_kind: str = "",
+    authorization: AuthorizedExecutionContext | None = None,
 ) -> tuple[Order, bool]:
     """The actual fix: check the broker BEFORE calling `submit`, via
     `order_submission.get_order_by_client_order_id` (a plain,
@@ -408,7 +414,19 @@ def _resolve_or_submit_order(
     order already existed or was freshly submitted -- both are a real,
     confirmed broker response, and either way this function's own crash
     window (the one this hook exists to narrow) has closed by the time
-    either return path is reached."""
+    either return path is reached.
+
+    `authorization` -- independent audit finding "Madde E" (2026-08-22):
+    this is EVERY real order's shared choke point (entry BUY, protective
+    stop, equity signal-exit SELL, crypto entry BUY all funnel through
+    here), so this is where the second, inner-function-level
+    authorization check lives -- a caller that reaches this function
+    directly, bypassing `run_daily_decision()`'s own top-level check, is
+    still refused here, before any broker call. See
+    `src.live.authorized_execution_context`'s own module docstring for
+    the full design and why this is scoped to the bare-call bypass, not
+    to `run_daily_decision.py`'s own `main()`."""
+    require_authorized_execution_context(authorization, action_description=f"Submitting order ({action_kind} {ticker})")
     _call_order_intent_hook(
         order_intent_hook, "SUBMITTING", ticker=ticker, action_kind=action_kind, client_order_id=client_order_id
     )
@@ -568,7 +586,11 @@ def _require_live_account_suffix() -> str:
 
 
 def _reconcile_pending_equity_orders(
-    client: TradingClient, runner_state: LiveRunnerState, *, order_intent_hook: OrderIntentHook | None = None
+    client: TradingClient,
+    runner_state: LiveRunnerState,
+    *,
+    order_intent_hook: OrderIntentHook | None = None,
+    authorization: AuthorizedExecutionContext | None = None,
 ) -> list[dict]:
     """Catch up on entry orders submitted, but not confirmed, on a previous run.
 
@@ -615,6 +637,7 @@ def _reconcile_pending_equity_orders(
                         order_intent_hook=order_intent_hook,
                         ticker=ticker,
                         action_kind="PROTECTIVE_STOP",
+                        authorization=authorization,
                     )
                     stop_record = {
                         "order_id": str(stop_order.id),
@@ -645,6 +668,7 @@ def _execute_equity_orders(
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
     order_intent_hook: OrderIntentHook | None = None,
+    authorization: AuthorizedExecutionContext | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Submit real equity orders for today's decisions. Never called for crypto.
 
@@ -678,6 +702,7 @@ def _execute_equity_orders(
                 order_intent_hook=order_intent_hook,
                 ticker=ticker,
                 action_kind="ENTRY_MARKET_BUY",
+                authorization=authorization,
             )
             status = (
                 _order_status_str(order) if already_existed
@@ -717,6 +742,7 @@ def _execute_equity_orders(
                     order_intent_hook=order_intent_hook,
                     ticker=ticker,
                     action_kind="PROTECTIVE_STOP",
+                    authorization=authorization,
                 )
                 stop_record = {
                     "order_id": str(stop_order.id),
@@ -787,6 +813,9 @@ def _execute_equity_orders(
             cancel_key = f"{trade.ticker}|CANCEL_STOP|{equity_date}"
             cancel_record = runner_state.submitted_actions.get(cancel_key)
             if cancel_record is None:
+                require_authorized_execution_context(
+                    authorization, action_description=f"Canceling protective stop ({trade.ticker})"
+                )
                 cancel_status = order_submission.cancel_order_and_confirm(client, stop_order_id)
                 cancel_record = {
                     "order_id": stop_order_id,
@@ -852,6 +881,7 @@ def _execute_equity_orders(
                 order_intent_hook=order_intent_hook,
                 ticker=trade.ticker,
                 action_kind="SIGNAL_EXIT_MARKET_SELL",
+                authorization=authorization,
             )
             status = (
                 _order_status_str(order) if already_existed
@@ -918,6 +948,7 @@ def _execute_crypto_orders(
     newly_opened: dict[str, _MutablePosition],
     closed_trades: list[PortfolioTrade],
     order_intent_hook: OrderIntentHook | None = None,
+    authorization: AuthorizedExecutionContext | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Submit real crypto orders for today's decisions. Never called for equity.
 
@@ -988,6 +1019,7 @@ def _execute_crypto_orders(
                     order_intent_hook=order_intent_hook,
                     ticker=ticker,
                     action_kind="ENTRY_MARKET_BUY",
+                    authorization=authorization,
                 )
                 status = (
                     _order_status_str(order) if already_existed
@@ -1038,6 +1070,9 @@ def _execute_crypto_orders(
             action_key = f"{trade.ticker}|SIGNAL_EXIT_MARKET_SELL|{crypto_date}"
             record = runner_state.submitted_actions.get(action_key)
             if record is None:
+                require_authorized_execution_context(
+                    authorization, action_description=f"Submitting crypto signal-exit SELL ({trade.ticker})"
+                )
                 client_order_id = client_order_id_for_action(trade.ticker, "SIGNAL_EXIT_MARKET_SELL", crypto_date)
                 # Checked before spending a call on available_quantity --
                 # if this exact intent already happened, no quantity
@@ -1135,11 +1170,31 @@ def run_daily_decision(
     trading_client: TradingClient | None = None,
     skip_broker_reconciliation: bool = False,
     order_intent_hook: OrderIntentHook | None = None,
+    authorization: AuthorizedExecutionContext | None = None,
 ) -> dict:
     """`guard_path` overrides the rollback high-water-mark file's location;
     defaults to the real, out-of-repo path. Only override in tests -- see
     `load_position_state`'s docstring for why a tmp_path-only test must
     not touch the real, machine-wide guard file.
+
+    `authorization` -- MANDATORY whenever `enable_equity_orders`/
+    `enable_crypto_orders` is `True` (independent audit finding "Madde
+    E", 2026-08-22, "Doğrudan runner bypass'ı hâlâ açık"): checked as
+    the FIRST statement in this function's body, before any credential
+    load, broker call, or state read/write -- see
+    `src.live.authorized_execution_context`'s own module docstring for
+    the full design, and this repo's two blessed callers: this file's
+    own `main()` (self-authorizes after its STOP/FREEZE preflight -- the
+    real live cron's `--enable-equity-orders` usage is UNCHANGED by
+    this, by deliberate scope decision) and
+    `scripts/run_control_arm_decision.py`'s `_execute()` (authorizes
+    only after its full preflight chain: identity, reconciliation, TTL,
+    session, write-ahead evidence). A BARE call to this function with an
+    order-enabling flag True and no valid `authorization` -- bypassing
+    both of those -- now raises immediately, before this function does
+    anything else at all. `None` is always accepted when both order
+    flags are `False` (the dry-run path, unauthenticated by design --
+    dry-run makes no real broker call).
 
     `order_intent_hook` -- injection-seam callback (2026-08-22, independent
     audit finding #3, approach (B)), same one-directional-dependency
@@ -1196,6 +1251,14 @@ def run_daily_decision(
     `skip_broker_reconciliation=True`; every other real caller leaves
     this `False` (the unchanged, default behavior) and gets the real
     reconciliation this function's own docstring describes above."""
+    if enable_equity_orders or enable_crypto_orders:
+        # MANDATORY, fail-closed, checked FIRST -- before load_position_state,
+        # before any credential/broker/state call. See `authorization`'s
+        # own docstring above for the two blessed callers this accepts.
+        require_authorized_execution_context(
+            authorization, action_description="run_daily_decision(enable_equity_orders/enable_crypto_orders=True)"
+        )
+
     config = PortfolioBacktestConfig(
         maximum_open_positions=LIVE_MAXIMUM_OPEN_POSITIONS,
         maximum_total_open_risk_percent=LIVE_MAXIMUM_TOTAL_OPEN_RISK_PERCENT,
@@ -1235,7 +1298,9 @@ def run_daily_decision(
     needs_review: list[dict] = []
     if enable_equity_orders:
         needs_review.extend(
-            _reconcile_pending_equity_orders(trading_client, runner_state, order_intent_hook=order_intent_hook)
+            _reconcile_pending_equity_orders(
+                trading_client, runner_state, order_intent_hook=order_intent_hook, authorization=authorization
+            )
         )
 
     # Reuses the SAME already-verified trading_client reconciliation just
@@ -1313,6 +1378,7 @@ def run_daily_decision(
             newly_opened=newly_opened,
             closed_trades=state.trades,
             order_intent_hook=order_intent_hook,
+            authorization=authorization,
         )
         needs_review.extend(more_review)
 
@@ -1325,6 +1391,7 @@ def run_daily_decision(
             newly_opened=newly_opened,
             closed_trades=state.trades,
             order_intent_hook=order_intent_hook,
+            authorization=authorization,
         )
         needs_review.extend(more_review)
 
@@ -1544,6 +1611,20 @@ def main() -> None:
         print(text)
         _notify_safe(text)
 
+    # Self-authorizes AFTER the STOP/FREEZE preflight above (independent
+    # audit finding "Madde E", 2026-08-22): this CLI entrypoint is one of
+    # this codebase's two blessed callers of run_daily_decision() with a
+    # real order-enabling flag -- see run_daily_decision()'s own
+    # `authorization` docstring and src.live.authorized_execution_context's
+    # module docstring for the full design and why this is a deliberate
+    # scope decision (the live cron's real --enable-equity-orders usage
+    # is unchanged by this). Only constructed when actually needed --
+    # the dry-run path (neither flag set, every non-live-order invocation)
+    # never touches this at all.
+    authorization = (
+        authorize_order_execution() if (arguments.enable_equity_orders or arguments.enable_crypto_orders) else None
+    )
+
     try:
         result = run_daily_decision(
             state_path=arguments.state_path,
@@ -1551,6 +1632,7 @@ def main() -> None:
             enable_equity_orders=arguments.enable_equity_orders,
             enable_crypto_orders=arguments.enable_crypto_orders,
             freeze=freeze,
+            authorization=authorization,
         )
     except Exception as error:
         # Notify, then re-raise unchanged -- the notification step must

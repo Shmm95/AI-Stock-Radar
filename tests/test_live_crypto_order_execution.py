@@ -75,6 +75,7 @@ def test_entry_buy_uses_ioc_and_alpaca_symbol(stub_lock, monkeypatch: pytest.Mon
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-14",
         newly_opened={"BTC-USD": crypto_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -102,12 +103,14 @@ def test_rerun_for_same_bar_never_resubmits_entry(stub_lock, monkeypatch: pytest
     runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-14",
         newly_opened={"BTC-USD": crypto_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
     assert calls["submit"] == 1
 
     runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-14",
         newly_opened={"BTC-USD": crypto_position()}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
     assert calls["submit"] == 1, "must not submit a second real order for the same bar"
 
@@ -130,6 +133,7 @@ def test_signal_exit_sells_broker_confirmed_quantity_not_local(stub_lock, monkey
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-15",
         newly_opened={}, closed_trades=[crypto_trade(quantity=0.01)],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert review == []
@@ -154,6 +158,7 @@ def test_signal_exit_with_no_available_quantity_skips_and_flags_review(
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-15",
         newly_opened={}, closed_trades=[crypto_trade()],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert not any(a["action"] == "SELL" for a in actions)
@@ -175,6 +180,7 @@ def test_stop_loss_exit_never_submits_a_sell(stub_lock, monkeypatch: pytest.Monk
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-15",
         newly_opened={}, closed_trades=[crypto_trade(exit_reason="STOP_LOSS")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []
@@ -192,6 +198,7 @@ def test_gap_stop_loss_exit_never_submits_a_sell(stub_lock, monkeypatch: pytest.
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-15",
         newly_opened={}, closed_trades=[crypto_trade(exit_reason="GAP_STOP_LOSS")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []
@@ -214,6 +221,7 @@ def test_equity_positions_never_reach_crypto_execution(stub_lock, monkeypatch: p
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-14",
         newly_opened={"AAPL": equity_position}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []
@@ -231,6 +239,7 @@ def test_no_op_when_nothing_crypto_pending_does_not_touch_the_lock(
     state = LiveRunnerState()
     actions, review = runner._execute_crypto_orders(
         client=None, runner_state=state, crypto_date="2026-08-14", newly_opened={}, closed_trades=[],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []
@@ -252,6 +261,7 @@ def test_lock_busy_after_retries_skips_submission_and_flags_both_sides(
         client=None, runner_state=state, crypto_date="2026-08-14",
         newly_opened={"BTC-USD": crypto_position()},
         closed_trades=[crypto_trade(ticker="ETH-USD")],
+        authorization=runner.authorize_order_execution(),
     )
 
     assert actions == []

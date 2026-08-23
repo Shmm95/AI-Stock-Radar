@@ -320,6 +320,7 @@ def test_orders_enabled_combination_reconciles_and_reaches_market_data(
             guard_path=guard_path,
             trading_client=_CleanClient(),
             enable_equity_orders=True,
+            authorization=runner.authorize_order_execution(),
         )
 
 
@@ -437,6 +438,7 @@ def test_run_control_arm_decision_reuses_its_own_client_and_skips_duplicate_reco
 
     source = inspect.getsource(carm)
     call_start = source.index("result = rdd.run_daily_decision(")
-    call_text = source[call_start:call_start + 1200]
+    call_text = source[call_start:call_start + 1400]
     assert "trading_client=reconciliation_client" in call_text
     assert "skip_broker_reconciliation=True" in call_text
+    assert "authorization=authorization" in call_text

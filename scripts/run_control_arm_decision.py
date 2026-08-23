@@ -270,6 +270,7 @@ import src.live.healthchecks_ping as healthchecks_ping
 import src.live.issuer_identity_preflight as issuer_identity_preflight
 import src.live.order_intent as order_intent
 import src.live.pending_signal_ttl as pending_signal_ttl
+from src.live.authorized_execution_context import authorize_order_execution
 from src.live.control_universe import CONTROL_UNIVERSE_TICKERS
 from src.live.single_instance_lock import SingleInstanceLockError, single_instance_lock
 
@@ -1553,12 +1554,27 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     reconciliation_state, expected_session_date, arguments
                 )
 
+                # Independent audit finding "Madde E" (2026-08-22):
+                # self-authorizes ONLY here, AFTER every preflight guard
+                # above has already passed (identity, reconciliation,
+                # TTL, session, write-ahead evidence) -- see
+                # src.live.authorized_execution_context's own module
+                # docstring for the full design. Constructed only when
+                # actually needed (an order-enabling flag is set); the
+                # dry-run path never touches this.
+                authorization = (
+                    authorize_order_execution()
+                    if (arguments.enable_equity_orders or arguments.enable_crypto_orders)
+                    else None
+                )
+
                 result = rdd.run_daily_decision(
                     state_path=arguments.state_path,
                     decision_log_directory=arguments.decision_log_directory,
                     enable_equity_orders=arguments.enable_equity_orders,
                     enable_crypto_orders=arguments.enable_crypto_orders,
                     freeze=freeze,
+                    authorization=authorization,
                     # REAL BUG FOUND AND FIXED (2026-08-22, independent
                     # audit): without these two, run_daily_decision()
                     # would build its OWN fresh trading client and run a
