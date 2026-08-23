@@ -380,17 +380,33 @@ def _order_status_str(order: Order) -> str:
 # right at the moment a broker call is about to happen -- for the exact
 # ticker/action about to be attempted, not a blanket pre-run guess.
 #
-# CONTRACT (extended 2026-08-22, Task 3 -- see PROTECTIVE_STOP/
+# CONTRACT (extended 2026-08-22, Task 3; extended again 2026-08-23,
+# independent-audit-round-2 finding #3 -- see PROTECTIVE_STOP/
 # CANCEL_STOP call sites below for why): `hook(phase, *, ticker,
 # action_kind, client_order_id, order=None, operation_id=None,
 # side=None, order_type=None, quantity=None, notional=None,
-# stop_price=None, parent_order_id=None)`.
+# stop_price=None, parent_order_id=None, broker_status=None)`.
 # `phase` is `"SUBMITTING"` (called BEFORE the broker is queried/called
 # for this client_order_id/operation_id -- may fire even when the order
 # turns out to already exist, since the query itself is what
 # "SUBMITTING" durably guards against a crash during) or
 # `"BROKER_ACKNOWLEDGED"` (called AFTER that query/call resolves
 # successfully, `order` is the real `Order` when one exists).
+#
+# `broker_status` (added 2026-08-23): a plain string status to use when
+# NO `Order` object exists to derive one from -- the CANCEL_STOP call
+# site below is the one caller that needs this: Alpaca's cancel API
+# returns no `Order`, only the plain status string
+# `order_submission.cancel_order_and_confirm` already returns
+# (`cancel_status`). Before this parameter existed, that real status was
+# fetched but never threaded through to the hook, so a cancel intent's
+# own `broker_status` field landed `None` even though the real status
+# was known and already recorded elsewhere (`submitted_actions`). A
+# caller that also has a real `order` object should pass that instead
+# and leave this `None` -- see `_order_intent_hook_for_run`'s own
+# `hook()` for which one wins when both could theoretically be supplied
+# (this one does, since it is the more specific, deliberately-supplied
+# value for the callers that have no `Order` at all).
 # Never called on a raised exception -- the exception propagates uncaught
 # exactly as before this parameter existed; a SUBMITTING-with-no-following-
 # BROKER_ACKNOWLEDGED journal entry left behind by a real crash is exactly
@@ -439,12 +455,14 @@ def _call_order_intent_hook(
     notional: float | None = None,
     stop_price: float | None = None,
     parent_order_id: str | None = None,
+    broker_status: str | None = None,
 ) -> None:
     if hook is not None:
         hook(
             phase, ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order,
             operation_id=operation_id, side=side, order_type=order_type, quantity=quantity,
             notional=notional, stop_price=stop_price, parent_order_id=parent_order_id,
+            broker_status=broker_status,
         )
 
 
@@ -934,6 +952,13 @@ def _execute_equity_orders(
                     order_intent_hook, "BROKER_ACKNOWLEDGED", ticker=trade.ticker,
                     action_kind="CANCEL_PROTECTIVE_STOP", operation_id=cancel_operation_id,
                     side="SELL", order_type="stop", parent_order_id=stop_order_id,
+                    # independent-audit-round-2 finding #3 (2026-08-23):
+                    # a cancel has no Order object to derive broker_status
+                    # from (Alpaca's cancel API returns only this plain
+                    # status string) -- without threading it through here,
+                    # the intent's own broker_status landed None even
+                    # though the real status was already known.
+                    broker_status=cancel_status,
                 )
                 cancel_record = {
                     "order_id": stop_order_id,

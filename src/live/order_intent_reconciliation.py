@@ -47,7 +47,20 @@ from src.live import order_intent
 from src.live import order_submission
 
 _NON_TERMINAL_STATUSES = frozenset(
-    {order_intent.PREPARED, order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED, order_intent.UNCERTAIN}
+    {
+        order_intent.PREPARED, order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED,
+        # COMMITTED (added independent-audit round 2, 2026-08-23): a
+        # crash in the narrow window AFTER the COMMITTED write lands but
+        # BEFORE the following TERMINAL write -- see
+        # `finalize_resolved_intent`'s own docstring -- left such an
+        # intent permanently invisible to this stray scan, since
+        # COMMITTED was (incorrectly) treated as "as good as done."
+        # order_intent.py's own `_VALID_TRANSITIONS` has always allowed
+        # COMMITTED -> TERMINAL; nothing was ever calling it for a
+        # leftover-from-a-prior-run COMMITTED intent.
+        order_intent.COMMITTED,
+        order_intent.UNCERTAIN,
+    }
 )
 
 # Alpaca order statuses this module treats as "the target order is
@@ -61,10 +74,10 @@ _STILL_RESTING_STATUSES = frozenset({"new", "accepted", "pending_new", "held", "
 
 def find_stray_session_intents_from_prior_run() -> list[order_intent.OrderIntent]:
     """Every intent currently on disk that is NOT in a terminal state
-    (PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/UNCERTAIN) -- a candidate
-    a PRIOR, interrupted run left behind. Local-only, makes no broker
-    call itself; see `list_intents()`'s own docstring for why this is
-    safe to call cheaply and often."""
+    (PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/COMMITTED/UNCERTAIN) -- a
+    candidate a PRIOR, interrupted run left behind. Local-only, makes no
+    broker call itself; see `list_intents()`'s own docstring for why
+    this is safe to call cheaply and often."""
     return [intent for intent in order_intent.list_intents() if intent.status in _NON_TERMINAL_STATUSES]
 
 
@@ -203,6 +216,50 @@ def resolve_stray_cancel_intent(client: TradingClient, intent: order_intent.Orde
     )
 
 
+def finalize_resolved_intent(intent: order_intent.OrderIntent) -> order_intent.OrderIntent:
+    """Closes a stray intent whose broker-side outcome is now
+    definitively known -- BROKER_ACKNOWLEDGED (this run's own
+    `resolve_stray_*` call just landed there, or the intent was already
+    sitting at BROKER_ACKNOWLEDGED because a prior run never got to
+    close it -- independent-audit-round-2 finding #1, 2026-08-23) or
+    COMMITTED (the prior run's own second save landed but the final
+    bookkeeping transition to TERMINAL did not -- e.g. a crash in the
+    narrow window between those two writes; finding #2) -- through to
+    TERMINAL.
+
+    JOURNAL-ONLY, same scope discipline as every other function in this
+    module: never touches `position_state.json`. Advancing a
+    BROKER_ACKNOWLEDGED intent to COMMITTED here means "the broker's
+    real, authoritative outcome for this intent is now known and
+    durably recorded in THIS JOURNAL ENTRY" -- not a claim that
+    `position_state.json` has already been updated to match; propagating
+    that is `broker_reconciliation.py`'s own Scenario C's job (run
+    separately, unmodified, as part of the same preflight this module's
+    caller already runs) or the run's own normal decision flow, never
+    reimplemented here.
+
+    Before this function existed, a stray intent resolved to (or found
+    already at) BROKER_ACKNOWLEDGED had no path forward at all --
+    `resolve_stray_order_submission_intent`/`resolve_stray_cancel_intent`
+    both deliberately stop there by design (see their own docstrings),
+    and nothing downstream ever called `transition_intent(...,
+    COMMITTED)` for a STRAY intent the way `run_control_arm_decision.py`'s
+    own finalization loop already does for intents created/resolved
+    WITHIN the same run. It stayed BROKER_ACKNOWLEDGED permanently --
+    the bug this function exists to close.
+
+    A no-op (returns the intent unchanged) for any other status --
+    TERMINAL is already done; PREPARED/SUBMITTING are not this
+    function's job (that is `resolve_stray_*`'s own job, called before
+    this); UNCERTAIN is fail-closed, human-review-only, never
+    auto-advanced by anything in this module."""
+    if intent.status == order_intent.BROKER_ACKNOWLEDGED:
+        intent = order_intent.transition_intent(intent, order_intent.COMMITTED)
+    if intent.status == order_intent.COMMITTED:
+        intent = order_intent.transition_intent(intent, order_intent.TERMINAL)
+    return intent
+
+
 def resolve_stray_intent(client: TradingClient, intent: order_intent.OrderIntent) -> order_intent.OrderIntent:
     """Dispatches to `resolve_stray_order_submission_intent` or
     `resolve_stray_cancel_intent` based on which correlation key the
@@ -213,16 +270,27 @@ def resolve_stray_intent(client: TradingClient, intent: order_intent.OrderIntent
     never a silent guess) for an intent carrying neither, which should be
     structurally impossible given how `create_intent` is called
     throughout this codebase, but this function does not assume that
-    invariant holds without checking."""
+    invariant holds without checking.
+
+    Always finalizes through `finalize_resolved_intent` before returning
+    (independent-audit-round-2 findings #1/#2, 2026-08-23) -- a caller
+    of this function never needs to remember to call that separately;
+    the ONLY status this function can now return for a call that does
+    not raise is TERMINAL, UNCERTAIN, or (unreachable in practice, see
+    `resolve_stray_order_submission_intent`/`resolve_stray_cancel_intent`'s
+    own contracts) PREPARED/SUBMITTING if a caller passes an intent this
+    module has not actually tried to resolve at all."""
     if intent.client_order_id:
-        return resolve_stray_order_submission_intent(client, intent)
-    if intent.target_broker_order_id:
-        return resolve_stray_cancel_intent(client, intent)
-    raise ValueError(
-        f"Intent {intent.intent_id} ({intent.ticker} {intent.action_kind}) has neither a "
-        f"client_order_id nor a target_broker_order_id -- cannot determine how to resolve it "
-        f"against the broker. Fail-closed."
-    )
+        resolved = resolve_stray_order_submission_intent(client, intent)
+    elif intent.target_broker_order_id:
+        resolved = resolve_stray_cancel_intent(client, intent)
+    else:
+        raise ValueError(
+            f"Intent {intent.intent_id} ({intent.ticker} {intent.action_kind}) has neither a "
+            f"client_order_id nor a target_broker_order_id -- cannot determine how to resolve it "
+            f"against the broker. Fail-closed."
+        )
+    return finalize_resolved_intent(resolved)
 
 
 def _status_str(order) -> str:

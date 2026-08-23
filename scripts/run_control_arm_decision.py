@@ -837,7 +837,7 @@ def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) ->
         phase: str, *, ticker: str, action_kind: str, client_order_id: str = "", order=None,
         operation_id: str | None = None, side: str | None = None, order_type: str | None = None,
         quantity: float | None = None, notional: float | None = None, stop_price: float | None = None,
-        parent_order_id: str | None = None,
+        parent_order_id: str | None = None, broker_status: str | None = None,
     ) -> None:
         if action_kind not in _KNOWN_ACTION_KINDS:
             raise RuntimeError(
@@ -878,10 +878,24 @@ def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) ->
         elif phase == "BROKER_ACKNOWLEDGED":
             if intent.status != order_intent.SUBMITTING:
                 return  # nothing to acknowledge if SUBMITTING was never durably recorded
+            # independent-audit-round-2 finding #3 (2026-08-23): a
+            # cancel has no `order` object (Alpaca's cancel API returns
+            # none), only the plain `broker_status` string
+            # `run_daily_decision.py`'s own CANCEL_STOP call site now
+            # threads through. Prefer that explicit value when given --
+            # it is the more specific, deliberately-supplied one for
+            # exactly the callers that have no `order` at all; a real
+            # `order` (the ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL/
+            # PROTECTIVE_STOP submission callers) still derives its own
+            # status via `_order_status_str` as before.
+            resolved_broker_status = (
+                broker_status if broker_status is not None
+                else (rdd._order_status_str(order) if order is not None else None)
+            )
             intent = order_intent.transition_intent(
                 intent, order_intent.BROKER_ACKNOWLEDGED,
                 broker_order_id=str(order.id) if order is not None else None,
-                broker_status=rdd._order_status_str(order) if order is not None else None,
+                broker_status=resolved_broker_status,
             )
             store[key] = intent
             print(
@@ -936,7 +950,16 @@ def _run_intent_protocol(
     closed PREPARED -> TERMINAL as an abandoned guess, never COMMITTED
     -- see module docstring's "INTENT JOURNAL ORDERING GAP" section,
     "a 'blind' intent that did NOT materialize ... transitions to
-    TERMINAL as an abandoned guess."
+    TERMINAL as an abandoned guess." THIS is the ordinary case
+    (PREPARED, since real order submission has never been enabled here
+    in production). If the blind intent's status is instead SUBMITTING
+    or BROKER_ACKNOWLEDGED (independent-audit-round-2 finding #4,
+    2026-08-23 -- the real order_intent_hook DID fire for it during
+    `rdd.run_daily_decision()`, yet it still does not appear in
+    `executed_today`), it is routed to UNCERTAIN instead -- PREPARED is
+    the only status `_VALID_TRANSITIONS` allows a direct move to
+    TERMINAL from; a genuinely ambiguous "hook advanced it, but it's not
+    in the output" case is never silently forced through the same path.
 
     NO REAL BROKER CALL IS MADE ANYWHERE IN THIS FUNCTION.
     BROKER_ACKNOWLEDGED here means "the local decision is confirmed as
@@ -1030,18 +1053,105 @@ def _run_intent_protocol(
     for client_order_id, blind in blind_by_client_order_id.items():
         if client_order_id in materialized_client_order_ids:
             continue
-        closed = order_intent.transition_intent(
-            blind, order_intent.TERMINAL,
-            last_error=(
-                "attempted_but_not_executed -- this pre-run write-ahead candidate did not "
-                "appear in this run's executed_today (cap full / rejected / FREEZE / a stop "
-                "or another condition changed the outcome before this ticker was reached)."
-            ),
-        )
-        print(f"[CONTROL] Intent {closed.intent_id} ({closed.ticker} {closed.action_kind}): PREPARED -> TERMINAL (attempted_but_not_executed)")
-        intents.append(closed)
+        # independent-audit-round-2 finding #4 (2026-08-23): this used
+        # to transition straight to TERMINAL without checking the
+        # blind intent's CURRENT status first. The ordinary case is
+        # PREPARED (never materialized this run at all) -- but if the
+        # real order_intent_hook DID fire for this exact candidate
+        # during run_daily_decision() (e.g. it got as far as
+        # SUBMITTING, or even BROKER_ACKNOWLEDGED, before a crash or a
+        # rejection kept it out of this run's own executed_today),
+        # `_VALID_TRANSITIONS` has no path from SUBMITTING/
+        # BROKER_ACKNOWLEDGED straight to TERMINAL -- the old code would
+        # raise InvalidTransitionError uncaught in exactly that case.
+        if blind.status == order_intent.PREPARED:
+            closed = order_intent.transition_intent(
+                blind, order_intent.TERMINAL,
+                last_error=(
+                    "attempted_but_not_executed -- this pre-run write-ahead candidate did not "
+                    "appear in this run's executed_today (cap full / rejected / FREEZE / a stop "
+                    "or another condition changed the outcome before this ticker was reached)."
+                ),
+            )
+            print(f"[CONTROL] Intent {closed.intent_id} ({closed.ticker} {closed.action_kind}): PREPARED -> TERMINAL (attempted_but_not_executed)")
+            intents.append(closed)
+        elif blind.status in (order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED):
+            # The hook DID advance this candidate during
+            # run_daily_decision() -- a real broker call was at least
+            # attempted, possibly acknowledged -- yet it does not appear
+            # in this run's own executed_today. Never assumed to be the
+            # ordinary "never attempted" case (that would be a false
+            # claim); routes to UNCERTAIN instead (a valid transition
+            # from both statuses) -- fail-closed, human review required.
+            # The NEXT run's own Phase 1.5 stray-intent recovery (see
+            # order_intent_reconciliation.py) is what actually resolves
+            # this against the broker; this function makes no broker
+            # call itself (see its own docstring).
+            closed = order_intent.transition_intent(
+                blind, order_intent.UNCERTAIN,
+                last_error=(
+                    f"blind candidate reached {blind.status} via the real order_intent_hook during "
+                    f"run_daily_decision(), but does not appear in this run's own executed_today -- "
+                    f"ambiguous outcome, never assumed to be 'never attempted'. Fail-closed, human "
+                    f"review (or the next run's own stray-intent recovery) required."
+                ),
+            )
+            print(
+                f"[CONTROL] Intent {closed.intent_id} ({closed.ticker} {closed.action_kind}): "
+                f"{blind.status} -> UNCERTAIN (hook advanced it but it is not in executed_today)"
+            )
+            intents.append(closed)
+        else:
+            # UNCERTAIN/COMMITTED/TERMINAL: already resolved, or already
+            # flagged ambiguous, by something else -- never re-transitioned
+            # here.
+            print(f"[CONTROL] Intent {blind.intent_id} ({blind.ticker} {blind.action_kind}): already {blind.status} -- not re-transitioning.")
+            intents.append(blind)
 
     return intents
+
+
+def _finalize_run_intents(all_run_intents: list[order_intent.OrderIntent]) -> list[order_intent.OrderIntent]:
+    """Closes out every intent this SAME run touched -- extracted from
+    `_execute()`'s own inline loop (2026-08-23, independent-audit-round-2
+    test-quality note) so this is directly, behaviorally testable rather
+    than only checkable via source-text matching against `_execute`.
+
+    Intents committed only AFTER state has actually been durably
+    re-saved -- COMMITTED is meant to mean "local state reflects this,"
+    not merely "we decided to." `_execute()`'s own caller only invokes
+    this function after `_stamp_last_processed_dates` has already run,
+    preserving that ordering guarantee; this function itself does not
+    re-verify it.
+
+    Folds in the PROTECTIVE_STOP/CANCEL_PROTECTIVE_STOP just-in-time
+    intents the hook created during this same run (never returned by
+    `_run_intent_protocol` itself -- that function only knows about
+    ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL) so they go through the
+    exact same COMMITTED/TERMINAL finalization, not a second, divergent
+    code path (Task 3, 2026-08-22).
+
+    Abandoned "blind" guesses (already TERMINAL by this point, or
+    UNCERTAIN -- see `_run_intent_protocol`'s own docstring) are left
+    untouched: TERMINAL has no further valid transition, and COMMITTED
+    would be a false claim for a candidate that was never actually
+    acted on this run, or one whose outcome is still genuinely
+    ambiguous. Only materialized (BROKER_ACKNOWLEDGED) intents commit
+    -- closing the real, pre-existing gap where COMMITTED was
+    previously a dead end in practice, even though `order_intent.py`'s
+    own `_VALID_TRANSITIONS` has always allowed COMMITTED -> TERMINAL.
+
+    Returns the same list, each element updated in place to its final
+    status -- purely for test convenience; `_execute()`'s own caller
+    does not use the return value today."""
+    for intent in all_run_intents:
+        if intent.status != order_intent.BROKER_ACKNOWLEDGED:
+            continue
+        committed = order_intent.transition_intent(intent, order_intent.COMMITTED)
+        print(f"[CONTROL] Intent {committed.intent_id} ({committed.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
+        order_intent.transition_intent(committed, order_intent.TERMINAL)
+        print(f"[CONTROL] Intent {committed.intent_id} ({committed.ticker}): COMMITTED -> TERMINAL (run finished successfully)")
+    return all_run_intents
 
 
 _PENDING_SIGNAL_ACTION_KIND_FAMILIES: dict[str, tuple[str, ...]] = {
@@ -1506,27 +1616,34 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     f"SEC cache age={issuer_identity_result.sec_data_age_days}."
                 )
 
-                # PHASE 1.5 (Task 3, 2026-08-22, item 6): post-crash
-                # order-intent recovery -- BEFORE broker reconciliation's
-                # own snapshot below, using the SAME already-resolved
-                # reconciliation_client (one real TradingClient for this
-                # whole run, same discipline as every other call here).
-                # Resolves any stray PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/
+                # PHASE 1.5 (Task 3, 2026-08-22, item 6; finalization
+                # closed independent-audit-round-2, 2026-08-23, findings
+                # #1/#2): post-crash order-intent recovery -- BEFORE
+                # broker reconciliation's own snapshot below, using the
+                # SAME already-resolved reconciliation_client (one real
+                # TradingClient for this whole run, same discipline as
+                # every other call here). Resolves any stray
+                # PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/COMMITTED/
                 # UNCERTAIN intent a PRIOR, interrupted run left behind
                 # against the real broker -- never auto-resubmits, never
                 # auto-retries a cancel (see
                 # order_intent_reconciliation.py's own module docstring
-                # for the full resolution table). A BROKER_ACKNOWLEDGED
-                # result is deliberately left as-is here, not blocked --
-                # "broker acknowledged, local state not yet caught up" is
-                # exactly what Phase 2a's own reconciliation call (see
-                # broker_reconciliation's own Scenario C, immediately
-                # below) already resolves; this phase does not
-                # reimplement that. Anything still
-                # UNCERTAIN (or otherwise non-terminal, which should be
-                # structurally impossible given the resolution functions'
-                # own contracts) blocks this run entirely, fail-closed --
-                # human review required before proceeding.
+                # for the full resolution table).
+                # `resolve_stray_intent` now ALWAYS finalizes a
+                # BROKER_ACKNOWLEDGED/COMMITTED outcome through to
+                # TERMINAL itself (`finalize_resolved_intent`, closing
+                # the real gap where such an intent previously had no
+                # path forward and stayed non-terminal permanently) --
+                # this journal-level closure is independent of, and
+                # never a substitute for, Phase 2a's own reconciliation
+                # call below (broker_reconciliation's Scenario C), which
+                # is what actually catches `position_state.json` up if
+                # needed; this phase never reimplements that. Anything
+                # still UNCERTAIN after resolution (or otherwise
+                # non-terminal, which should be structurally impossible
+                # given `resolve_stray_intent`'s own contract) blocks
+                # this run entirely, fail-closed -- human review required
+                # before proceeding.
                 stray_intents = order_intent_reconciliation.find_stray_session_intents_from_prior_run()
                 if stray_intents:
                     print(
@@ -1540,9 +1657,7 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                             f"[CONTROL] Stray intent {resolved.intent_id} ({resolved.ticker} "
                             f"{resolved.action_kind}): {stray.status} -> {resolved.status}"
                         )
-                        if resolved.status not in (
-                            order_intent.COMMITTED, order_intent.TERMINAL, order_intent.BROKER_ACKNOWLEDGED,
-                        ):
+                        if resolved.status != order_intent.TERMINAL:
                             unresolved_stray_intents.append(resolved)
                     if unresolved_stray_intents:
                         raise RuntimeError(
@@ -1884,40 +1999,13 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                 # Intents committed only AFTER state has actually been
                 # durably re-saved above -- COMMITTED is meant to mean
                 # "local state reflects this," not merely "we decided to."
-                #
-                # Task 3 (2026-08-22): folds in the PROTECTIVE_STOP/
-                # CANCEL_PROTECTIVE_STOP just-in-time intents the hook
-                # created during this same run (never returned by
-                # _run_intent_protocol itself -- that function only knows
-                # about ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL) so they
-                # go through the exact same COMMITTED/TERMINAL finalization,
-                # not a second, divergent code path.
-                #
-                # Also closes a real, pre-existing gap this same review
-                # found (not new in scope, but fixed here since it's the
-                # same loop): COMMITTED was previously a dead end in
-                # practice -- nothing ever transitioned a run's own
-                # COMMITTED intents to TERMINAL, even though
-                # order_intent.py's own _VALID_TRANSITIONS has always
-                # allowed it (COMMITTED -> TERMINAL, the only valid next
-                # state). A successful run's own intents now close out
-                # TERMINAL too -- applies uniformly to every intent this
-                # run touches, not only the new stop/cancel ones.
+                # See `_finalize_run_intents`'s own docstring for the
+                # full reasoning (extracted into its own function
+                # 2026-08-23 so it is directly, behaviorally testable --
+                # independent-audit-round-2's own test-quality note --
+                # rather than only checkable via source-text matching).
                 all_run_intents = list(intents) + list(getattr(real_order_intent_hook, "just_in_time_intents", {}).values())
-                for intent in all_run_intents:
-                    # Abandoned "blind" guesses (see _run_intent_protocol's
-                    # own docstring) are already TERMINAL by this point --
-                    # TERMINAL has no further valid transition (see
-                    # order_intent.py's _VALID_TRANSITIONS), and "COMMITTED"
-                    # would be a false claim for a candidate that was never
-                    # actually acted on this run. Only materialized
-                    # (BROKER_ACKNOWLEDGED) intents commit.
-                    if intent.status != order_intent.BROKER_ACKNOWLEDGED:
-                        continue
-                    committed = order_intent.transition_intent(intent, order_intent.COMMITTED)
-                    print(f"[CONTROL] Intent {committed.intent_id} ({committed.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
-                    terminal = order_intent.transition_intent(committed, order_intent.TERMINAL)
-                    print(f"[CONTROL] Intent {terminal.intent_id} ({terminal.ticker}): COMMITTED -> TERMINAL (run finished successfully)")
+                _finalize_run_intents(all_run_intents)
 
                 telegram_all_ok &= _notify_and_warn(rdd._build_daily_notification_text(decision))
                 # `with single_instance_lock(...)` releases the lock here,

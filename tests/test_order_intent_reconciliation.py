@@ -60,8 +60,29 @@ class _FakeOrder:
 
 
 def test_finds_only_non_terminal_intents():
+    """independent-audit-round-2 (2026-08-23) test-quality note: the
+    original version of this test only exercised PREPARED/SUBMITTING/
+    TERMINAL -- BROKER_ACKNOWLEDGED, COMMITTED, and UNCERTAIN were never
+    covered, even though `_NON_TERMINAL_STATUSES` (finding #2's own fix)
+    includes all three. Expanded to prove every non-terminal status is
+    actually found, and only TERMINAL is actually excluded."""
     prepared = _submission_intent(status=order_intent.PREPARED)
     submitting = _submission_intent(status=order_intent.SUBMITTING, client_order_id="MSFT-ENTRY-MARKET-BUY-2026-08-20")
+
+    acknowledged = _submission_intent(status=order_intent.SUBMITTING, client_order_id="NVDA-ENTRY-MARKET-BUY-2026-08-20")
+    acknowledged = order_intent.transition_intent(
+        acknowledged, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-1", broker_status="filled",
+    )
+
+    committed = _submission_intent(status=order_intent.SUBMITTING, client_order_id="TSLA-ENTRY-MARKET-BUY-2026-08-20")
+    committed = order_intent.transition_intent(
+        committed, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-2", broker_status="filled",
+    )
+    committed = order_intent.transition_intent(committed, order_intent.COMMITTED)
+
+    uncertain = _submission_intent(status=order_intent.SUBMITTING, client_order_id="AMD-ENTRY-MARKET-BUY-2026-08-20")
+    uncertain = order_intent.transition_intent(uncertain, order_intent.UNCERTAIN, last_error="ambiguous")
+
     terminal_intent = order_intent.create_intent(
         client_order_id="GOOG-ENTRY-MARKET-BUY-2026-08-20", account_identity="control_arm_v1", ticker="GOOG",
         side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY", source_signal_timestamp="2026-08-20T00:00:00Z",
@@ -72,7 +93,11 @@ def test_finds_only_non_terminal_intents():
     stray_ids = {intent.intent_id for intent in stray}
     assert prepared.intent_id in stray_ids
     assert submitting.intent_id in stray_ids
+    assert acknowledged.intent_id in stray_ids
+    assert committed.intent_id in stray_ids
+    assert uncertain.intent_id in stray_ids
     assert terminal_intent.intent_id not in stray_ids
+    assert len(stray) == 5
 
 
 # --- resolve_stray_order_submission_intent ---
@@ -225,17 +250,98 @@ def test_target_filled_before_cancel_landed_is_honestly_recorded_not_relabeled(m
 
 
 def test_dispatch_routes_submission_type_by_client_order_id(monkeypatch: pytest.MonkeyPatch):
+    """`resolve_stray_intent` (the dispatcher) always finalizes through
+    to TERMINAL now (independent-audit-round-2 finding #1, 2026-08-23)
+    -- unlike `resolve_stray_order_submission_intent` on its own, which
+    deliberately still stops at BROKER_ACKNOWLEDGED (see that function's
+    own, still-passing `test_already_broker_acknowledged_submission_returned_unchanged`)."""
     intent = _submission_intent(status=order_intent.PREPARED)
     monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: _FakeOrder("x"))
     resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent)
-    assert resolved.status == order_intent.BROKER_ACKNOWLEDGED
+    assert resolved.status == order_intent.TERMINAL
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.status == order_intent.TERMINAL
+    assert reloaded.broker_order_id == "x"  # the real broker fact is still preserved through finalization
 
 
 def test_dispatch_routes_cancel_type_by_target_broker_order_id(monkeypatch: pytest.MonkeyPatch):
     intent = _cancel_intent(status=order_intent.PREPARED)
     monkeypatch.setattr(order_submission, "get_order_status", lambda *a, **k: "canceled")
     resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent)
-    assert resolved.status == order_intent.BROKER_ACKNOWLEDGED
+    assert resolved.status == order_intent.TERMINAL
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.broker_status == "canceled"
+
+
+# --- finalize_resolved_intent (independent-audit-round-2 findings #1/#2, 2026-08-23) ---
+
+
+def test_finalize_closes_broker_acknowledged_through_to_terminal():
+    """The exact bug finding #1 describes: a stray intent resolved to
+    (or already sitting at) BROKER_ACKNOWLEDGED previously had no path
+    forward and stayed there permanently."""
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-3", broker_status="filled",
+    )
+    finalized = reconciliation.finalize_resolved_intent(intent)
+    assert finalized.status == order_intent.TERMINAL
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.status == order_intent.TERMINAL
+    assert reloaded.broker_order_id == "real-3"
+
+
+def test_finalize_closes_committed_through_to_terminal():
+    """Finding #2's own crash window: a prior run's second save
+    (COMMITTED) landed, but the run crashed before the final TERMINAL
+    write."""
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-4", broker_status="filled",
+    )
+    intent = order_intent.transition_intent(intent, order_intent.COMMITTED)
+    finalized = reconciliation.finalize_resolved_intent(intent)
+    assert finalized.status == order_intent.TERMINAL
+
+
+def test_finalize_is_a_no_op_for_prepared_submitting_uncertain_terminal():
+    prepared = _submission_intent(status=order_intent.PREPARED)
+    assert reconciliation.finalize_resolved_intent(prepared).status == order_intent.PREPARED
+
+    submitting = _submission_intent(status=order_intent.SUBMITTING, client_order_id="MSFT-ENTRY-MARKET-BUY-2026-08-20")
+    assert reconciliation.finalize_resolved_intent(submitting).status == order_intent.SUBMITTING
+
+    uncertain = _submission_intent(status=order_intent.SUBMITTING, client_order_id="AMD-ENTRY-MARKET-BUY-2026-08-20")
+    uncertain = order_intent.transition_intent(uncertain, order_intent.UNCERTAIN, last_error="ambiguous")
+    assert reconciliation.finalize_resolved_intent(uncertain).status == order_intent.UNCERTAIN
+
+    terminal = _submission_intent(status=order_intent.PREPARED, client_order_id="GOOG-ENTRY-MARKET-BUY-2026-08-20")
+    terminal = order_intent.transition_intent(terminal, order_intent.TERMINAL)
+    assert reconciliation.finalize_resolved_intent(terminal).status == order_intent.TERMINAL
+
+
+def test_resolve_stray_intent_finalizes_an_already_acknowledged_stray_from_a_prior_run(monkeypatch: pytest.MonkeyPatch):
+    """The precise scenario finding #1 names: a stray intent that was
+    ALREADY BROKER_ACKNOWLEDGED when found on disk (left over from a
+    prior run, never advanced further) -- `resolve_stray_intent` must
+    still finalize it through to TERMINAL, not merely return it
+    unchanged. Never queries the broker again for an already-resolved
+    intent (see `resolve_stray_order_submission_intent`'s own
+    docstring) -- only finalization runs here."""
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="already-acked-2", broker_status="filled",
+    )
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("must not query the broker for an already-resolved intent")
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", fail_if_called)
+
+    resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent)
+
+    assert resolved.status == order_intent.TERMINAL
+    assert resolved.broker_order_id == "already-acked-2"
 
 
 def test_dispatch_raises_for_intent_with_neither_key():

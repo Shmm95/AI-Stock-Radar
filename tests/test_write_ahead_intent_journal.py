@@ -340,6 +340,81 @@ def test_run_intent_protocol_does_not_re_transition_an_intent_the_hook_already_a
     assert result.broker_order_id == "real-broker-order-123"  # the REAL hook-recorded value, not overwritten
 
 
+def test_run_intent_protocol_routes_unmaterialized_submitting_intent_to_uncertain_not_terminal():
+    """independent-audit-round-2 finding #4 (2026-08-23): the abandoned-
+    guess loop used to transition straight to TERMINAL without checking
+    the blind intent's current status. Before this fix, a blind
+    candidate the hook advanced to SUBMITTING (a real broker call was at
+    least attempted) but that still does not appear in this run's own
+    executed_today (e.g. a crash between SUBMITTING and
+    BROKER_ACKNOWLEDGED, or a rejection) would hit
+    `transition_intent(blind, TERMINAL)` -- not a valid transition from
+    SUBMITTING (`_VALID_TRANSITIONS`) -- and raise InvalidTransitionError
+    uncaught, crashing the whole run. Must route to UNCERTAIN instead."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG", price=75.0)
+    blind_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-18", pre_state_hash="h")
+    blind_intent = blind_intents[0]
+
+    hook = carm._order_intent_hook_for_run(blind_intents)
+    hook("SUBMITTING", ticker="CEG", action_kind="ENTRY_MARKET_BUY", client_order_id=blind_intent.client_order_id)
+
+    decision = {"as_of_bar_timestamp_equity": "2026-08-18", "executed_today": {"entries": [], "exits": []}}
+    result_intents = carm._run_intent_protocol(decision, pre_state_hash="h", blind_intents=blind_intents)
+
+    assert len(result_intents) == 1
+    assert result_intents[0].status == order_intent.UNCERTAIN
+    reloaded = order_intent.load_intent(blind_intent.intent_id)
+    assert reloaded.status == order_intent.UNCERTAIN
+
+
+def test_run_intent_protocol_routes_unmaterialized_broker_acknowledged_intent_to_uncertain():
+    """Same finding #4 fix, the BROKER_ACKNOWLEDGED case: the hook
+    completed a real (scaffold) acknowledgment for this candidate, yet
+    it still does not appear in executed_today -- genuinely ambiguous,
+    never silently claimed as 'never attempted' (TERMINAL), and
+    BROKER_ACKNOWLEDGED has no valid transition straight to TERMINAL
+    either."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG", price=75.0)
+    blind_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-18", pre_state_hash="h")
+    blind_intent = blind_intents[0]
+
+    hook = carm._order_intent_hook_for_run(blind_intents)
+    hook("SUBMITTING", ticker="CEG", action_kind="ENTRY_MARKET_BUY", client_order_id=blind_intent.client_order_id)
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="ENTRY_MARKET_BUY",
+        client_order_id=blind_intent.client_order_id,
+        order=_FakeBrokerOrder("real-broker-order-999", status="rejected"),
+    )
+
+    decision = {"as_of_bar_timestamp_equity": "2026-08-18", "executed_today": {"entries": [], "exits": []}}
+    result_intents = carm._run_intent_protocol(decision, pre_state_hash="h", blind_intents=blind_intents)
+
+    assert len(result_intents) == 1
+    assert result_intents[0].status == order_intent.UNCERTAIN
+    assert "not assumed to be" in result_intents[0].last_error.lower() or "ambiguous" in result_intents[0].last_error.lower()
+
+
+def test_run_intent_protocol_leaves_a_pre_existing_uncertain_blind_intent_untouched():
+    """The `else` branch: a blind intent already UNCERTAIN (e.g. from a
+    prior partial run) must not be re-transitioned again here."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG", price=75.0)
+    blind_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-18", pre_state_hash="h")
+    blind_intent = blind_intents[0]
+    blind_intent = order_intent.transition_intent(blind_intent, order_intent.SUBMITTING)
+    blind_intent = order_intent.transition_intent(blind_intent, order_intent.UNCERTAIN, last_error="pre-existing")
+    blind_intents[0] = blind_intent
+
+    decision = {"as_of_bar_timestamp_equity": "2026-08-18", "executed_today": {"entries": [], "exits": []}}
+    result_intents = carm._run_intent_protocol(decision, pre_state_hash="h", blind_intents=blind_intents)
+
+    assert len(result_intents) == 1
+    assert result_intents[0].status == order_intent.UNCERTAIN
+    assert result_intents[0].last_error == "pre-existing"  # untouched, not overwritten
+
+
 # --- Guard's new conditional logic ---
 
 def test_guard_still_blocks_by_default_write_ahead_owner_approval_false(monkeypatch):
@@ -458,6 +533,31 @@ def test_cancel_protective_stop_hook_creates_prepared_intent_keyed_by_operation_
     assert on_disk[0].status == order_intent.SUBMITTING
 
 
+def test_cancel_protective_stop_hook_broker_acknowledged_uses_explicit_broker_status():
+    """independent-audit-round-2 finding #3 (2026-08-23), consumer side:
+    `_order_intent_hook_for_run`'s own `hook()` must prefer an explicitly
+    passed `broker_status` (the only thing a CANCEL caller can supply --
+    it has no `Order` object) over trying to derive one from `order`
+    (which is `None` for a cancel)."""
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="CANCEL_PROTECTIVE_STOP",
+        operation_id="CEG-CANCEL-PROTECTIVE-STOP-resting-stop-1",
+        side="SELL", order_type="stop", parent_order_id="resting-stop-1",
+    )
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="CANCEL_PROTECTIVE_STOP",
+        operation_id="CEG-CANCEL-PROTECTIVE-STOP-resting-stop-1",
+        side="SELL", order_type="stop", parent_order_id="resting-stop-1",
+        broker_status="pending_cancel",
+    )
+    on_disk = order_intent.list_intents()
+    assert len(on_disk) == 1
+    assert on_disk[0].status == order_intent.BROKER_ACKNOWLEDGED
+    assert on_disk[0].broker_status == "pending_cancel"  # not None, the real bug before this fix
+    assert on_disk[0].broker_order_id is None  # a cancel confirmation has no order id of its own here
+
+
 def test_unknown_action_kind_is_fail_closed_not_silently_skipped():
     """REAL FAIL-CLOSED PROOF (Task 3): an action kind this hook does not
     know how to journal must raise, never silently pass through
@@ -513,21 +613,55 @@ def test_just_in_time_intents_are_exposed_for_the_finalization_loop():
     assert len(hook.just_in_time_intents) == 1
 
 
-def test_execute_finalization_loop_source_commits_then_terminates_all_run_intents():
-    """Real source-text check (same discipline as this codebase's other
-    drift-detection tests): confirms _execute()'s own finalization loop
-    genuinely folds in the hook's just_in_time_intents alongside
-    _run_intent_protocol's own return value, and transitions
-    BROKER_ACKNOWLEDGED -> COMMITTED -> TERMINAL for all of them --
-    closing the real, pre-existing gap where COMMITTED was previously a
-    dead end (nothing ever reached TERMINAL, even for ENTRY/EXIT
+def test_finalize_run_intents_commits_then_terminates_broker_acknowledged_intents():
+    """Real-behavior replacement (independent-audit-round-2 test-quality
+    note, 2026-08-23) for the original source-text-matching version of
+    this test: `_execute()`'s own finalization loop was extracted into
+    `_finalize_run_intents` specifically so this could call it directly
+    and assert genuine, on-disk resulting statuses -- not merely that
+    certain tokens appear near each other in `_execute`'s source.
+    Closes the real, pre-existing gap where COMMITTED was previously a
+    dead end (nothing ever reached TERMINAL for a run's own materialized
     intents, despite order_intent.py's own _VALID_TRANSITIONS always
-    having allowed it)."""
-    import inspect
+    having allowed COMMITTED -> TERMINAL)."""
+    materialized = order_intent.create_intent(
+        client_order_id="AAPL-ENTRY-MARKET-BUY-2026-08-20", account_identity="control_arm_v1", ticker="AAPL",
+        side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY", source_signal_timestamp="2026-08-20T00:00:00Z",
+    )
+    materialized = order_intent.transition_intent(materialized, order_intent.SUBMITTING)
+    materialized = order_intent.transition_intent(
+        materialized, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-1", broker_status="filled",
+    )
+    abandoned = order_intent.create_intent(
+        client_order_id="MSFT-ENTRY-MARKET-BUY-2026-08-20", account_identity="control_arm_v1", ticker="MSFT",
+        side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY", source_signal_timestamp="2026-08-20T00:00:00Z",
+    )
+    abandoned = order_intent.transition_intent(abandoned, order_intent.TERMINAL, last_error="attempted_but_not_executed")
 
-    source = inspect.getsource(carm._execute)
-    loop_start = source.index("all_run_intents = list(intents)")
-    loop_text = source[loop_start:loop_start + 1200]
-    assert "just_in_time_intents" in loop_text
-    assert "order_intent.COMMITTED" in loop_text
-    assert "order_intent.TERMINAL" in loop_text
+    carm._finalize_run_intents([materialized, abandoned])
+
+    reloaded_materialized = order_intent.load_intent(materialized.intent_id)
+    assert reloaded_materialized.status == order_intent.TERMINAL
+    reloaded_abandoned = order_intent.load_intent(abandoned.intent_id)
+    assert reloaded_abandoned.status == order_intent.TERMINAL  # untouched -- was already TERMINAL, never re-transitioned
+
+
+def test_finalize_run_intents_folds_in_just_in_time_intents_from_the_hook():
+    """`_execute()`'s own caller passes `list(intents) +
+    list(hook.just_in_time_intents.values())` -- proves
+    `_finalize_run_intents` itself has no special-casing that would only
+    work for `_run_intent_protocol`'s own ENTRY/EXIT intents, by feeding
+    it a PROTECTIVE_STOP-shaped one the hook would have created."""
+    stop_intent = order_intent.create_intent(
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1", account_identity="control_arm_v1", ticker="CEG",
+        side="SELL", order_type="stop", action_kind="PROTECTIVE_STOP", source_signal_timestamp="2026-08-20T00:00:00Z",
+    )
+    stop_intent = order_intent.transition_intent(stop_intent, order_intent.SUBMITTING)
+    stop_intent = order_intent.transition_intent(
+        stop_intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="stop-real-1", broker_status="new",
+    )
+
+    carm._finalize_run_intents([stop_intent])
+
+    reloaded = order_intent.load_intent(stop_intent.intent_id)
+    assert reloaded.status == order_intent.TERMINAL

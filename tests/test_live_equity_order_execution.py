@@ -695,6 +695,41 @@ def test_cancel_stop_hook_fires_submitting_before_cancel_call(monkeypatch: pytes
     assert hook_events[0][3] is not None  # a real operation_id was built, not left None
 
 
+def test_cancel_stop_hook_broker_acknowledged_carries_the_real_cancel_status(monkeypatch: pytest.MonkeyPatch):
+    """independent-audit-round-2 finding #3 (2026-08-23): a CANCEL has no
+    `Order` object to derive a status from (Alpaca's cancel API returns
+    only the plain status string `cancel_order_and_confirm` already
+    returns) -- before this fix, the BROKER_ACKNOWLEDGED hook call for
+    CANCEL_PROTECTIVE_STOP never passed that real status through at
+    all, so a consumer building a journal entry from it (see
+    `_order_intent_hook_for_run` in run_control_arm_decision.py) always
+    recorded `broker_status=None`, even though the real status
+    (`cancel_status`) was already known at the call site. This test
+    hits the REAL producer call site (`_execute_equity_orders`'s own
+    CANCEL_STOP block), not a hand-built hook call."""
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("exit-1"))
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "cancel_order_and_confirm", lambda client, order_id: "pending_cancel")
+
+    captured: dict = {}
+
+    def hook(phase, *, ticker, action_kind, client_order_id="", order=None, broker_status=None, **_extra):
+        if action_kind == "CANCEL_PROTECTIVE_STOP" and phase == "BROKER_ACKNOWLEDGED":
+            captured["broker_status"] = broker_status
+            captured["order"] = order
+
+    state = LiveRunnerState(equity_stop_orders={"AAPL": "stop-1"})
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-15",
+        newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        order_intent_hook=hook, authorization=runner.authorize_order_execution(),
+    )
+
+    assert captured["broker_status"] == "pending_cancel"  # the real cancel_status, not None
+    assert captured["order"] is None  # a cancel genuinely has no Order object -- confirms this isn't derived from one
+
+
 def test_cancel_stop_hook_is_none_by_default_zero_behavior_change(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
     monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("exit-1"))
