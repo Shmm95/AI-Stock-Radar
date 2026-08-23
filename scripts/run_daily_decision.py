@@ -336,6 +336,21 @@ def client_order_id_for_action(ticker: str, action_kind: str, date: str) -> str:
     return _deterministic_client_order_id(ticker, segment, date)
 
 
+def _deterministic_operation_id(ticker: str, action_kind: str, target_broker_order_id: str) -> str:
+    """Task 3 (2026-08-22): the CANCEL-side counterpart to
+    `client_order_id_for_action`. A cancel is never itself a broker
+    order -- Alpaca's cancel API has no client_order_id of its own to
+    generate or accept -- so this builds a LOCAL-only, deterministic
+    journal correlation key instead (`OrderIntent.operation_id`, never
+    sent to the broker). Keyed off the TARGET order's own real broker
+    id (the resting stop being canceled), the same "immutable reference
+    that exists the moment the thing it protects/targets is known"
+    discipline `_reconcile_pending_equity_orders`'s own protective-stop
+    keying already uses -- not a date, so a retry/crash-restart
+    targeting the same resting order always reproduces the same id."""
+    return _deterministic_client_order_id(ticker, action_kind, target_broker_order_id)
+
+
 def _order_status_str(order: Order) -> str:
     status = order.status
     return str(status.value if hasattr(status, "value") else status)
@@ -365,12 +380,17 @@ def _order_status_str(order: Order) -> str:
 # right at the moment a broker call is about to happen -- for the exact
 # ticker/action about to be attempted, not a blanket pre-run guess.
 #
-# CONTRACT: `hook(phase, *, ticker, action_kind, client_order_id, order=None)`.
-# `phase` is `"SUBMITTING"` (called BEFORE the broker is queried/called for
-# this client_order_id -- may fire even when the order turns out to
-# already exist, since the query itself is what "SUBMITTING" durably
-# guards against a crash during) or `"BROKER_ACKNOWLEDGED"` (called AFTER
-# that query/call resolves successfully, `order` is the real `Order`).
+# CONTRACT (extended 2026-08-22, Task 3 -- see PROTECTIVE_STOP/
+# CANCEL_STOP call sites below for why): `hook(phase, *, ticker,
+# action_kind, client_order_id, order=None, operation_id=None,
+# side=None, order_type=None, quantity=None, notional=None,
+# stop_price=None, parent_order_id=None)`.
+# `phase` is `"SUBMITTING"` (called BEFORE the broker is queried/called
+# for this client_order_id/operation_id -- may fire even when the order
+# turns out to already exist, since the query itself is what
+# "SUBMITTING" durably guards against a crash during) or
+# `"BROKER_ACKNOWLEDGED"` (called AFTER that query/call resolves
+# successfully, `order` is the real `Order` when one exists).
 # Never called on a raised exception -- the exception propagates uncaught
 # exactly as before this parameter existed; a SUBMITTING-with-no-following-
 # BROKER_ACKNOWLEDGED journal entry left behind by a real crash is exactly
@@ -378,14 +398,54 @@ def _order_status_str(order: Order) -> str:
 # `None` (the default, every call site in this file that does not pass one
 # explicitly) means "no journal integration" -- zero behavior change for
 # any caller that does not opt in.
+#
+# `client_order_id` vs `operation_id`: a real order submission
+# (ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL/PROTECTIVE_STOP) always has
+# a `client_order_id` and leaves `operation_id` `None`. A CANCEL has no
+# client_order_id of its own (Alpaca's cancel API doesn't take/generate
+# one) -- it passes `client_order_id=""` and a real `operation_id`
+# instead (see `_deterministic_operation_id`). A caller must check which
+# one is populated, never assume `client_order_id` alone identifies the
+# call.
+#
+# `side`/`order_type`/`quantity`/`notional`/`stop_price`/`parent_order_id`
+# -- the real order attributes, passed through so a hook building a
+# durable journal entry (see `run_control_arm_decision._order_intent_hook_for_run`)
+# has everything needed to create one JUST-IN-TIME, right before this
+# call, for an action kind (PROTECTIVE_STOP, CANCEL_PROTECTIVE_STOP)
+# that -- unlike ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL -- is decided
+# reactively, mid-run, with no pre-run "blind" candidate to have already
+# journaled these values ahead of time. `parent_order_id` is the
+# immutable id of the order this action protects/targets (the ENTRY
+# fill a PROTECTIVE_STOP defends, or the resting stop a
+# CANCEL_PROTECTIVE_STOP targets) -- the same anchor
+# `_reconcile_pending_equity_orders`'s own protective-stop keying
+# already uses, never a date.
 OrderIntentHook = Callable[..., None]
 
 
 def _call_order_intent_hook(
-    hook: OrderIntentHook | None, phase: str, *, ticker: str, action_kind: str, client_order_id: str, order=None
+    hook: OrderIntentHook | None,
+    phase: str,
+    *,
+    ticker: str,
+    action_kind: str,
+    client_order_id: str = "",
+    order=None,
+    operation_id: str | None = None,
+    side: str | None = None,
+    order_type: str | None = None,
+    quantity: float | None = None,
+    notional: float | None = None,
+    stop_price: float | None = None,
+    parent_order_id: str | None = None,
 ) -> None:
     if hook is not None:
-        hook(phase, ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order)
+        hook(
+            phase, ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order,
+            operation_id=operation_id, side=side, order_type=order_type, quantity=quantity,
+            notional=notional, stop_price=stop_price, parent_order_id=parent_order_id,
+        )
 
 
 def _resolve_or_submit_order(
@@ -397,6 +457,12 @@ def _resolve_or_submit_order(
     ticker: str = "",
     action_kind: str = "",
     authorization: AuthorizedExecutionContext | None = None,
+    side: str | None = None,
+    order_type: str | None = None,
+    quantity: float | None = None,
+    notional: float | None = None,
+    stop_price: float | None = None,
+    parent_order_id: str | None = None,
 ) -> tuple[Order, bool]:
     """The actual fix: check the broker BEFORE calling `submit`, via
     `order_submission.get_order_by_client_order_id` (a plain,
@@ -416,6 +482,13 @@ def _resolve_or_submit_order(
     window (the one this hook exists to narrow) has closed by the time
     either return path is reached.
 
+    `side`/`order_type`/`quantity`/`notional`/`stop_price`/`parent_order_id`
+    (added 2026-08-22, Task 3) -- passed straight through to the hook,
+    unused by this function itself; see `OrderIntentHook`'s own
+    module-level comment for why a hook building a just-in-time journal
+    entry (PROTECTIVE_STOP has no pre-run "blind" candidate) needs
+    these.
+
     `authorization` -- independent audit finding "Madde E" (2026-08-22):
     this is EVERY real order's shared choke point (entry BUY, protective
     stop, equity signal-exit SELL, crypto entry BUY all funnel through
@@ -425,22 +498,34 @@ def _resolve_or_submit_order(
     still refused here, before any broker call. See
     `src.live.authorized_execution_context`'s own module docstring for
     the full design and why this is scoped to the bare-call bypass, not
-    to `run_daily_decision.py`'s own `main()`."""
+    to `run_daily_decision.py`'s own `main()`. (Task 3's own "hook
+    required in control-arm real-order mode" fail-closed check
+    deliberately does NOT live here -- see
+    `run_control_arm_decision.py`'s own preflight for why putting it in
+    this shared, caller-agnostic function would have broken the live
+    system's own `main()`, which self-authorizes but never supplies a
+    hook.)"""
     require_authorized_execution_context(authorization, action_description=f"Submitting order ({action_kind} {ticker})")
     _call_order_intent_hook(
-        order_intent_hook, "SUBMITTING", ticker=ticker, action_kind=action_kind, client_order_id=client_order_id
+        order_intent_hook, "SUBMITTING", ticker=ticker, action_kind=action_kind, client_order_id=client_order_id,
+        side=side, order_type=order_type, quantity=quantity, notional=notional, stop_price=stop_price,
+        parent_order_id=parent_order_id,
     )
     existing = order_submission.get_order_by_client_order_id(client, client_order_id)
     if existing is not None:
         _call_order_intent_hook(
             order_intent_hook, "BROKER_ACKNOWLEDGED",
             ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=existing,
+            side=side, order_type=order_type, quantity=quantity, notional=notional, stop_price=stop_price,
+            parent_order_id=parent_order_id,
         )
         return existing, True
     order = submit()
     _call_order_intent_hook(
         order_intent_hook, "BROKER_ACKNOWLEDGED",
         ticker=ticker, action_kind=action_kind, client_order_id=client_order_id, order=order,
+        side=side, order_type=order_type, quantity=quantity, notional=notional, stop_price=stop_price,
+        parent_order_id=parent_order_id,
     )
     return order, False
 
@@ -638,6 +723,11 @@ def _reconcile_pending_equity_orders(
                         ticker=ticker,
                         action_kind="PROTECTIVE_STOP",
                         authorization=authorization,
+                        side="SELL",
+                        order_type="stop",
+                        quantity=position.quantity,
+                        stop_price=position.stop_loss_price,
+                        parent_order_id=record["order_id"],
                     )
                     stop_record = {
                         "order_id": str(stop_order.id),
@@ -743,6 +833,11 @@ def _execute_equity_orders(
                     ticker=ticker,
                     action_kind="PROTECTIVE_STOP",
                     authorization=authorization,
+                    side="SELL",
+                    order_type="stop",
+                    quantity=position.quantity,
+                    stop_price=position.stop_loss_price,
+                    parent_order_id=record["order_id"],
                 )
                 stop_record = {
                     "order_id": str(stop_order.id),
@@ -816,7 +911,30 @@ def _execute_equity_orders(
                 require_authorized_execution_context(
                     authorization, action_description=f"Canceling protective stop ({trade.ticker})"
                 )
+                # Task 3 (2026-08-22): a CANCEL has no client_order_id
+                # of its own (Alpaca's cancel API takes/generates none)
+                # -- durable journal coverage uses `operation_id`
+                # instead (see `_deterministic_operation_id` and
+                # `OrderIntentHook`'s own module-level comment). Does
+                # not go through `_resolve_or_submit_order` (a cancel
+                # has no "does it already exist" broker query the way
+                # a submission does) -- hook calls inlined here, same
+                # discipline as the crypto signal-exit's own bespoke
+                # inline path.
+                cancel_operation_id = _deterministic_operation_id(
+                    trade.ticker, "CANCEL_PROTECTIVE_STOP", stop_order_id
+                )
+                _call_order_intent_hook(
+                    order_intent_hook, "SUBMITTING", ticker=trade.ticker, action_kind="CANCEL_PROTECTIVE_STOP",
+                    operation_id=cancel_operation_id, side="SELL", order_type="stop",
+                    parent_order_id=stop_order_id,
+                )
                 cancel_status = order_submission.cancel_order_and_confirm(client, stop_order_id)
+                _call_order_intent_hook(
+                    order_intent_hook, "BROKER_ACKNOWLEDGED", ticker=trade.ticker,
+                    action_kind="CANCEL_PROTECTIVE_STOP", operation_id=cancel_operation_id,
+                    side="SELL", order_type="stop", parent_order_id=stop_order_id,
+                )
                 cancel_record = {
                     "order_id": stop_order_id,
                     "status": cancel_status,

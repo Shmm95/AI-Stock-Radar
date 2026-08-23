@@ -576,7 +576,7 @@ def test_order_intent_hook_fires_submitting_before_and_acknowledged_after(monkey
 
     hook_events: list[tuple] = []
 
-    def hook(phase, *, ticker, action_kind, client_order_id, order=None):
+    def hook(phase, *, ticker, action_kind, client_order_id, order=None, **_extra_hook_kwargs):
         calls.append(phase)
         hook_events.append((phase, ticker, action_kind, client_order_id, order))
 
@@ -632,7 +632,7 @@ def test_order_intent_hook_fires_even_when_order_already_existed(monkeypatch: py
 
     hook_phases: list[str] = []
 
-    def hook(phase, *, ticker, action_kind, client_order_id, order=None):
+    def hook(phase, *, ticker, action_kind, client_order_id, order=None, **_extra_hook_kwargs):
         if action_kind == "ENTRY_MARKET_BUY":
             hook_phases.append(phase)
 
@@ -645,3 +645,97 @@ def test_order_intent_hook_fires_even_when_order_already_existed(monkeypatch: py
     )
 
     assert hook_phases == ["SUBMITTING", "BROKER_ACKNOWLEDGED"]
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (2026-08-22): CANCEL_STOP journal coverage -- previously had NO
+# hook wiring at all (confirmed by grep before this fix: no
+# _call_order_intent_hook call anywhere near the cancel_order_and_confirm
+# call site).
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_stop_hook_fires_submitting_before_cancel_call(monkeypatch: pytest.MonkeyPatch):
+    """REAL GAP CLOSED (Task 3): 'the cancel method cannot be reached
+    without the intent being written' -- proves SUBMITTING fires
+    (durable journal evidence written) strictly BEFORE
+    cancel_order_and_confirm is called, using a fake cancel function
+    that raises if called before SUBMITTING was recorded -- the same
+    crash-window ordering proof already used for entry BUY."""
+    calls: list[str] = []
+
+    def recording_cancel(client, order_id):
+        assert calls == ["SUBMITTING"], f"cancel_order_and_confirm called before SUBMITTING was recorded: {calls}"
+        calls.append("CANCEL_CALLED")
+        return "canceled"
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("exit-1"))
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "cancel_order_and_confirm", recording_cancel)
+
+    hook_events: list[tuple] = []
+
+    def hook(phase, *, ticker, action_kind, client_order_id="", order=None, operation_id=None, **_extra):
+        if action_kind == "CANCEL_PROTECTIVE_STOP":
+            calls.append(phase)
+            hook_events.append((phase, ticker, action_kind, operation_id, order))
+
+    state = LiveRunnerState(equity_stop_orders={"AAPL": "stop-1"})
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-15",
+        newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        order_intent_hook=hook, authorization=runner.authorize_order_execution(),
+    )
+
+    assert [e[0] for e in hook_events] == ["SUBMITTING", "BROKER_ACKNOWLEDGED"]
+    # Same operation_id both times -- the journal correlates SUBMITTING
+    # and BROKER_ACKNOWLEDGED to the SAME intent, not two divergent ones.
+    assert hook_events[0][3] == hook_events[1][3]
+    assert hook_events[0][3] is not None  # a real operation_id was built, not left None
+
+
+def test_cancel_stop_hook_is_none_by_default_zero_behavior_change(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("exit-1"))
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "cancel_order_and_confirm", lambda client, order_id: "canceled")
+
+    state = LiveRunnerState(equity_stop_orders={"AAPL": "stop-1"})
+    actions, review = runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-15",
+        newly_opened={}, closed_trades=[equity_trade(exit_reason="EXIT_SIGNAL_NEXT_OPEN")],
+        authorization=runner.authorize_order_execution(),
+    )
+    assert review == []
+    assert "AAPL" not in state.equity_stop_orders
+
+
+def test_protective_stop_hook_carries_parent_order_id_and_quantity(monkeypatch: pytest.MonkeyPatch):
+    """Task 3 item 3: 'canonical idempotency key parent_entry_order_id
+    olmalı; tarih değil' -- proves the hook actually receives the real
+    parent entry order id and quantity/stop_price, not just a bare
+    action_kind/ticker."""
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(order_submission, "submit_equity_market_order", lambda *a, **k: FakeOrder("entry-1"))
+    monkeypatch.setattr(order_submission, "wait_for_fill_or_timeout", lambda *a, **k: "filled")
+    monkeypatch.setattr(order_submission, "submit_equity_stop_sell", lambda *a, **k: FakeOrder("stop-1"))
+
+    captured: dict = {}
+
+    def hook(phase, *, ticker, action_kind, client_order_id="", order=None, parent_order_id=None,
+             quantity=None, stop_price=None, side=None, **_extra):
+        if action_kind == "PROTECTIVE_STOP" and phase == "SUBMITTING":
+            captured.update(parent_order_id=parent_order_id, quantity=quantity, stop_price=stop_price, side=side)
+
+    state = LiveRunnerState()
+    runner._execute_equity_orders(
+        client=None, runner_state=state, equity_date="2026-08-14",
+        newly_opened={"AAPL": equity_position()}, closed_trades=[],
+        order_intent_hook=hook, authorization=runner.authorize_order_execution(),
+    )
+
+    assert captured["parent_order_id"] == "entry-1"  # the real parent ENTRY order's own id, not a date
+    assert captured["quantity"] == 10.0
+    assert captured["stop_price"] == 180.5
+    assert captured["side"] == "SELL"

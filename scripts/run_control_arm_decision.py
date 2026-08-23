@@ -269,6 +269,7 @@ import src.live.broker_reconciliation as broker_reconciliation
 import src.live.healthchecks_ping as healthchecks_ping
 import src.live.issuer_identity_preflight as issuer_identity_preflight
 import src.live.order_intent as order_intent
+import src.live.order_intent_reconciliation as order_intent_reconciliation
 import src.live.pending_signal_ttl as pending_signal_ttl
 from src.live.authorized_execution_context import authorize_order_execution
 from src.live.control_universe import CONTROL_UNIVERSE_TICKERS
@@ -725,13 +726,31 @@ def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) ->
 
     `blind_intents` is the SAME list `_write_blind_prepared_intents`
     already wrote before this run's `rdd.run_daily_decision()` call,
-    keyed here by `client_order_id` for lookup. A hook call for a
-    `client_order_id` with no matching blind intent (e.g.
-    `PROTECTIVE_STOP`, never pre-journaled -- only `pending_buys`/
-    `pending_exits` are) is a silent no-op, not an error -- not every
-    real broker call this hook fires around has a corresponding pre-run
-    journal entry, and creating one on the fly here would defeat the
-    whole "durable BEFORE the call" point.
+    keyed here by `client_order_id` for lookup -- covers
+    `ENTRY_MARKET_BUY`/`SIGNAL_EXIT_MARKET_SELL`, the two action kinds
+    that have a pre-run "blind" candidate (`pending_buys`/`pending_exits`).
+
+    `PROTECTIVE_STOP`/`CANCEL_PROTECTIVE_STOP` (Task 3, 2026-08-22, closing
+    the real gap the ORIGINAL version of this docstring's own "silent
+    no-op" wording described): unlike a BUY/EXIT, these are decided
+    REACTIVELY mid-run (a stop is only placed once its entry fill
+    confirms; a cancel is only decided once a signal-exit needs to sell
+    through it) -- there is no pre-run candidate to have blind-journaled
+    ahead of time. For these two, this hook creates a REAL PREPARED
+    intent itself, JUST-IN-TIME, using the real quantity/stop_price/
+    parent_order_id/operation_id the caller now passes (see
+    `OrderIntentHook`'s own module-level comment in run_daily_decision.py)
+    -- still durably on disk BEFORE the broker call, the same guarantee
+    the blind-pre-journaled path provides, just created one step later in
+    time because that is the earliest point this information exists.
+    `PROTECTIVE_STOP` is keyed by `client_order_id` (it submits a real
+    order, same as BUY/EXIT); `CANCEL_PROTECTIVE_STOP` has none and is
+    keyed by `operation_id` instead (`OrderIntent.operation_id`/
+    `target_broker_order_id` -- see that dataclass's own field comments).
+
+    An unrecognized `action_kind` raises `RuntimeError` -- fail-closed,
+    never a silent pass-through for a future action kind this hook does
+    not yet know how to journal.
 
     Inert today: `_guard_against_premature_order_activation` blocks
     `--enable-equity-orders`/`--enable-crypto-orders` entirely (see that
@@ -744,19 +763,117 @@ def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) ->
     blind_by_client_order_id: dict[str, order_intent.OrderIntent] = {
         intent.client_order_id: intent for intent in blind_intents
     }
+    # Just-in-time intents THIS hook creates itself, for the two action
+    # kinds with no pre-run blind candidate -- keyed by client_order_id
+    # (PROTECTIVE_STOP) or operation_id (CANCEL_PROTECTIVE_STOP), never
+    # mixed with `blind_by_client_order_id` above (a different dict, so
+    # a real client_order_id collision between the two action families
+    # is structurally impossible even in principle).
+    just_in_time_by_key: dict[str, order_intent.OrderIntent] = {}
 
-    def hook(phase: str, *, ticker: str, action_kind: str, client_order_id: str, order=None) -> None:
-        intent = blind_by_client_order_id.get(client_order_id)
-        if intent is None:
-            return  # no pre-run journal entry for this call (e.g. PROTECTIVE_STOP) -- nothing to transition
+    _KNOWN_ACTION_KINDS = frozenset(
+        {"ENTRY_MARKET_BUY", "SIGNAL_EXIT_MARKET_SELL", "PROTECTIVE_STOP", "CANCEL_PROTECTIVE_STOP"}
+    )
+
+    def _find_or_create_just_in_time_intent(
+        *, key: str, ticker: str, action_kind: str, client_order_id: str, operation_id: str | None,
+        side: str | None, order_type: str | None, quantity: float | None, notional: float | None,
+        stop_price: float | None, parent_order_id: str | None,
+    ) -> order_intent.OrderIntent:
+        existing = just_in_time_by_key.get(key)
+        if existing is not None:
+            return existing
+        # Also check disk directly -- a crash-restart within the same
+        # calendar run could have already durably written this exact
+        # intent (same deterministic key) on a prior, interrupted attempt;
+        # reuse it rather than creating a second, divergent one. Accepts
+        # PREPARED *or* SUBMITTING (unlike `_write_blind_prepared_intents`'s
+        # own blind-candidate resume, which only accepts PREPARED and
+        # fails closed on anything further along): that function runs
+        # BEFORE rdd.run_daily_decision() even starts, so finding
+        # anything past PREPARED there means an earlier, more serious
+        # crash needing human review. This hook instead fires DURING the
+        # real broker call itself -- finding a leftover SUBMITTING
+        # record here means a prior attempt (this run or an interrupted
+        # one) got as far as querying/calling the broker but never
+        # recorded the result; it is still safe to resume, because the
+        # REAL protection against a duplicate submission is
+        # `_resolve_or_submit_order`'s own broker-authoritative query by
+        # client_order_id (always run before any real submit call,
+        # tested separately) -- this journal-level reuse only avoids a
+        # second, divergent LOCAL record, it is not itself the safety
+        # mechanism against a real duplicate order.
+        found = (
+            order_intent.find_intent_by_client_order_id(client_order_id)
+            if action_kind == "PROTECTIVE_STOP"
+            else order_intent.find_intent_by_operation_id(operation_id) if operation_id else None
+        )
+        if found is not None and found.status in (order_intent.PREPARED, order_intent.SUBMITTING):
+            just_in_time_by_key[key] = found
+            return found
+        created = order_intent.create_intent(
+            client_order_id=client_order_id,
+            account_identity=ACCOUNT_IDENTITY,
+            ticker=ticker,
+            side=side or "",
+            order_type=order_type or "",
+            action_kind=action_kind,
+            source_signal_timestamp=datetime.now(timezone.utc).isoformat(),
+            quantity=quantity,
+            notional=notional,
+            stop_price=stop_price,
+            parent_intent_id=None,
+            operation_id=operation_id,
+            target_broker_order_id=parent_order_id if action_kind == "CANCEL_PROTECTIVE_STOP" else None,
+        )
+        just_in_time_by_key[key] = created
+        print(
+            f"[CONTROL] Just-in-time intent {created.intent_id} ({ticker} {action_kind}): "
+            f"PREPARED (created immediately before this broker call, key={key!r})."
+        )
+        return created
+
+    def hook(
+        phase: str, *, ticker: str, action_kind: str, client_order_id: str = "", order=None,
+        operation_id: str | None = None, side: str | None = None, order_type: str | None = None,
+        quantity: float | None = None, notional: float | None = None, stop_price: float | None = None,
+        parent_order_id: str | None = None,
+    ) -> None:
+        if action_kind not in _KNOWN_ACTION_KINDS:
+            raise RuntimeError(
+                f"order_intent_hook received an unrecognized action_kind {action_kind!r} "
+                f"(ticker={ticker!r}) -- refusing to silently skip journaling it. Fail-closed; "
+                f"add it to _KNOWN_ACTION_KINDS only after deciding how it should be journaled."
+            )
+
+        if action_kind in ("ENTRY_MARKET_BUY", "SIGNAL_EXIT_MARKET_SELL"):
+            intent = blind_by_client_order_id.get(client_order_id)
+            if intent is None:
+                return  # e.g. a candidate that only appeared this run with no prior pending state
+            key = client_order_id
+            store = blind_by_client_order_id
+        else:
+            key = client_order_id if action_kind == "PROTECTIVE_STOP" else (operation_id or "")
+            if phase == "SUBMITTING":
+                intent = _find_or_create_just_in_time_intent(
+                    key=key, ticker=ticker, action_kind=action_kind, client_order_id=client_order_id,
+                    operation_id=operation_id, side=side, order_type=order_type, quantity=quantity,
+                    notional=notional, stop_price=stop_price, parent_order_id=parent_order_id,
+                )
+            else:
+                intent = just_in_time_by_key.get(key)
+                if intent is None:
+                    return  # SUBMITTING was never recorded for this key -- nothing to acknowledge
+            store = just_in_time_by_key
+
         if phase == "SUBMITTING":
             if intent.status != order_intent.PREPARED:
                 return  # already advanced (e.g. a retry within the same run) -- do not re-transition
             intent = order_intent.transition_intent(intent, order_intent.SUBMITTING, increment_attempt=True)
-            blind_by_client_order_id[client_order_id] = intent
+            store[key] = intent
             print(
                 f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): PREPARED -> "
-                f"SUBMITTING (real broker call about to start, client_order_id={client_order_id!r})."
+                f"SUBMITTING (real broker call about to start, key={key!r})."
             )
         elif phase == "BROKER_ACKNOWLEDGED":
             if intent.status != order_intent.SUBMITTING:
@@ -766,13 +883,24 @@ def _order_intent_hook_for_run(blind_intents: list[order_intent.OrderIntent]) ->
                 broker_order_id=str(order.id) if order is not None else None,
                 broker_status=rdd._order_status_str(order) if order is not None else None,
             )
-            blind_by_client_order_id[client_order_id] = intent
+            store[key] = intent
             print(
                 f"[CONTROL] Intent {intent.intent_id} ({ticker} {action_kind}): SUBMITTING -> "
                 f"BROKER_ACKNOWLEDGED (real broker order_id={intent.broker_order_id!r}, "
                 f"status={intent.broker_status!r})."
             )
 
+    # Exposed as a plain function attribute (not a second return value)
+    # so this hook's own call signature/assignment at the call site stays
+    # a single `order_intent_hook=_order_intent_hook_for_run(blind_intents)`
+    # -- the caller reads `hook.just_in_time_intents.values()` AFTER
+    # rdd.run_daily_decision() returns, to fold PROTECTIVE_STOP/
+    # CANCEL_PROTECTIVE_STOP intents into the same COMMITTED/TERMINAL
+    # finalization loop `_run_intent_protocol`'s own return value already
+    # goes through -- these are never included in that function's own
+    # return value (it only ever knows about ENTRY_MARKET_BUY/
+    # SIGNAL_EXIT_MARKET_SELL).
+    hook.just_in_time_intents = just_in_time_by_key
     return hook
 
 
@@ -1378,6 +1506,52 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     f"SEC cache age={issuer_identity_result.sec_data_age_days}."
                 )
 
+                # PHASE 1.5 (Task 3, 2026-08-22, item 6): post-crash
+                # order-intent recovery -- BEFORE broker reconciliation's
+                # own snapshot below, using the SAME already-resolved
+                # reconciliation_client (one real TradingClient for this
+                # whole run, same discipline as every other call here).
+                # Resolves any stray PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/
+                # UNCERTAIN intent a PRIOR, interrupted run left behind
+                # against the real broker -- never auto-resubmits, never
+                # auto-retries a cancel (see
+                # order_intent_reconciliation.py's own module docstring
+                # for the full resolution table). A BROKER_ACKNOWLEDGED
+                # result is deliberately left as-is here, not blocked --
+                # "broker acknowledged, local state not yet caught up" is
+                # exactly what Phase 2a's own reconciliation call (see
+                # broker_reconciliation's own Scenario C, immediately
+                # below) already resolves; this phase does not
+                # reimplement that. Anything still
+                # UNCERTAIN (or otherwise non-terminal, which should be
+                # structurally impossible given the resolution functions'
+                # own contracts) blocks this run entirely, fail-closed --
+                # human review required before proceeding.
+                stray_intents = order_intent_reconciliation.find_stray_session_intents_from_prior_run()
+                if stray_intents:
+                    print(
+                        f"[CONTROL] Found {len(stray_intents)} stray order-intent(s) from a "
+                        f"prior run -- resolving against the broker before proceeding."
+                    )
+                    unresolved_stray_intents: list[order_intent.OrderIntent] = []
+                    for stray in stray_intents:
+                        resolved = order_intent_reconciliation.resolve_stray_intent(reconciliation_client, stray)
+                        print(
+                            f"[CONTROL] Stray intent {resolved.intent_id} ({resolved.ticker} "
+                            f"{resolved.action_kind}): {stray.status} -> {resolved.status}"
+                        )
+                        if resolved.status not in (
+                            order_intent.COMMITTED, order_intent.TERMINAL, order_intent.BROKER_ACKNOWLEDGED,
+                        ):
+                            unresolved_stray_intents.append(resolved)
+                    if unresolved_stray_intents:
+                        raise RuntimeError(
+                            f"{len(unresolved_stray_intents)} stray order-intent(s) from a prior run "
+                            f"remain unresolved (UNCERTAIN) after broker-authoritative recovery -- "
+                            f"refusing to proceed. Human review required: "
+                            f"{[(i.intent_id, i.ticker, i.action_kind, i.status) for i in unresolved_stray_intents]}"
+                        )
+
                 # PHASE 2a: broker-vs-local reconciliation, BEFORE any
                 # market-data fetch or decision computation. Account
                 # identity check, then a consistency-verified broker
@@ -1568,6 +1742,31 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     else None
                 )
 
+                # Task 3 (2026-08-22): "hook required in control-arm's own
+                # real-order mode" fail-closed check -- deliberately placed
+                # HERE, in this file's own preflight, never inside
+                # run_daily_decision.py's shared functions. Those functions
+                # are caller-agnostic by design and are also called by the
+                # LIVE system's own main() (see authorized_execution_context's
+                # module docstring: main() self-authorizes but never
+                # supplies an order_intent_hook -- order_intent.py is
+                # control-arm-only). A check keyed only on
+                # `authorization is not None` inside a shared function would
+                # therefore have raised on the live cron's very first real
+                # order submission. This assertion is currently a pure
+                # defense-in-depth measure -- the hook below is already
+                # always built and passed regardless of the flags -- guarding
+                # against a future refactor of this call site silently
+                # dropping the `order_intent_hook=` kwarg while order-enabling
+                # flags stay set.
+                real_order_intent_hook = _order_intent_hook_for_run(blind_intents)
+                if authorization is not None and real_order_intent_hook is None:
+                    raise RuntimeError(
+                        "Real order submission is authorized (an order-enabling flag is "
+                        "set) but no order_intent_hook was built -- refusing to proceed "
+                        "without durable write-ahead journal coverage. Fail-closed."
+                    )
+
                 result = rdd.run_daily_decision(
                     state_path=arguments.state_path,
                     decision_log_directory=arguments.decision_log_directory,
@@ -1594,7 +1793,7 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     # _guard_against_premature_order_activation), wired
                     # now so it is already correct and tested once real
                     # orders are ever enabled.
-                    order_intent_hook=_order_intent_hook_for_run(blind_intents),
+                    order_intent_hook=real_order_intent_hook,
                 )
 
                 decision = result["decision"]
@@ -1685,7 +1884,27 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                 # Intents committed only AFTER state has actually been
                 # durably re-saved above -- COMMITTED is meant to mean
                 # "local state reflects this," not merely "we decided to."
-                for intent in intents:
+                #
+                # Task 3 (2026-08-22): folds in the PROTECTIVE_STOP/
+                # CANCEL_PROTECTIVE_STOP just-in-time intents the hook
+                # created during this same run (never returned by
+                # _run_intent_protocol itself -- that function only knows
+                # about ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL) so they
+                # go through the exact same COMMITTED/TERMINAL finalization,
+                # not a second, divergent code path.
+                #
+                # Also closes a real, pre-existing gap this same review
+                # found (not new in scope, but fixed here since it's the
+                # same loop): COMMITTED was previously a dead end in
+                # practice -- nothing ever transitioned a run's own
+                # COMMITTED intents to TERMINAL, even though
+                # order_intent.py's own _VALID_TRANSITIONS has always
+                # allowed it (COMMITTED -> TERMINAL, the only valid next
+                # state). A successful run's own intents now close out
+                # TERMINAL too -- applies uniformly to every intent this
+                # run touches, not only the new stop/cancel ones.
+                all_run_intents = list(intents) + list(getattr(real_order_intent_hook, "just_in_time_intents", {}).values())
+                for intent in all_run_intents:
                     # Abandoned "blind" guesses (see _run_intent_protocol's
                     # own docstring) are already TERMINAL by this point --
                     # TERMINAL has no further valid transition (see
@@ -1695,8 +1914,10 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     # (BROKER_ACKNOWLEDGED) intents commit.
                     if intent.status != order_intent.BROKER_ACKNOWLEDGED:
                         continue
-                    order_intent.transition_intent(intent, order_intent.COMMITTED)
-                    print(f"[CONTROL] Intent {intent.intent_id} ({intent.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
+                    committed = order_intent.transition_intent(intent, order_intent.COMMITTED)
+                    print(f"[CONTROL] Intent {committed.intent_id} ({committed.ticker}): BROKER_ACKNOWLEDGED -> COMMITTED")
+                    terminal = order_intent.transition_intent(committed, order_intent.TERMINAL)
+                    print(f"[CONTROL] Intent {terminal.intent_id} ({terminal.ticker}): COMMITTED -> TERMINAL (run finished successfully)")
 
                 telegram_all_ok &= _notify_and_warn(rdd._build_daily_notification_text(decision))
                 # `with single_instance_lock(...)` releases the lock here,

@@ -134,6 +134,22 @@ class OrderIntent:
     attempt_count: int = 0
     pre_state_hash: str | None = None
     last_error: str | None = None
+    # Added 2026-08-22 (Task 3 -- protective-stop/cancel journal
+    # coverage): `client_order_id` is meaningless for a CANCEL -- Alpaca's
+    # cancel API takes a broker order id, never generates or accepts a
+    # client_order_id of its own. `operation_id` is this journal's own
+    # LOCAL-only deterministic correlation key for a non-order-submission
+    # action (today: only CANCEL_PROTECTIVE_STOP), built by
+    # `run_daily_decision._deterministic_operation_id` -- never sent to
+    # the broker, never compared against anything broker-side.
+    # `target_broker_order_id` is the id of the REST-ING order a cancel
+    # intent targets (e.g. the protective stop being canceled) -- distinct
+    # from `broker_order_id` above, which (once set) is the id of the
+    # cancel CONFIRMATION itself. A submission-type intent leaves both
+    # of these `None`; a cancel-type intent leaves `client_order_id`
+    # empty/unused and populates these two instead.
+    operation_id: str | None = None
+    target_broker_order_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -169,10 +185,18 @@ def create_intent(
     stop_price: float | None = None,
     parent_intent_id: str | None = None,
     pre_state_hash: str | None = None,
+    operation_id: str | None = None,
+    target_broker_order_id: str | None = None,
 ) -> OrderIntent:
     """Durably record a new intent in PREPARED state BEFORE any broker
     call is attempted. `intent_id` is generated here, once, and is what
-    the rest of this intent's lifecycle is addressed by."""
+    the rest of this intent's lifecycle is addressed by.
+
+    `operation_id`/`target_broker_order_id` -- see `OrderIntent`'s own
+    field comments (added 2026-08-22, Task 3). For a real order
+    submission, leave both `None` and pass `client_order_id` as usual.
+    For a CANCEL (no client_order_id exists), pass `client_order_id=""`
+    and supply both of these instead."""
     intent = OrderIntent(
         intent_id=str(uuid.uuid4()),
         client_order_id=client_order_id,
@@ -188,6 +212,8 @@ def create_intent(
         parent_intent_id=parent_intent_id,
         status=PREPARED,
         pre_state_hash=pre_state_hash,
+        operation_id=operation_id,
+        target_broker_order_id=target_broker_order_id,
     )
     _write_intent(intent)
     return intent
@@ -234,6 +260,19 @@ def find_intent_by_client_order_id(client_order_id: str) -> OrderIntent | None:
     local one is the CALLER's job, not this function's."""
     for intent in list_intents():
         if intent.client_order_id == client_order_id:
+            return intent
+    return None
+
+
+def find_intent_by_operation_id(operation_id: str) -> OrderIntent | None:
+    """The cancel-intent counterpart to `find_intent_by_client_order_id`
+    above -- see `OrderIntent.operation_id`'s own field comment (added
+    2026-08-22, Task 3) for why a CANCEL needs a separate correlation
+    key (Alpaca's cancel API has no client_order_id of its own to key
+    off). LOCAL lookup only, same as the sibling function -- makes no
+    Alpaca call itself."""
+    for intent in list_intents():
+        if intent.operation_id == operation_id:
             return intent
     return None
 

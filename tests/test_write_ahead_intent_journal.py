@@ -387,3 +387,147 @@ def test_real_runtime_gate_is_a_no_op_when_no_order_flag_is_set():
     runner_state.pending_buys["NEVR"] = _pending_buy("NEVR")  # no evidence written
     args = SimpleNamespace(enable_equity_orders=False, enable_crypto_orders=False)
     carm._verify_write_ahead_evidence_before_broker_call(runner_state, "2026-08-17", args)  # must not raise
+
+
+# --- Task 3 (2026-08-22), item 3/4: PROTECTIVE_STOP/CANCEL_PROTECTIVE_STOP
+# just-in-time journaling via _order_intent_hook_for_run ---
+
+
+def test_protective_stop_hook_creates_prepared_intent_before_submitting_on_disk():
+    """REAL GAP CLOSED (Task 3): before this fix, _order_intent_hook_for_run
+    silently no-op'd for PROTECTIVE_STOP (no pre-run blind candidate
+    exists for it) -- a real stop-placement broker call could crash with
+    ZERO durable evidence. Proves the hook now creates a real PREPARED
+    intent on disk BEFORE the broker call, exactly the crash-window
+    guarantee this whole mechanism exists to provide."""
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1",
+        side="SELL", order_type="stop", quantity=5.0, stop_price=70.0,
+        parent_order_id="entry-order-1",
+    )
+    intents_on_disk = order_intent.list_intents()
+    assert len(intents_on_disk) == 1
+    on_disk = intents_on_disk[0]
+    assert on_disk.status == order_intent.SUBMITTING  # already advanced past PREPARED by this point
+    assert on_disk.ticker == "CEG"
+    assert on_disk.action_kind == "PROTECTIVE_STOP"
+    assert on_disk.quantity == 5.0
+    assert on_disk.stop_price == 70.0
+    assert on_disk.client_order_id == "CEG-PROTECTIVE-STOP-FOR-entry-order-1"
+
+
+def test_protective_stop_hook_acknowledges_with_real_broker_order_id():
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1",
+        side="SELL", order_type="stop", quantity=5.0, stop_price=70.0,
+        parent_order_id="entry-order-1",
+    )
+
+    class _FakeStopOrder:
+        id = "real-stop-order-1"
+        status = "new"
+
+    hook(
+        "BROKER_ACKNOWLEDGED", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1", order=_FakeStopOrder(),
+    )
+    on_disk = order_intent.list_intents()[0]
+    assert on_disk.status == order_intent.BROKER_ACKNOWLEDGED
+    assert on_disk.broker_order_id == "real-stop-order-1"
+
+
+def test_cancel_protective_stop_hook_creates_prepared_intent_keyed_by_operation_id():
+    """CANCEL has no client_order_id -- must be keyed/found by
+    operation_id instead (OrderIntent.operation_id/target_broker_order_id,
+    see that dataclass's own field comments)."""
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="CANCEL_PROTECTIVE_STOP",
+        operation_id="CEG-CANCEL-PROTECTIVE-STOP-resting-stop-1",
+        side="SELL", order_type="stop", parent_order_id="resting-stop-1",
+    )
+    on_disk = order_intent.list_intents()
+    assert len(on_disk) == 1
+    assert on_disk[0].operation_id == "CEG-CANCEL-PROTECTIVE-STOP-resting-stop-1"
+    assert on_disk[0].target_broker_order_id == "resting-stop-1"
+    assert on_disk[0].client_order_id == ""
+    assert on_disk[0].status == order_intent.SUBMITTING
+
+
+def test_unknown_action_kind_is_fail_closed_not_silently_skipped():
+    """REAL FAIL-CLOSED PROOF (Task 3): an action kind this hook does not
+    know how to journal must raise, never silently pass through
+    unjournaled."""
+    hook = carm._order_intent_hook_for_run([])
+    with pytest.raises(RuntimeError, match="unrecognized action_kind"):
+        hook("SUBMITTING", ticker="XYZ", action_kind="SOME_FUTURE_ACTION_KIND", client_order_id="XYZ-1")
+
+
+def test_just_in_time_intent_is_idempotently_reused_not_duplicated_on_retry():
+    """A crash between SUBMITTING and BROKER_ACKNOWLEDGED, followed by a
+    retry within the same run reaching this hook again for the exact
+    same client_order_id, must reuse the same on-disk PREPARED/SUBMITTING
+    intent -- never create a second, divergent one."""
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1",
+        side="SELL", order_type="stop", quantity=5.0, stop_price=70.0,
+        parent_order_id="entry-order-1",
+    )
+    assert len(order_intent.list_intents()) == 1
+    first_intent_id = order_intent.list_intents()[0].intent_id
+
+    # A SECOND hook instance -- simulating a fresh in-process retry that
+    # rebuilt its own just_in_time_by_key dict from scratch -- must find
+    # the SAME on-disk intent via find_intent_by_client_order_id, not
+    # create a new one.
+    second_hook = carm._order_intent_hook_for_run([])
+    second_hook(
+        "SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1",
+        side="SELL", order_type="stop", quantity=5.0, stop_price=70.0,
+        parent_order_id="entry-order-1",
+    )
+    all_intents = order_intent.list_intents()
+    assert len(all_intents) == 1
+    assert all_intents[0].intent_id == first_intent_id
+
+
+def test_just_in_time_intents_are_exposed_for_the_finalization_loop():
+    """_execute()'s own COMMITTED/TERMINAL finalization loop needs these
+    intents alongside _run_intent_protocol's own return value -- exposed
+    as a plain function attribute, not silently dropped."""
+    hook = carm._order_intent_hook_for_run([])
+    hook(
+        "SUBMITTING", ticker="CEG", action_kind="PROTECTIVE_STOP",
+        client_order_id="CEG-PROTECTIVE-STOP-FOR-entry-order-1",
+        side="SELL", order_type="stop", quantity=5.0, stop_price=70.0,
+        parent_order_id="entry-order-1",
+    )
+    assert hasattr(hook, "just_in_time_intents")
+    assert len(hook.just_in_time_intents) == 1
+
+
+def test_execute_finalization_loop_source_commits_then_terminates_all_run_intents():
+    """Real source-text check (same discipline as this codebase's other
+    drift-detection tests): confirms _execute()'s own finalization loop
+    genuinely folds in the hook's just_in_time_intents alongside
+    _run_intent_protocol's own return value, and transitions
+    BROKER_ACKNOWLEDGED -> COMMITTED -> TERMINAL for all of them --
+    closing the real, pre-existing gap where COMMITTED was previously a
+    dead end (nothing ever reached TERMINAL, even for ENTRY/EXIT
+    intents, despite order_intent.py's own _VALID_TRANSITIONS always
+    having allowed it)."""
+    import inspect
+
+    source = inspect.getsource(carm._execute)
+    loop_start = source.index("all_run_intents = list(intents)")
+    loop_text = source[loop_start:loop_start + 1200]
+    assert "just_in_time_intents" in loop_text
+    assert "order_intent.COMMITTED" in loop_text
+    assert "order_intent.TERMINAL" in loop_text
