@@ -587,20 +587,80 @@ def _hash_state_file(state_path: Path) -> str | None:
 
 class StrayPreparedIntentConflictError(RuntimeError):
     """Raised by `_write_blind_prepared_intents` when a candidate's
-    deterministic `client_order_id` already has an on-disk intent in a
-    NON-PREPARED, non-terminal status (SUBMITTING/BROKER_ACKNOWLEDGED/
-    UNCERTAIN) -- meaning a PRIOR run got further than this pre-write
-    step before crashing/exiting, or before this control arm's normal
-    end-of-run cleanup ran. This pre-write step only knows how to safely
-    resume from a leftover PREPARED intent (the idempotent
-    crash-before-`rdd.run_daily_decision()` case -- see the "crash
-    simulation" test in tests/test_run_control_arm_decision_guards.py);
-    anything further along needs real broker-side reconciliation, which
-    is explicitly out of scope here -- the same already-documented gap
-    as `broker_reconciliation.py`'s own docstring note that it does not
-    yet inspect `order_intent.list_intents()` either. Fail-closed rather
-    than silently creating a second, divergent intent for the same
-    `client_order_id`."""
+    deterministic `client_order_id` already has an on-disk intent in
+    status SUBMITTING/BROKER_ACKNOWLEDGED/COMMITTED/UNCERTAIN --
+    meaning a PRIOR run got further than this pre-write step before
+    crashing/exiting, or before this control arm's normal end-of-run
+    cleanup ran, and Phase 1.5's own stray-recovery (which runs before
+    this) did not (or could not) resolve it to something this step
+    knows how to handle.
+
+    CORRECTED DOCSTRING (reboot-drill finding #1, 2026-08-24): this
+    previously (incorrectly) claimed "non-terminal status" here while
+    the actual code ALSO raised for a plain TERMINAL record -- a real
+    documentation bug, not just an implementation one; the code itself
+    is what changed (TERMINAL is no longer a conflict at all, see
+    `_write_blind_prepared_intents`'s own updated docstring), and this
+    docstring is now accurate to what the code actually checks.
+
+    This pre-write step only knows how to safely resume from a leftover
+    PREPARED intent (the idempotent crash-before-`rdd.run_daily_decision()`
+    case -- see the "crash simulation" test in
+    tests/test_run_control_arm_decision_guards.py) or to ignore a
+    TERMINAL one (writing a fresh new intent instead, see
+    `_write_blind_prepared_intents`); anything else needs real
+    broker-side reconciliation, which Phase 1.5 (immediately before this
+    step) is responsible for -- reaching this error means Phase 1.5
+    itself did not run, or found something it could not resolve.
+    Fail-closed rather than silently creating a second, divergent intent
+    for the same `client_order_id`."""
+
+
+def _stray_intent_matches_live_candidate(intent: order_intent.OrderIntent, runner_state) -> bool:
+    """Reboot-drill finding #1 (2026-08-24): does THIS run still have a
+    live, EXACTLY matching candidate for a stray submission intent --
+    ticker, action_kind, client_order_id, account_identity, and side ALL
+    agree with a currently-queued `pending_buys`/`pending_exits` entry.
+    Used by Phase 1.5 to decide whether a confirmed-404-from-PREPARED
+    stray should be left RESUMABLE (reused by `_write_blind_prepared_intents`
+    below, exactly as if this were a plain crash-before-`rdd.run_daily_decision()`
+    case) rather than closed `ABANDONED_NO_SUBMISSION` -- see
+    `order_intent_reconciliation.resolve_stray_order_submission_intent`'s
+    own docstring for the full "why" this parameter exists.
+
+    Only ENTRY_MARKET_BUY/SIGNAL_EXIT_MARKET_SELL intents have a
+    "pending candidate" concept at all -- PROTECTIVE_STOP/
+    CANCEL_PROTECTIVE_STOP are decided reactively mid-run, never
+    pre-queued (see `_order_intent_hook_for_run`'s own docstring) --
+    `False` immediately for anything else.
+
+    `client_order_id` is re-derived from `intent.ticker`/`intent.action_kind`/
+    `intent.source_signal_timestamp` and compared against the intent's
+    own STORED `client_order_id`, rather than trusted blindly -- this is
+    what makes the match "exact" with respect to session date too: if
+    the intent was originally prepared for a DIFFERENT session than
+    today's real `expected_session_date`, `_write_blind_prepared_intents`
+    would compute a different id entirely for today's own candidate and
+    would never even look this intent up by that id in the first place,
+    so an intentionally-stale intent can never spuriously match here."""
+    if intent.action_kind == "ENTRY_MARKET_BUY":
+        pending = runner_state.pending_buys.get(intent.ticker)
+        expected_side = "BUY"
+    elif intent.action_kind == "SIGNAL_EXIT_MARKET_SELL":
+        pending = runner_state.pending_exits.get(intent.ticker)
+        expected_side = "SELL"
+    else:
+        return False
+    if pending is None:
+        return False
+    if intent.account_identity != ACCOUNT_IDENTITY:
+        return False
+    if intent.side != expected_side:
+        return False
+    recomputed_client_order_id = rdd.client_order_id_for_action(
+        intent.ticker, intent.action_kind, str(intent.source_signal_timestamp)
+    )
+    return recomputed_client_order_id == intent.client_order_id
 
 
 def _write_blind_prepared_intents(
@@ -644,10 +704,34 @@ def _write_blind_prepared_intents(
     `rdd.run_daily_decision()` being called): reuses it rather than
     creating a duplicate -- the candidate is still genuinely pending
     (never consumed), so the SAME client_order_id, SAME PREPARED intent
-    is still exactly correct. Raises `StrayPreparedIntentConflictError`
-    (fail-closed) if a leftover intent for that client_order_id exists
-    in any OTHER non-terminal status -- see that exception's own
-    docstring.
+    is still exactly correct.
+
+    A leftover TERMINAL intent for the SAME `client_order_id` is IGNORED
+    (reboot-drill finding #1, 2026-08-24, real bug fixed) -- never
+    raised on, never reused/mutated. `intent_id`, not `client_order_id`,
+    is this journal's own storage key, so multiple records legitimately
+    sharing one `client_order_id` is not a structural problem (e.g. an
+    earlier attempt genuinely completed or was abandoned
+    `ABANDONED_NO_SUBMISSION`, and THIS run's own candidate deserves its
+    own fresh PREPARED record, own `intent_id`, leaving the old TERMINAL
+    one on disk untouched as historical evidence). Before this fix, ANY
+    non-PREPARED status -- TERMINAL included, despite this function's
+    own now-corrected docstring previously claiming otherwise -- raised
+    `StrayPreparedIntentConflictError` here, which deadlocked a run
+    whenever Phase 1.5's own stray-recovery had (correctly, at the time)
+    closed a confirmed-404 PREPARED intent TERMINAL earlier in the SAME
+    run, for a candidate that was in fact still live. Confirmed via a
+    real, end-to-end reboot-drill reproduction. Phase 1.5's own
+    RESUMABLE_PREPARED fix (`_stray_intent_matches_live_candidate`) now
+    prevents that specific TERMINAL-with-a-live-candidate case from ever
+    happening in the first place -- this TERMINAL-ignoring fix is the
+    second, independent layer: this step must be robust to finding a
+    TERMINAL record regardless of why one exists.
+
+    Raises `StrayPreparedIntentConflictError` (fail-closed) if a
+    leftover intent for that client_order_id exists in status
+    SUBMITTING/BROKER_ACKNOWLEDGED/COMMITTED/UNCERTAIN -- see that
+    exception's own docstring.
     """
     candidates: list[tuple[str, str, object]] = []
     for ticker, pending in sorted(runner_state.pending_buys.items()):
@@ -676,7 +760,7 @@ def _write_blind_prepared_intents(
                 f"reused existing PREPARED intent left by an interrupted prior run "
                 f"(idempotent, same client_order_id)."
             )
-        elif existing is not None:
+        elif existing is not None and existing.status != order_intent.TERMINAL:
             raise StrayPreparedIntentConflictError(
                 f"{ticker} {action_kind}: an intent for client_order_id={client_order_id!r} "
                 f"already exists in status={existing.status!r} (intent_id={existing.intent_id}), "
@@ -684,6 +768,18 @@ def _write_blind_prepared_intents(
                 f"Needs real reconciliation before this run can proceed."
             )
         else:
+            # Either no prior intent exists at all, or one exists but is
+            # TERMINAL (reboot-drill finding #1, 2026-08-24: ignored,
+            # never raised on, never reused/mutated -- see this
+            # function's own docstring) -- both cases get a genuinely
+            # fresh PREPARED intent, own new `intent_id`, for this run's
+            # own candidate.
+            if existing is not None:
+                print(
+                    f"[CONTROL] Blind intent for {ticker} {action_kind} (client_order_id={client_order_id!r}): "
+                    f"a TERMINAL record already exists (intent_id={existing.intent_id}) -- ignored, writing a "
+                    f"fresh PREPARED intent for this run's own candidate."
+                )
             intent = order_intent.create_intent(
                 client_order_id=client_order_id,
                 account_identity=ACCOUNT_IDENTITY,
@@ -1616,34 +1712,54 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     f"SEC cache age={issuer_identity_result.sec_data_age_days}."
                 )
 
+                # Loaded HERE, before Phase 1.5, rather than at Phase 2a
+                # as before (reboot-drill finding #1, 2026-08-24): Phase
+                # 1.5's own stray-recovery loop now needs
+                # `pending_buys`/`pending_exits` to decide whether a
+                # confirmed-404 PREPARED intent still has a live,
+                # matching candidate this run (see
+                # `_stray_intent_matches_live_candidate` below) --
+                # RESUMABLE_PREPARED vs ABANDONED_NO_SUBMISSION. The SAME
+                # loaded object is reused, unmodified, at Phase 2a below
+                # (no second, redundant load).
+                reconciliation_state = rdd.ps.load_position_state(
+                    arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
+                )
+
                 # PHASE 1.5 (Task 3, 2026-08-22, item 6; finalization
                 # closed independent-audit-round-2, 2026-08-23, findings
-                # #1/#2): post-crash order-intent recovery -- BEFORE
-                # broker reconciliation's own snapshot below, using the
-                # SAME already-resolved reconciliation_client (one real
-                # TradingClient for this whole run, same discipline as
-                # every other call here). Resolves any stray
-                # PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/COMMITTED/
-                # UNCERTAIN intent a PRIOR, interrupted run left behind
-                # against the real broker -- never auto-resubmits, never
-                # auto-retries a cancel (see
-                # order_intent_reconciliation.py's own module docstring
-                # for the full resolution table).
-                # `resolve_stray_intent` now ALWAYS finalizes a
-                # BROKER_ACKNOWLEDGED/COMMITTED outcome through to
-                # TERMINAL itself (`finalize_resolved_intent`, closing
-                # the real gap where such an intent previously had no
-                # path forward and stayed non-terminal permanently) --
-                # this journal-level closure is independent of, and
-                # never a substitute for, Phase 2a's own reconciliation
-                # call below (broker_reconciliation's Scenario C), which
-                # is what actually catches `position_state.json` up if
-                # needed; this phase never reimplements that. Anything
-                # still UNCERTAIN after resolution (or otherwise
-                # non-terminal, which should be structurally impossible
-                # given `resolve_stray_intent`'s own contract) blocks
-                # this run entirely, fail-closed -- human review required
-                # before proceeding.
+                # #1/#2; two-phase recovery model fixed reboot-drill
+                # findings #1/#2, 2026-08-24): post-crash order-intent
+                # recovery -- BEFORE broker reconciliation's own snapshot
+                # below, using the SAME already-resolved
+                # reconciliation_client (one real TradingClient for this
+                # whole run, same discipline as every other call here).
+                # Resolves any stray PREPARED/SUBMITTING/BROKER_ACKNOWLEDGED/
+                # COMMITTED/UNCERTAIN intent a PRIOR, interrupted run left
+                # behind against the real broker -- never auto-resubmits,
+                # never auto-retries a cancel (see
+                # order_intent_reconciliation.py's own module docstring,
+                # "TWO-PHASE RECOVERY", for the full resolution table).
+                #
+                # `resolve_stray_intent` now returns one of FOUR
+                # legitimate resting statuses, not just TERMINAL/UNCERTAIN
+                # as before: TERMINAL (fully resolved), PREPARED
+                # (RESUMABLE_PREPARED -- a confirmed 404 whose candidate
+                # is still live THIS run; `_write_blind_prepared_intents`
+                # below will naturally reuse it), BROKER_ACKNOWLEDGED
+                # (broker truth is known, but local-state reconciliation
+                # has not run/completed yet -- Phase 2a below is what
+                # determines whether that catches up cleanly or halts via
+                # `JournalAcknowledgedButLocalStateMissingError`), or
+                # UNCERTAIN (genuinely ambiguous, always blocks). Only
+                # UNCERTAIN (or anything else entirely unexpected) blocks
+                # HERE, fail-closed -- human review required before
+                # proceeding; PREPARED/BROKER_ACKNOWLEDGED are legitimate
+                # resting states this phase deliberately does NOT try to
+                # resolve further itself (see module docstring for why:
+                # moving broker_reconciliation's own reconcile() call earlier does
+                # not help, it would still hit the exact same halt for
+                # the BROKER_ACKNOWLEDGED case, just reordered).
                 stray_intents = order_intent_reconciliation.find_stray_session_intents_from_prior_run()
                 if stray_intents:
                     print(
@@ -1652,12 +1768,21 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                     )
                     unresolved_stray_intents: list[order_intent.OrderIntent] = []
                     for stray in stray_intents:
-                        resolved = order_intent_reconciliation.resolve_stray_intent(reconciliation_client, stray)
+                        matches_live_candidate = _stray_intent_matches_live_candidate(stray, reconciliation_state)
+                        resolved = order_intent_reconciliation.resolve_stray_intent(
+                            reconciliation_client, stray, matches_live_candidate=matches_live_candidate,
+                        )
                         print(
                             f"[CONTROL] Stray intent {resolved.intent_id} ({resolved.ticker} "
                             f"{resolved.action_kind}): {stray.status} -> {resolved.status}"
+                            + (" (RESUMABLE_PREPARED -- live candidate still matches this run)"
+                               if resolved.status == order_intent.PREPARED else "")
+                            + (" (broker truth known; awaiting Phase 2a local-state reconciliation)"
+                               if resolved.status == order_intent.BROKER_ACKNOWLEDGED else "")
                         )
-                        if resolved.status != order_intent.TERMINAL:
+                        if resolved.status not in (
+                            order_intent.TERMINAL, order_intent.PREPARED, order_intent.BROKER_ACKNOWLEDGED,
+                        ):
                             unresolved_stray_intents.append(resolved)
                     if unresolved_stray_intents:
                         raise RuntimeError(
@@ -1684,19 +1809,17 @@ def _execute(arguments: argparse.Namespace, *, trading_client: TradingClient | N
                 # failure -- it updates only an order-status field on the
                 # freshly-loaded state below and persists that correction
                 # to disk before proceeding, exactly like any other
-                # successful pre-decision state fix. NOTE: this deliberately
-                # does NOT yet inspect order_intent.list_intents() for
-                # stray PREPARED/SUBMITTING/UNCERTAIN intents from an
-                # interrupted prior run -- that intent-journal-specific
-                # reconciliation is still out of scope for this task
-                # (broker_reconciliation.py reconciles submitted_actions/
-                # equity_stop_orders/positions only). Reuses
+                # successful pre-decision state fix. `broker_reconciliation.py`'s
+                # own Scenario D now DOES inspect `order_intent.list_intents()`
+                # (reboot-drill finding #2, 2026-08-24) -- narrowly, only
+                # to distinguish a journal-correlated crash-recovery gap
+                # from a genuinely mystery broker order; still fail-closed
+                # either way, only the diagnostic differs. Reuses
                 # `reconciliation_client`, already constructed above for
                 # the issuer-identity preflight -- one real TradingClient
                 # instance for this whole run, not a fresh one per check.
-                reconciliation_state = rdd.ps.load_position_state(
-                    arguments.state_path, guard_path=rdd.ps.HIGH_WATER_MARK_PATH
-                )
+                # `reconciliation_state` reuses the SAME object loaded
+                # before Phase 1.5 above -- not reloaded here.
                 reconciliation_result = broker_reconciliation.reconcile(
                     reconciliation_client, reconciliation_state,
                     # REAL REGRESSION FOUND AND FIXED (2026-08-22,

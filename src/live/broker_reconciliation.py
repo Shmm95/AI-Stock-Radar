@@ -148,6 +148,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.requests import GetOrdersRequest
 
+from src.live import order_intent
+
 # Last 4 digits of the control-arm Alpaca paper account's masked
 # fingerprint (cash $100,000, zero positions, created 2026-08-15).
 # Independently verified twice: once by the user directly via a real
@@ -217,6 +219,26 @@ class UnreconciledLocalOrderError(ReconciliationError):
 
 class UnknownBrokerOrderError(ReconciliationError):
     """Scenario D: the broker has an open order local state has no record of."""
+
+
+class JournalAcknowledgedButLocalStateMissingError(ReconciliationError):
+    """Scenario D, refined (reboot-drill finding #2, 2026-08-24): the
+    "unknown" broker order actually correlates with an
+    `order_intent.py` journal entry sitting at `BROKER_ACKNOWLEDGED` --
+    i.e. NOT a genuine mystery order. This is the exact, expected shape
+    of a crash between a broker acknowledgment and this run's own local
+    `submitted_actions` update, now correctly recognized as such rather
+    than reported as an unexplained anomaly (`UnknownBrokerOrderError`).
+
+    Still fail-closed, same halt as Scenario D always was -- this is a
+    more specific DIAGNOSIS, never a different resolution. NO automatic
+    resubmit, cancel, or silent local-state adoption happens here or
+    anywhere else in response to this -- see
+    `order_intent_reconciliation.py`'s own module docstring, "NEVER DO,"
+    for the three specific shortcuts workspace-c's own audit explicitly
+    ruled out. Either a human resolves this, or a separately-approved,
+    deterministic recovery procedure does -- neither exists in this
+    module."""
 
 
 class LocalTerminalButBrokerOpenError(ReconciliationError):
@@ -849,8 +871,40 @@ def reconcile(
         and (not order.client_order_id or str(order.client_order_id) not in known_client_order_ids)
     ]
     if unknown_broker_orders:
-        details = [
-            {
+        # Reboot-drill finding #2 (2026-08-24): before raising the
+        # generic "mystery order" error, check whether any of these
+        # "unknown to local state" orders actually correlate with an
+        # order_intent.py journal entry sitting at BROKER_ACKNOWLEDGED
+        # -- the exact, expected shape of a crash between a broker
+        # acknowledgment and this run's own local submitted_actions
+        # update (see order_intent_reconciliation.py's own module
+        # docstring, "TWO-PHASE RECOVERY"). A cheap, local-only,
+        # read-only journal scan -- no extra broker call. Still
+        # fail-closed either way; this only changes WHICH exception (and
+        # therefore which diagnostic) fires, never the halt itself.
+        acknowledged_intents_by_client_order_id = {
+            intent.client_order_id: intent
+            for intent in order_intent.list_intents()
+            if intent.status == order_intent.BROKER_ACKNOWLEDGED and intent.client_order_id
+        }
+        acknowledged_intents_by_broker_order_id = {
+            intent.broker_order_id: intent
+            for intent in order_intent.list_intents()
+            if intent.status == order_intent.BROKER_ACKNOWLEDGED and intent.broker_order_id
+        }
+        journal_correlated: list[tuple[Any, order_intent.OrderIntent]] = []
+        genuinely_unknown: list[Any] = []
+        for order in unknown_broker_orders:
+            correlated_intent = acknowledged_intents_by_client_order_id.get(
+                str(order.client_order_id) if order.client_order_id else None
+            ) or acknowledged_intents_by_broker_order_id.get(str(order.id))
+            if correlated_intent is not None:
+                journal_correlated.append((order, correlated_intent))
+            else:
+                genuinely_unknown.append(order)
+
+        def _order_detail(order: Any) -> dict:
+            return {
                 "order_id": str(order.id),
                 "client_order_id": order.client_order_id,
                 "symbol": order.symbol,
@@ -859,8 +913,25 @@ def reconcile(
                 "status": str(order.status.value if hasattr(order.status, "value") else order.status),
                 "submitted_at": str(order.submitted_at),
             }
-            for order in unknown_broker_orders
-        ]
+
+        if journal_correlated:
+            details = [
+                {**_order_detail(order), "journal_intent_id": intent.intent_id}
+                for order, intent in journal_correlated
+            ]
+            genuinely_unknown_details = [_order_detail(order) for order in genuinely_unknown]
+            raise JournalAcknowledgedButLocalStateMissingError(
+                f"Broker has {len(details)} open order(s) that correlate with an "
+                f"order_intent.py journal entry at BROKER_ACKNOWLEDGED but are not yet "
+                f"reflected in local submitted_actions: {details}. This is a known, "
+                f"journal-correlated crash-recovery gap, NOT a mystery order -- fail-closed, "
+                f"no automatic resubmit/cancel/adoption. Human review, or a separately-approved "
+                f"deterministic recovery procedure, required."
+                + (f" Additionally, {len(genuinely_unknown_details)} genuinely unrelated unknown "
+                   f"order(s) also found: {genuinely_unknown_details}." if genuinely_unknown_details else "")
+            )
+
+        details = [_order_detail(order) for order in genuinely_unknown]
         raise UnknownBrokerOrderError(
             f"Broker has {len(details)} open order(s) not known to local "
             f"state: {details}. Fail-closed -- no automatic cancellation or "

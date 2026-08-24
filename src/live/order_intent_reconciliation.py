@@ -34,6 +34,54 @@ the caller, which is expected to let the normal `reconcile()` call
 (already part of every real run) pick it up, not reimplement Scenario
 C's own exact-match logic a second time here.
 
+TWO-PHASE RECOVERY, NOT ONE (reboot-drill findings #1/#2, 2026-08-24 --
+a real, end-to-end reboot-drill reproduction found two genuine bugs in
+what used to be a single, greedy finalization pass; both confirmed
+against the real code and a real crash reproduction before being fixed,
+not assumed):
+
+  Phase A (THIS module, called early, before any market-data fetch):
+  resolve broker TRUTH only. `resolve_stray_intent` may now return
+  `PREPARED` (RESUMABLE_PREPARED -- a confirmed 404 whose candidate is
+  STILL live this run; see `resolve_stray_order_submission_intent`'s
+  own docstring) or `BROKER_ACKNOWLEDGED` (broker truth known, but
+  local-state reconciliation has not happened/completed yet; see
+  `finalize_resolved_intent`'s own docstring) as LEGITIMATE, non-error
+  resting outcomes -- not just `TERMINAL`/`UNCERTAIN` as before. A
+  caller that still treats "anything other than TERMINAL" as a hard
+  failure will reject these two correct outcomes; see
+  `run_control_arm_decision.py`'s own updated Phase-1.5 acceptance set.
+
+  Phase B (the CALLER's own broker/local-state reconciliation --
+  `broker_reconciliation.reconcile()`, unmodified, run separately right
+  after this module's own preflight): actually catches
+  `position_state.json` up (or correctly halts fail-closed if it
+  can't -- see that module's own new
+  `JournalAcknowledgedButLocalStateMissingError`, which now
+  distinguishes "a known, journal-correlated crash-recovery gap" from a
+  genuinely mystery broker order).
+
+  Only ONCE local state is genuinely consistent (a state THIS module
+  never itself verifies) is it safe for anything to advance a
+  BROKER_ACKNOWLEDGED intent further -- and even then, ONLY when
+  `broker_status` shows the order never had any real position/cash
+  impact (canceled/expired/rejected/done_for_day) does
+  `finalize_resolved_intent` do that automatically; anything else
+  (filled, or still resting) requires the run's own normal
+  decision/finalization flow, or human review, never an automatic
+  advance from this module alone.
+
+NEVER DO (workspace-c's own explicit warning, reboot-drill findings
+#1/#2): move `broker_reconciliation.reconcile()` earlier so it runs
+BEFORE this module (Scenario D still triggers on the same case, this
+does not resolve anything, only reorders when the same halt happens);
+silently add a recovered client_order_id to some "known" list so
+Scenario D skips it (masks a real local-state gap, letting a run
+proceed with incomplete state); or leave an intent artificially at
+TERMINAL to suppress Scenario D (the single riskiest option -- a
+lying journal record next to a state a human now has no reason to
+suspect is inconsistent).
+
 Nothing here calls Alpaca on import or at module load -- every function
 below takes a real `TradingClient` as an explicit parameter, same
 injection-seam discipline the rest of this codebase's live modules use.
@@ -71,6 +119,17 @@ _NON_TERMINAL_STATUSES = frozenset(
 # module's own `TERMINAL_STATUSES` set answers.
 _STILL_RESTING_STATUSES = frozenset({"new", "accepted", "pending_new", "held", "replaced"})
 
+# Reboot-drill finding #2 (2026-08-24): the subset of
+# `order_submission.TERMINAL_STATUSES` that has NO position/cash impact
+# -- deliberately EXCLUDES "filled" (real position impact) and
+# "partially_filled" (not even in that set; still open). Only when a
+# recovered BROKER_ACKNOWLEDGED intent's own `broker_status` is one of
+# these is it safe for `finalize_resolved_intent` to claim COMMITTED
+# ("local state now reflects this") without any real local-state
+# catch-up having happened -- there is nothing for local state to catch
+# up ON, since the order never took effect.
+_NO_POSITION_IMPACT_TERMINAL_STATUSES = frozenset({"canceled", "expired", "rejected", "done_for_day"})
+
 
 def find_stray_session_intents_from_prior_run() -> list[order_intent.OrderIntent]:
     """Every intent currently on disk that is NOT in a terminal state
@@ -81,7 +140,9 @@ def find_stray_session_intents_from_prior_run() -> list[order_intent.OrderIntent
     return [intent for intent in order_intent.list_intents() if intent.status in _NON_TERMINAL_STATUSES]
 
 
-def resolve_stray_order_submission_intent(client: TradingClient, intent: order_intent.OrderIntent) -> order_intent.OrderIntent:
+def resolve_stray_order_submission_intent(
+    client: TradingClient, intent: order_intent.OrderIntent, *, matches_live_candidate: bool = False,
+) -> order_intent.OrderIntent:
     """Resolves a stray intent that represents a real order SUBMISSION
     (has a non-empty `client_order_id` -- ENTRY_MARKET_BUY/
     SIGNAL_EXIT_MARKET_SELL/PROTECTIVE_STOP). Queries the broker by
@@ -95,10 +156,42 @@ def resolve_stray_order_submission_intent(client: TradingClient, intent: order_i
 
     Confirmed 404 (`get_order_by_client_order_id` returns `None`) from
     `PREPARED` -> a definitive negative: the broker never received this
-    exact submission. Safe to close TERMINAL as abandoned -- the next
-    real run's own normal flow (not this module) will attempt the
-    action fresh through its own regular idempotency check, with a
-    fresh, real decision behind it.
+    exact submission.
+
+    `matches_live_candidate` (reboot-drill finding #1, 2026-08-24; the
+    CALLER's own responsibility to compute -- see
+    `run_control_arm_decision._stray_intent_matches_live_candidate` --
+    since it requires `runner_state.pending_buys`/`pending_exits`, which
+    this module deliberately never loads itself): `True` when THIS
+    EXACT run still has a live, matching candidate for this intent (same
+    ticker/action_kind/client_order_id/account_identity/side/
+    source_signal_timestamp) queued in `pending_buys`/`pending_exits`.
+    In that case the intent is left UNCHANGED, still `PREPARED` --
+    RESUMABLE, not abandoned: the next real run step
+    (`_write_blind_prepared_intents`) will naturally reuse this exact
+    intent for its own idempotent-resume path, exactly as if this were
+    a plain crash-before-`rdd.run_daily_decision()` case (which, from
+    the broker's honest perspective, it still is -- the broker
+    genuinely never received this submission).
+
+    THE REAL BUG THIS PARAMETER CLOSES: this function used to close
+    TERMINAL unconditionally on a confirmed 404 from PREPARED,
+    regardless of whether the SAME run still had a live candidate for
+    it -- `_write_blind_prepared_intents`'s own conflict check
+    (`StrayPreparedIntentConflictError`) then fired on the very next
+    step of the SAME run, since it found a TERMINAL record for the
+    client_order_id it was about to (idempotently) reuse, not the
+    PREPARED it expected. The whole run deadlocked. Confirmed via a
+    real, end-to-end reboot-drill reproduction
+    (`scripts/run_control_arm_reboot_drill.py`) before this fix, not
+    assumed.
+
+    `matches_live_candidate=False` (the default -- no live candidate,
+    or the caller has none to check against) -> the ORIGINAL behavior:
+    safe to close TERMINAL as `ABANDONED_NO_SUBMISSION` -- the next
+    real run's own normal flow will attempt the action fresh through
+    its own regular idempotency check, with a fresh, real decision
+    behind it, if a new candidate is ever generated again.
 
     Confirmed 404 from `SUBMITTING` -> NOT treated as definitive here,
     deliberately more conservative than the PREPARED case: `SUBMITTING`
@@ -106,6 +199,8 @@ def resolve_stray_order_submission_intent(client: TradingClient, intent: order_i
     prior run stopped, and a query racing a real in-flight submission
     can plausibly still 404 briefly. Transitions to `UNCERTAIN` --
     fail-closed, human review required, never auto-resubmitted.
+    `matches_live_candidate` is irrelevant here -- ambiguity, not a
+    definitive negative, so there is nothing safe to resume.
 
     `intent.status` outside {PREPARED, SUBMITTING} (e.g. already
     BROKER_ACKNOWLEDGED) is returned unchanged -- see this module's own
@@ -119,6 +214,10 @@ def resolve_stray_order_submission_intent(client: TradingClient, intent: order_i
 
     if intent.status == order_intent.PREPARED:
         if found is None:
+            if matches_live_candidate:
+                # RESUMABLE_PREPARED: left unchanged, still PREPARED --
+                # see this function's own docstring for the full "why."
+                return intent
             # PREPARED -> TERMINAL directly (never via SUBMITTING, which
             # `_VALID_TRANSITIONS` does not allow to reach TERMINAL --
             # and semantically correct anyway: claiming SUBMITTING was
@@ -126,7 +225,10 @@ def resolve_stray_order_submission_intent(client: TradingClient, intent: order_i
             # never happened).
             return order_intent.transition_intent(
                 intent, order_intent.TERMINAL,
-                last_error="stray-recovery: confirmed 404 from PREPARED -- broker never received this submission.",
+                last_error=(
+                    "ABANDONED_NO_SUBMISSION: stray-recovery: confirmed 404 from PREPARED -- broker "
+                    "never received this submission, and no live candidate remains for it this run."
+                ),
             )
         intent = order_intent.transition_intent(intent, order_intent.SUBMITTING, increment_attempt=True)
         return order_intent.transition_intent(
@@ -217,36 +319,52 @@ def resolve_stray_cancel_intent(client: TradingClient, intent: order_intent.Orde
 
 
 def finalize_resolved_intent(intent: order_intent.OrderIntent) -> order_intent.OrderIntent:
-    """Closes a stray intent whose broker-side outcome is now
-    definitively known -- BROKER_ACKNOWLEDGED (this run's own
-    `resolve_stray_*` call just landed there, or the intent was already
-    sitting at BROKER_ACKNOWLEDGED because a prior run never got to
-    close it -- independent-audit-round-2 finding #1, 2026-08-23) or
-    COMMITTED (the prior run's own second save landed but the final
-    bookkeeping transition to TERMINAL did not -- e.g. a crash in the
-    narrow window between those two writes; finding #2) -- through to
-    TERMINAL.
+    """Closes a stray intent's journal record once (and only once) it is
+    actually SAFE to claim done -- COMMITTED (the prior run's own second
+    save landed but the final bookkeeping transition to TERMINAL did
+    not -- e.g. a crash in the narrow window between those two writes;
+    independent-audit-round-2 finding #2, 2026-08-23) always advances to
+    TERMINAL, unconditionally: COMMITTED's own defined meaning
+    (`order_intent.py`'s own docstring: "local state has been durably
+    updated to reflect this intent's outcome") already guarantees local
+    state agrees, nothing further to verify.
+
+    BROKER_ACKNOWLEDGED is DIFFERENT, and is where reboot-drill finding
+    #2 (2026-08-24) found a real bug: this function used to advance
+    BROKER_ACKNOWLEDGED -> COMMITTED -> TERMINAL unconditionally too --
+    but for a JUST-recovered stray (this run's own `resolve_stray_*`
+    call moved SUBMITTING -> BROKER_ACKNOWLEDGED moments ago because the
+    broker turned out to have the order), `position_state.json`'s
+    `submitted_actions` has definitely NOT been updated yet -- that
+    claim of "COMMITTED" was false. The run would then reach
+    `broker_reconciliation.reconcile()`'s own Scenario D, correctly
+    detect the broker order as "unknown to local state," and correctly
+    halt -- but the journal had ALREADY claimed TERMINAL/done, a
+    misleading record sitting next to a correctly-fail-closed halt.
+    Confirmed via a real, end-to-end reboot-drill reproduction, not
+    assumed.
+
+    Fixed: a BROKER_ACKNOWLEDGED intent advances to COMMITTED here ONLY
+    when `broker_status` is one of `_NO_POSITION_IMPACT_TERMINAL_STATUSES`
+    (canceled/expired/rejected/done_for_day) -- i.e. the order
+    definitively never took effect, so there is genuinely nothing for
+    local state to catch up ON, and claiming "local state reflects this"
+    is trivially true (there is nothing to reflect). Any OTHER
+    `broker_status` (new/accepted/held/replaced/partially_filled/filled
+    -- anything that could carry real position/cash impact) leaves the
+    intent AT BROKER_ACKNOWLEDGED, deliberately not advanced -- the
+    caller's own broker/local-state reconciliation
+    (`broker_reconciliation.reconcile()`, run separately, unmodified,
+    right after this module's own preflight) is what determines whether
+    local state genuinely catches up; ONLY once that has happened (a
+    SEPARATE, later call, not made by this function) is it safe for
+    something else to advance BROKER_ACKNOWLEDGED -> COMMITTED ->
+    TERMINAL. This function itself never re-checks reconciliation state
+    -- see `run_control_arm_decision.py`'s own Phase 1.5/Phase 2a
+    ordering for where that boundary actually is.
 
     JOURNAL-ONLY, same scope discipline as every other function in this
-    module: never touches `position_state.json`. Advancing a
-    BROKER_ACKNOWLEDGED intent to COMMITTED here means "the broker's
-    real, authoritative outcome for this intent is now known and
-    durably recorded in THIS JOURNAL ENTRY" -- not a claim that
-    `position_state.json` has already been updated to match; propagating
-    that is `broker_reconciliation.py`'s own Scenario C's job (run
-    separately, unmodified, as part of the same preflight this module's
-    caller already runs) or the run's own normal decision flow, never
-    reimplemented here.
-
-    Before this function existed, a stray intent resolved to (or found
-    already at) BROKER_ACKNOWLEDGED had no path forward at all --
-    `resolve_stray_order_submission_intent`/`resolve_stray_cancel_intent`
-    both deliberately stop there by design (see their own docstrings),
-    and nothing downstream ever called `transition_intent(...,
-    COMMITTED)` for a STRAY intent the way `run_control_arm_decision.py`'s
-    own finalization loop already does for intents created/resolved
-    WITHIN the same run. It stayed BROKER_ACKNOWLEDGED permanently --
-    the bug this function exists to close.
+    module: never touches `position_state.json` itself.
 
     A no-op (returns the intent unchanged) for any other status --
     TERMINAL is already done; PREPARED/SUBMITTING are not this
@@ -254,13 +372,18 @@ def finalize_resolved_intent(intent: order_intent.OrderIntent) -> order_intent.O
     this); UNCERTAIN is fail-closed, human-review-only, never
     auto-advanced by anything in this module."""
     if intent.status == order_intent.BROKER_ACKNOWLEDGED:
-        intent = order_intent.transition_intent(intent, order_intent.COMMITTED)
+        if intent.broker_status in _NO_POSITION_IMPACT_TERMINAL_STATUSES:
+            intent = order_intent.transition_intent(intent, order_intent.COMMITTED)
+        else:
+            return intent
     if intent.status == order_intent.COMMITTED:
         intent = order_intent.transition_intent(intent, order_intent.TERMINAL)
     return intent
 
 
-def resolve_stray_intent(client: TradingClient, intent: order_intent.OrderIntent) -> order_intent.OrderIntent:
+def resolve_stray_intent(
+    client: TradingClient, intent: order_intent.OrderIntent, *, matches_live_candidate: bool = False,
+) -> order_intent.OrderIntent:
     """Dispatches to `resolve_stray_order_submission_intent` or
     `resolve_stray_cancel_intent` based on which correlation key the
     intent actually carries -- a submission-type intent has a real
@@ -272,16 +395,25 @@ def resolve_stray_intent(client: TradingClient, intent: order_intent.OrderIntent
     throughout this codebase, but this function does not assume that
     invariant holds without checking.
 
+    `matches_live_candidate` (reboot-drill finding #1, 2026-08-24) is
+    forwarded to `resolve_stray_order_submission_intent` only -- see its
+    own docstring; irrelevant for a cancel-type intent (no "pending
+    candidate" concept applies to those, see
+    `resolve_stray_cancel_intent`'s own docstring).
+
     Always finalizes through `finalize_resolved_intent` before returning
     (independent-audit-round-2 findings #1/#2, 2026-08-23) -- a caller
-    of this function never needs to remember to call that separately;
-    the ONLY status this function can now return for a call that does
-    not raise is TERMINAL, UNCERTAIN, or (unreachable in practice, see
-    `resolve_stray_order_submission_intent`/`resolve_stray_cancel_intent`'s
-    own contracts) PREPARED/SUBMITTING if a caller passes an intent this
-    module has not actually tried to resolve at all."""
+    of this function never needs to remember to call that separately.
+    The possible returned statuses are now: `TERMINAL` (fully resolved,
+    safe to treat as done), `PREPARED` (RESUMABLE_PREPARED --
+    `matches_live_candidate=True` hit a confirmed 404; reuse it),
+    `BROKER_ACKNOWLEDGED` (reboot-drill finding #2 -- broker truth is
+    known, but local-state reconciliation has not yet run/completed;
+    the caller must let `broker_reconciliation.reconcile()` run next,
+    never treat this as "done" on its own), or `UNCERTAIN` (genuinely
+    ambiguous, human review required)."""
     if intent.client_order_id:
-        resolved = resolve_stray_order_submission_intent(client, intent)
+        resolved = resolve_stray_order_submission_intent(client, intent, matches_live_candidate=matches_live_candidate)
     elif intent.target_broker_order_id:
         resolved = resolve_stray_cancel_intent(client, intent)
     else:

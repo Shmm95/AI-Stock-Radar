@@ -130,7 +130,48 @@ def test_prepared_submission_confirmed_404_becomes_terminal_not_resubmitted(monk
     resolved = reconciliation.resolve_stray_order_submission_intent(client=object(), intent=intent)
 
     assert resolved.status == order_intent.TERMINAL
+    assert "ABANDONED_NO_SUBMISSION" in resolved.last_error
     assert "never received" in resolved.last_error
+
+
+def test_prepared_submission_confirmed_404_with_a_live_candidate_stays_prepared_resumable(monkeypatch: pytest.MonkeyPatch):
+    """Reboot-drill finding #1 (2026-08-24), the real bug this closes: a
+    confirmed 404 from PREPARED used to ALWAYS close TERMINAL, even when
+    the SAME run still had a live, matching candidate for it --
+    `_write_blind_prepared_intents`'s own idempotent-resume step then
+    deadlocked on the very next run step (`StrayPreparedIntentConflictError`,
+    since it found TERMINAL where it expected a resumable PREPARED).
+    `matches_live_candidate=True` (the caller's own responsibility to
+    compute -- see `run_control_arm_decision._stray_intent_matches_live_candidate`)
+    leaves the intent UNCHANGED, still PREPARED -- confirmed via a real,
+    end-to-end reboot-drill reproduction before this fix, not assumed."""
+    intent = _submission_intent(status=order_intent.PREPARED)
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(
+        order_submission, "submit_equity_market_order",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must never resubmit")),
+    )
+
+    resolved = reconciliation.resolve_stray_order_submission_intent(
+        client=object(), intent=intent, matches_live_candidate=True,
+    )
+
+    assert resolved.status == order_intent.PREPARED
+    assert resolved.last_error is None  # untouched -- never written to, since nothing transitioned
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.status == order_intent.PREPARED
+
+
+def test_resolve_stray_intent_leaves_a_resumable_prepared_intent_unfinalized(monkeypatch: pytest.MonkeyPatch):
+    """The dispatcher must not finalize a RESUMABLE_PREPARED result --
+    `finalize_resolved_intent` is a no-op for PREPARED, so this should
+    fall straight through unchanged."""
+    intent = _submission_intent(status=order_intent.PREPARED)
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+
+    resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent, matches_live_candidate=True)
+
+    assert resolved.status == order_intent.PREPARED
 
 
 def test_submitting_submission_found_at_broker_becomes_broker_acknowledged(monkeypatch: pytest.MonkeyPatch):
@@ -250,18 +291,33 @@ def test_target_filled_before_cancel_landed_is_honestly_recorded_not_relabeled(m
 
 
 def test_dispatch_routes_submission_type_by_client_order_id(monkeypatch: pytest.MonkeyPatch):
-    """`resolve_stray_intent` (the dispatcher) always finalizes through
-    to TERMINAL now (independent-audit-round-2 finding #1, 2026-08-23)
-    -- unlike `resolve_stray_order_submission_intent` on its own, which
-    deliberately still stops at BROKER_ACKNOWLEDGED (see that function's
-    own, still-passing `test_already_broker_acknowledged_submission_returned_unchanged`)."""
+    """`resolve_stray_intent` (the dispatcher) finalizes through
+    `finalize_resolved_intent` -- but a real, position-impacting broker
+    status ("accepted", `_FakeOrder`'s own default) must now leave the
+    intent AT BROKER_ACKNOWLEDGED, not TERMINAL (reboot-drill finding
+    #2, 2026-08-24 -- see `finalize_resolved_intent`'s own corrected
+    docstring: only a no-position-impact status is safe to
+    auto-finalize)."""
     intent = _submission_intent(status=order_intent.PREPARED)
     monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: _FakeOrder("x"))
+    resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent)
+    assert resolved.status == order_intent.BROKER_ACKNOWLEDGED
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.status == order_intent.BROKER_ACKNOWLEDGED
+    assert reloaded.broker_order_id == "x"  # the real broker fact is still preserved
+
+
+def test_dispatch_routes_submission_type_and_finalizes_a_no_impact_status(monkeypatch: pytest.MonkeyPatch):
+    """The counterpart to the test above: a definitively no-position-impact
+    broker status (e.g. "rejected") IS safe to finalize all the way to
+    TERMINAL automatically."""
+    intent = _submission_intent(status=order_intent.PREPARED)
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: _FakeOrder("x", status="rejected"))
     resolved = reconciliation.resolve_stray_intent(client=object(), intent=intent)
     assert resolved.status == order_intent.TERMINAL
     reloaded = order_intent.load_intent(intent.intent_id)
     assert reloaded.status == order_intent.TERMINAL
-    assert reloaded.broker_order_id == "x"  # the real broker fact is still preserved through finalization
+    assert reloaded.broker_order_id == "x"
 
 
 def test_dispatch_routes_cancel_type_by_target_broker_order_id(monkeypatch: pytest.MonkeyPatch):
@@ -276,19 +332,57 @@ def test_dispatch_routes_cancel_type_by_target_broker_order_id(monkeypatch: pyte
 # --- finalize_resolved_intent (independent-audit-round-2 findings #1/#2, 2026-08-23) ---
 
 
-def test_finalize_closes_broker_acknowledged_through_to_terminal():
-    """The exact bug finding #1 describes: a stray intent resolved to
+def test_finalize_closes_broker_acknowledged_through_to_terminal_when_no_position_impact():
+    """The original round-2 bug (finding #1): a stray intent resolved to
     (or already sitting at) BROKER_ACKNOWLEDGED previously had no path
-    forward and stayed there permanently."""
+    forward and stayed there permanently. Fixed for the case where it is
+    actually SAFE to close automatically -- broker_status shows the
+    order never had any real position/cash impact."""
     intent = _submission_intent(status=order_intent.SUBMITTING)
     intent = order_intent.transition_intent(
-        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-3", broker_status="filled",
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-3", broker_status="canceled",
     )
     finalized = reconciliation.finalize_resolved_intent(intent)
     assert finalized.status == order_intent.TERMINAL
     reloaded = order_intent.load_intent(intent.intent_id)
     assert reloaded.status == order_intent.TERMINAL
     assert reloaded.broker_order_id == "real-3"
+
+
+def test_finalize_leaves_broker_acknowledged_alone_when_it_could_have_position_impact():
+    """Reboot-drill finding #2 (2026-08-24), the real bug: a
+    JUST-recovered BROKER_ACKNOWLEDGED intent (e.g. broker_status
+    "filled") must NOT be auto-advanced to COMMITTED/TERMINAL --
+    position_state.json's own submitted_actions has definitely not been
+    updated yet, so claiming COMMITTED ("local state reflects this")
+    would be false. Confirmed via a real, end-to-end reboot-drill
+    reproduction before this fix, not assumed."""
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-3", broker_status="filled",
+    )
+    finalized = reconciliation.finalize_resolved_intent(intent)
+    assert finalized.status == order_intent.BROKER_ACKNOWLEDGED
+    reloaded = order_intent.load_intent(intent.intent_id)
+    assert reloaded.status == order_intent.BROKER_ACKNOWLEDGED  # never advanced, never written as COMMITTED/TERMINAL
+
+
+@pytest.mark.parametrize("still_open_status", ["new", "accepted", "pending_new", "held", "replaced", "partially_filled"])
+def test_finalize_leaves_broker_acknowledged_alone_for_every_still_open_status(still_open_status: str):
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-x", broker_status=still_open_status,
+    )
+    assert reconciliation.finalize_resolved_intent(intent).status == order_intent.BROKER_ACKNOWLEDGED
+
+
+@pytest.mark.parametrize("no_impact_status", ["canceled", "expired", "rejected", "done_for_day"])
+def test_finalize_advances_broker_acknowledged_for_every_no_impact_status(no_impact_status: str):
+    intent = _submission_intent(status=order_intent.SUBMITTING)
+    intent = order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="real-y", broker_status=no_impact_status,
+    )
+    assert reconciliation.finalize_resolved_intent(intent).status == order_intent.TERMINAL
 
 
 def test_finalize_closes_committed_through_to_terminal():
@@ -320,17 +414,17 @@ def test_finalize_is_a_no_op_for_prepared_submitting_uncertain_terminal():
     assert reconciliation.finalize_resolved_intent(terminal).status == order_intent.TERMINAL
 
 
-def test_resolve_stray_intent_finalizes_an_already_acknowledged_stray_from_a_prior_run(monkeypatch: pytest.MonkeyPatch):
-    """The precise scenario finding #1 names: a stray intent that was
-    ALREADY BROKER_ACKNOWLEDGED when found on disk (left over from a
-    prior run, never advanced further) -- `resolve_stray_intent` must
-    still finalize it through to TERMINAL, not merely return it
-    unchanged. Never queries the broker again for an already-resolved
-    intent (see `resolve_stray_order_submission_intent`'s own
-    docstring) -- only finalization runs here."""
+def test_resolve_stray_intent_finalizes_an_already_acknowledged_no_impact_stray_from_a_prior_run(monkeypatch: pytest.MonkeyPatch):
+    """A stray intent that was ALREADY BROKER_ACKNOWLEDGED when found on
+    disk (left over from a prior run, never advanced further), with a
+    broker_status showing definitively no position impact --
+    `resolve_stray_intent` finalizes it through to TERMINAL. Never
+    queries the broker again for an already-resolved intent (see
+    `resolve_stray_order_submission_intent`'s own docstring) -- only
+    finalization runs here."""
     intent = _submission_intent(status=order_intent.SUBMITTING)
     intent = order_intent.transition_intent(
-        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="already-acked-2", broker_status="filled",
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="already-acked-2", broker_status="canceled",
     )
 
     def fail_if_called(*a, **k):

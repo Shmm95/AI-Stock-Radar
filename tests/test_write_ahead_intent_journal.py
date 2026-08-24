@@ -169,6 +169,96 @@ def test_b_stray_non_prepared_intent_is_a_fail_closed_conflict_not_silently_dupl
         carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
 
 
+def test_b2_a_leftover_terminal_intent_is_ignored_not_raised_on(tmp_path):
+    """Reboot-drill finding #1 (2026-08-24), the real deadlock this
+    closes: a TERMINAL record for the SAME client_order_id (e.g. Phase
+    1.5's own stray-recovery closed a confirmed-404 PREPARED intent
+    ABANDONED_NO_SUBMISSION earlier in the SAME run) must be ignored --
+    never raised on, never reused/mutated. This step writes a genuinely
+    fresh PREPARED intent (its own new intent_id) for this run's own
+    live candidate. Confirmed via a real, end-to-end reboot-drill
+    reproduction before this fix (the deadlock this closes), not
+    assumed."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["TERM"] = _pending_buy("TERM")
+
+    first_run_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    old_intent = order_intent.transition_intent(
+        first_run_intents[0], order_intent.TERMINAL,
+        last_error="ABANDONED_NO_SUBMISSION: simulated prior-run abandonment",
+    )
+
+    second_run_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+
+    assert second_run_intents[0].status == order_intent.PREPARED
+    assert second_run_intents[0].intent_id != old_intent.intent_id  # a genuinely NEW record, old one untouched
+    reloaded_old = order_intent.load_intent(old_intent.intent_id)
+    assert reloaded_old.status == order_intent.TERMINAL  # the old TERMINAL record is left exactly as it was
+    assert reloaded_old.last_error == "ABANDONED_NO_SUBMISSION: simulated prior-run abandonment"
+
+
+# --- _stray_intent_matches_live_candidate (reboot-drill finding #1, 2026-08-24) ---
+
+
+def test_matches_live_candidate_true_for_an_exact_match():
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["MTCH"] = _pending_buy("MTCH")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is True
+
+
+def test_matches_live_candidate_false_when_candidate_no_longer_pending():
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["GONE"] = _pending_buy("GONE")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    del runner_state.pending_buys["GONE"]  # consumed/expired by something else this run
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_for_a_different_account_identity():
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["ACCT"] = _pending_buy("ACCT")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    intent.account_identity = "some_other_account"
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_for_a_mismatched_side():
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["SIDE"] = _pending_buy("SIDE")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    intent.side = "SELL"  # should be BUY for an ENTRY_MARKET_BUY candidate
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_for_a_different_session_date():
+    """A stale intent whose own client_order_id was computed for a
+    DIFFERENT session must never spuriously match today's candidate --
+    the recomputed client_order_id (using the intent's own stored
+    source_signal_timestamp) will legitimately differ from what a fresh
+    intent for TODAY's session would carry."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["OLDS"] = _pending_buy("OLDS")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-01", pre_state_hash=None)[0]
+    # Simulate a stale intent from an EARLIER session's own client_order_id
+    # ending up compared against today's ("2026-08-17") differently-computed id.
+    intent.client_order_id = "OLDS-ENTRY-MARKET-BUY-2026-07-15"
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_for_protective_stop_and_cancel_action_kinds():
+    """No "pending candidate" concept applies to reactively-decided
+    action kinds -- always False, never even reaches a pending_buys/
+    pending_exits lookup."""
+    from types import SimpleNamespace
+
+    runner_state = ps.LiveRunnerState()
+    stop_intent = SimpleNamespace(action_kind="PROTECTIVE_STOP")
+    cancel_intent = SimpleNamespace(action_kind="CANCEL_PROTECTIVE_STOP")
+    assert carm._stray_intent_matches_live_candidate(stop_intent, runner_state) is False
+    assert carm._stray_intent_matches_live_candidate(cancel_intent, runner_state) is False
+
+
 # --- (c) Rejected candidate: cap was full / candidate not actually  ---
 # --- attempted this run -- its blind PREPARED intent must close     ---
 # --- TERMINAL (attempted_but_not_executed), never left hanging,     ---

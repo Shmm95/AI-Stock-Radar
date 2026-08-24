@@ -32,7 +32,19 @@ import pytest
 
 from src.backtest.portfolio_backtest_engine import _MutablePosition
 from src.live import broker_reconciliation as br
+from src.live import order_intent
 from src.live.position_state import LiveRunnerState
+
+
+@pytest.fixture(autouse=True)
+def _isolate_order_intent_directory(tmp_path, monkeypatch):
+    """Reboot-drill finding #2 (2026-08-24): Scenario D now consults
+    `order_intent.list_intents()` (to distinguish a journal-correlated
+    crash-recovery gap from a genuinely mystery broker order) --
+    isolated here to a per-test tmp_path, same discipline
+    `test_write_ahead_intent_journal.py` already established, never the
+    real out-of-repo guard directory."""
+    monkeypatch.setattr(order_intent, "INTENT_DIRECTORY", tmp_path / "order_intents")
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +531,89 @@ def test_scenario_d_unknown_broker_order_fails_closed():
     )
     client = FakeClient(open_orders=[unknown_order], positions=[])
     runner_state = LiveRunnerState()
+    with pytest.raises(br.UnknownBrokerOrderError, match="unknown-1"):
+        br.reconcile(client, runner_state)
+
+
+def test_scenario_d_journal_correlated_order_raises_the_specific_error(monkeypatch: pytest.MonkeyPatch):
+    """Reboot-drill finding #2 (2026-08-24): a "known to local state"
+    check failing must NOT always mean a genuine mystery order -- if the
+    order correlates with an order_intent.py journal entry sitting at
+    BROKER_ACKNOWLEDGED (the exact shape of a crash between a broker
+    acknowledgment and this run's own local submitted_actions update),
+    the more specific, more actionable exception must fire instead of
+    the generic one. Still fail-closed either way -- only the
+    diagnostic differs."""
+    acknowledged_order = FakeOrder(
+        id="broker-order-1", client_order_id="AA-cid", symbol="AA",
+        side="buy", status="filled", qty="10", filled_qty="10",
+    )
+    client = FakeClient(open_orders=[acknowledged_order], positions=[])
+    runner_state = LiveRunnerState()
+
+    intent = order_intent.create_intent(
+        client_order_id="AA-cid", account_identity="control_arm_v1", ticker="AA",
+        side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY",
+        source_signal_timestamp="2026-08-24",
+    )
+    intent = order_intent.transition_intent(intent, order_intent.SUBMITTING)
+    order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="broker-order-1", broker_status="filled",
+    )
+
+    with pytest.raises(br.JournalAcknowledgedButLocalStateMissingError, match="broker-order-1"):
+        br.reconcile(client, runner_state)
+
+
+def test_scenario_d_mixes_journal_correlated_and_genuinely_unknown_orders(monkeypatch: pytest.MonkeyPatch):
+    """Both kinds of "unknown to local state" order present at once --
+    the more specific, more actionable error must still fire (never
+    silently swallow the journal-correlated one into the generic
+    message), and the genuinely-unknown one must still be visible in
+    its own detail."""
+    acknowledged_order = FakeOrder(
+        id="broker-order-1", client_order_id="AA-cid", symbol="AA",
+        side="buy", status="filled", qty="10", filled_qty="10",
+    )
+    mystery_order = FakeOrder(
+        id="unknown-1", client_order_id="MYST-cid", symbol="MYST",
+        side="buy", status="accepted", qty="10", filled_qty="0",
+    )
+    client = FakeClient(open_orders=[acknowledged_order, mystery_order], positions=[])
+    runner_state = LiveRunnerState()
+
+    intent = order_intent.create_intent(
+        client_order_id="AA-cid", account_identity="control_arm_v1", ticker="AA",
+        side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY",
+        source_signal_timestamp="2026-08-24",
+    )
+    intent = order_intent.transition_intent(intent, order_intent.SUBMITTING)
+    order_intent.transition_intent(
+        intent, order_intent.BROKER_ACKNOWLEDGED, broker_order_id="broker-order-1", broker_status="filled",
+    )
+
+    with pytest.raises(br.JournalAcknowledgedButLocalStateMissingError, match="unknown-1") as exc_info:
+        br.reconcile(client, runner_state)
+    assert "broker-order-1" in str(exc_info.value)
+
+
+def test_scenario_d_journal_entry_not_yet_broker_acknowledged_does_not_correlate():
+    """A PREPARED/SUBMITTING journal entry (broker truth NOT yet known)
+    must never suppress or soften Scenario D -- only a resolved
+    BROKER_ACKNOWLEDGED entry is a legitimate correlation."""
+    unknown_order = FakeOrder(
+        id="unknown-1", client_order_id="AA-cid", symbol="AA",
+        side="buy", status="accepted", qty="10", filled_qty="0",
+    )
+    client = FakeClient(open_orders=[unknown_order], positions=[])
+    runner_state = LiveRunnerState()
+
+    order_intent.create_intent(
+        client_order_id="AA-cid", account_identity="control_arm_v1", ticker="AA",
+        side="BUY", order_type="market", action_kind="ENTRY_MARKET_BUY",
+        source_signal_timestamp="2026-08-24",
+    )  # left at PREPARED -- broker truth not yet known
+
     with pytest.raises(br.UnknownBrokerOrderError, match="unknown-1"):
         br.reconcile(client, runner_state)
 

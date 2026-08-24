@@ -273,50 +273,133 @@ def _wait_for_process_state(pid: int, target_states: tuple[str, ...], *, timeout
     return last_state
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP/ps -o state= are POSIX-only")
-def test_arm_then_kill_then_recover_end_to_end(tmp_path):
-    """The real sequence this whole harness exists for: arm a drill for
-    real, wait for the REAL SIGSTOP, kill -9 the stopped process
-    (simulating a crash at that exact point), then run --phase recover
-    as a genuinely fresh process and confirm it produces a report --
-    exactly the manual sequence used to build/validate this harness,
-    now automated. Uses AFTER_PREPARED (the cheapest barrier to reach)
-    to keep this test fast; the full 6-barrier x 2-action x 2-outcome
-    matrix is the owner's own drill to run for real, per this module's
-    own docstring."""
-    case_dir = tmp_path / "case"
-    case_dir.mkdir()
-
+def _arm_wait_for_stop_then_kill(
+    case_dir: Path, *, barrier: str, action: str, broker_outcome: str, extra_wait_states: tuple[str, ...] = ("T",),
+) -> dict:
+    """Shared arm -> real SIGSTOP -> SIGKILL sequence used by both
+    end-to-end tests below. Returns the parsed `barrier.json` payload."""
     arm = subprocess.Popen(
         [
             sys.executable, "-m", "scripts.run_control_arm_reboot_drill",
             "--case-dir", str(case_dir), "--phase", "arm",
-            "--barrier", "AFTER_PREPARED", "--action", "submit", "--broker-outcome", "absent",
+            "--barrier", barrier, "--action", action, "--broker-outcome", broker_outcome,
         ],
         cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     try:
-        state = _wait_for_process_state(arm.pid, ("T",), timeout=30.0)
+        state = _wait_for_process_state(arm.pid, extra_wait_states, timeout=30.0)
         assert state.startswith("T"), (
             f"drill process never reached a stopped state (last ps state: {state!r}) -- "
             f"barrier.json exists: {(case_dir / 'barrier.json').is_file()}"
         )
         assert (case_dir / "barrier.json").is_file()
-        barrier_payload = json.loads((case_dir / "barrier.json").read_text(encoding="utf-8"))
-        assert barrier_payload["barrier"] == "AFTER_PREPARED"
-        assert barrier_payload["intent"]["status"] == "PREPARED"
+        return json.loads((case_dir / "barrier.json").read_text(encoding="utf-8"))
     finally:
         arm.kill()  # SIGKILL -- simulates the real crash/reboot at this exact point
         arm.wait(timeout=10.0)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP/ps -o state= are POSIX-only")
+def test_arm_then_kill_then_recover_end_to_end(tmp_path):
+    """The real sequence this whole harness exists for: arm a drill for
+    real, wait for the REAL SIGSTOP, kill -9 the stopped process
+    (simulating a crash at that exact point), then run --phase recover
+    as a genuinely fresh process and confirm RECOVERY ACTUALLY SUCCEEDED
+    -- not merely that one stray intent was found (reboot-drill finding
+    #1's own acceptance test, 2026-08-24; the ORIGINAL version of this
+    test only asserted the "before recovery" snapshot, which does not
+    prove recovery itself worked -- it did NOT, before the finding #1
+    fix: this exact scenario reproduced a real
+    `StrayPreparedIntentConflictError` deadlock, confirmed by hand
+    before writing this fix). Uses AFTER_PREPARED (the cheapest barrier
+    to reach) to keep this test fast; the full 6-barrier x 2-action x
+    2-outcome matrix is the owner's own drill to run for real, per this
+    module's own docstring."""
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+
+    barrier_payload = _arm_wait_for_stop_then_kill(
+        case_dir, barrier="AFTER_PREPARED", action="submit", broker_outcome="absent",
+    )
+    assert barrier_payload["barrier"] == "AFTER_PREPARED"
+    assert barrier_payload["intent"]["status"] == "PREPARED"
+    original_intent_id = barrier_payload["intent"]["intent_id"]
 
     recover = _run_drill_cli("--case-dir", str(case_dir), "--phase", "recover", "--broker-outcome", "absent", timeout=60.0)
     report_path = case_dir / "recovery_report.json"
     assert report_path.is_file(), f"recover stdout:\n{recover.stdout}\nstderr:\n{recover.stderr}"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["barrier"] == "AFTER_PREPARED"
-    # The stray PREPARED intent must have been found and resolved by the
-    # real Phase-1.5 recovery -- resolved all the way to TERMINAL for the
-    # broker-outcome=absent (confirmed 404) case, per
-    # resolve_stray_order_submission_intent's own documented contract.
     assert len(report["stray_intents_before_recovery"]) == 1
     assert report["stray_intents_before_recovery"][0]["status"] == "PREPARED"
+
+    # RECOVERY ACTUALLY SUCCEEDED -- the acceptance test's own real
+    # criteria, not just "a stray was found":
+    assert report["execute_raised"] is None, (
+        f"recovery raised instead of completing: {report['execute_raised']}"
+    )
+    assert report["execute_outcome"] == "RUN_OK"
+    # The SAME intent_id was reused (RESUMABLE_PREPARED, finding #1's own
+    # fix) -- never a second, divergent record for the same candidate --
+    # and it resolved past PREPARED as part of the same successful run.
+    stray_after = report["stray_intents_after_recovery"]
+    assert stray_after == [] or all(i["intent_id"] != original_intent_id for i in stray_after), (
+        "the original intent must not still be stray after a successful run"
+    )
+    # At most ONE real broker submission for this ticker's ENTRY_MARKET_BUY
+    # -- never a duplicate caused by the old deadlock's own retry/conflict.
+    entry_actions = [
+        record for key, record in report["final_position_state"]["submitted_actions"].items()
+        if record.get("kind") == "ENTRY_MARKET_BUY"
+    ]
+    assert len(entry_actions) <= 1
+    if entry_actions:
+        assert entry_actions[0]["client_order_id"] == barrier_payload["intent"]["client_order_id"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP/ps -o state= are POSIX-only")
+def test_submitting_then_broker_acknowledged_crash_fails_closed_with_the_specific_diagnosis(tmp_path):
+    """Reboot-drill finding #2's own acceptance scenario -- the most
+    dangerous window: SUBMITTING was durably recorded, the (fake) broker
+    genuinely acknowledged the order, and the process crashes BEFORE
+    local state (`submitted_actions`) is updated to reflect it. Recovery
+    must (a) NOT prematurely claim TERMINAL/done for the journal entry,
+    and (b) still halt fail-closed, but with the specific
+    `JournalAcknowledgedButLocalStateMissingError` diagnosis rather than
+    the generic "mystery order" one -- confirmed by hand before writing
+    this fix (the old code raised `UnknownBrokerOrderError` while the
+    journal had already, wrongly, closed TERMINAL)."""
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+
+    barrier_payload = _arm_wait_for_stop_then_kill(
+        case_dir, barrier="AFTER_SUBMITTING", action="submit", broker_outcome="present",
+    )
+    assert barrier_payload["barrier"] == "AFTER_SUBMITTING"
+    assert barrier_payload["intent"]["status"] == "SUBMITTING"
+
+    recover = _run_drill_cli("--case-dir", str(case_dir), "--phase", "recover", "--broker-outcome", "present", timeout=60.0)
+    report_path = case_dir / "recovery_report.json"
+    assert report_path.is_file(), f"recover stdout:\n{recover.stdout}\nstderr:\n{recover.stderr}"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    # Fail-closed, with the SPECIFIC diagnosis -- never the generic one,
+    # and never silently succeeding.
+    assert report["execute_raised"] is not None
+    assert "JournalAcknowledgedButLocalStateMissingError" in report["execute_raised"]
+    assert "UnknownBrokerOrderError" not in report["execute_raised"].split(":")[0]
+    assert report["execute_outcome"] is None
+
+    # The journal must be left HONESTLY at BROKER_ACKNOWLEDGED, never
+    # prematurely claimed TERMINAL -- the real bug finding #2 closes.
+    stray_after = report["stray_intents_after_recovery"]
+    assert len(stray_after) == 1
+    assert stray_after[0]["status"] == "BROKER_ACKNOWLEDGED"
+    assert stray_after[0]["broker_order_id"] is not None
+
+    # And local state must NOT have been fabricated to paper over the gap.
+    entry_actions = [
+        record for key, record in report["final_position_state"]["submitted_actions"].items()
+        if record.get("kind") == "ENTRY_MARKET_BUY"
+    ]
+    assert entry_actions == []
