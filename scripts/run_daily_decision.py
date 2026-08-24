@@ -205,6 +205,7 @@ from src.live.position_state import (
     load_position_state,
     save_position_state,
 )
+import src.live.session_replay_pass_gate as session_replay_pass_gate
 from src.live.single_instance_lock import single_instance_lock
 from src.notify.telegram_notifier import send_telegram_message
 
@@ -1707,12 +1708,73 @@ def _build_failure_notification_text(error: BaseException) -> str:
     )
 
 
+def _stamp_last_processed_dates(state_path: Path, guard_path: Path, *, actual_session_date: str) -> None:
+    """Second, separate read-modify-write after `run_daily_decision()`
+    returns -- moved here from `src/live/equity_session_orchestrator.py`
+    (2026-08-24, missing-session-replay cron-activation finding #1) so
+    BOTH the normal 21:15 job (`main()`, below) and the missing-session
+    replay path can call the exact same function, rather than each
+    keeping its own copy. Identical pattern to
+    `run_control_arm_decision._stamp_last_processed_dates` (that
+    function's own docstring explains the full "why a second save"
+    reasoning; not repeated here, just reused): `run_daily_decision()`'s
+    own internal save never populates `last_processed_equity_date`/
+    `last_processed_crypto_date`/`last_processed_equity_session_date`/
+    `last_processed_equity_bar_timestamp`, so this second, separate
+    save is the only way they ever become durable.
+
+    THE REAL, CLOSED GAP (finding #1): before this was wired into
+    `main()` itself, only a REPLAY run (via the orchestrator) ever
+    called this -- a NORMAL, successful daily run left these fields
+    `None` again immediately after `run_daily_decision()`'s own
+    internal save, confirmed by a real test using the genuine function,
+    not a fake. `main()` now calls this itself, under the SAME
+    `single_instance_lock` it already holds, immediately after a
+    successful `run_daily_decision()` call, so the normal path and the
+    replay path both keep the cursor honest."""
+    today = datetime.now(UTC).date().isoformat()
+    runner_state = load_position_state(state_path, guard_path=guard_path)
+    runner_state.last_processed_equity_date = today
+    runner_state.last_processed_crypto_date = today
+    runner_state.last_processed_equity_session_date = actual_session_date
+    runner_state.last_processed_equity_bar_timestamp = actual_session_date
+    save_position_state(runner_state, state_path, guard_path=guard_path)
+
+
+class MissingPassGateError(RuntimeError):
+    """Fail-closed (missing-session-replay cron-activation finding #2,
+    2026-08-24): the real 21:15 job refuses to submit real orders
+    without a same-day PASS gate already written by
+    `equity_session_orchestrator.run_missing_session_replay`'s own
+    self-verifying `_cursor_is_current` check. A bare `CLEAN_NO_OP`
+    orchestrator outcome is not, by itself, proof of safety (see that
+    module's own docstring) -- this gate is the durable evidence that
+    the check actually ran AND actually passed for TODAY, not merely
+    that the orchestrator was invoked. Checked BEFORE any credential
+    load, broker call, or state read/write -- zero API calls if the
+    gate is missing, same "cheapest, most local check first" discipline
+    STOP_FLAG_PATH already established. Scoped to real order-enabling
+    invocations only (`--enable-equity-orders`/`--enable-crypto-orders`),
+    mirroring `authorize_order_execution()`'s own established scope --
+    a dry-run invocation of this script (every existing test included)
+    is unaffected."""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one day of the frozen TREND_RSI strategy against live Alpaca data."
     )
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--decision-log-directory", type=Path, default=DEFAULT_DECISION_LOG_DIRECTORY)
+    parser.add_argument(
+        "--guard-path", type=Path, default=ps.HIGH_WATER_MARK_PATH,
+        help=(
+            "Rollback high-water-mark file location. Defaults to the real, out-of-repo path -- "
+            "override only in tests (added 2026-08-24, missing-session-replay cron-activation "
+            "finding #1: main() previously had no way to test-isolate this, the same discipline "
+            "run_daily_decision()'s own guard_path parameter already documents)."
+        ),
+    )
     parser.add_argument(
         "--enable-equity-orders",
         action="store_true",
@@ -1760,6 +1822,32 @@ def main() -> None:
             _notify_safe(text)
             return
 
+        # PASS-gate check (missing-session-replay cron-activation
+        # finding #2, 2026-08-24): scoped to real order-enabling
+        # invocations only, same "cheapest, most local check first"
+        # discipline as the STOP-flag check just above -- zero API
+        # calls either way. See `MissingPassGateError`'s own docstring
+        # for the full "why."
+        if arguments.enable_equity_orders or arguments.enable_crypto_orders:
+            if not session_replay_pass_gate.has_valid_pass_gate_for_today(
+                session_replay_pass_gate.DEFAULT_PASS_GATE_DIRECTORY
+            ):
+                error = MissingPassGateError(
+                    "Refusing to submit real orders: no same-day PASS gate found at "
+                    f"{session_replay_pass_gate.DEFAULT_PASS_GATE_DIRECTORY} -- "
+                    "equity_session_orchestrator.run_missing_session_replay has not yet "
+                    "confirmed (or failed to confirm) the session cursor is genuinely caught "
+                    "up today. Fail-closed; zero API calls made."
+                )
+                notified = _notify_safe(_build_failure_notification_text(error))
+                if not notified:
+                    print(
+                        "WARNING: Telegram failure notification could not be confirmed sent. "
+                        f"Original error: {type(error).__name__}: {error}",
+                        file=sys.stderr,
+                    )
+                raise error
+
         freeze = FREEZE_FLAG_PATH.exists()
         if freeze:
             text = (
@@ -1793,6 +1881,7 @@ def main() -> None:
                 enable_crypto_orders=arguments.enable_crypto_orders,
                 freeze=freeze,
                 authorization=authorization,
+                guard_path=arguments.guard_path,
             )
         except Exception as error:
             # Notify, then re-raise unchanged -- the notification step must
@@ -1816,6 +1905,21 @@ def main() -> None:
                     file=sys.stderr,
                 )
             raise
+
+        # Second save -- missing-session-replay cron-activation finding
+        # #1, 2026-08-24: a normal, successful run must ALSO stamp the
+        # session cursor, under this SAME lock, atomically, using the
+        # REAL session `run_daily_decision()` just processed -- not just
+        # a replay run (see `_stamp_last_processed_dates`'s own
+        # docstring for the full "why" and the real gap this closes).
+        # `actual_session_date` should always be present for a
+        # successful run; the `is not None` guard is defensive, matching
+        # `_verify_actual_equity_session`-style guards used elsewhere in
+        # this codebase rather than assuming the decision dict's own
+        # shape can never surprise this caller.
+        actual_session_date = result["decision"].get("as_of_bar_timestamp_equity")
+        if actual_session_date is not None:
+            _stamp_last_processed_dates(arguments.state_path, arguments.guard_path, actual_session_date=actual_session_date)
 
         print(json.dumps(result["decision"], indent=2, sort_keys=True, default=str))
         print()

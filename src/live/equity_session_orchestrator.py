@@ -152,6 +152,7 @@ import src.live.broker_reconciliation as broker_reconciliation
 import src.live.equity_session_detection as detection
 import src.live.missed_session_window_handling as missed_window
 import src.live.session_replay_journal as session_journal
+import src.live.session_replay_pass_gate as pass_gate
 from src.live import order_submission
 from src.live.live_universe import LIVE_CONTROLLED_TICKERS
 from src.live.single_instance_lock import single_instance_lock
@@ -341,23 +342,35 @@ def _verify_pending_orders_are_fresh_for_replay(runner_state: Any, *, last_proce
         )
 
 
-def _stamp_last_processed_dates(state_path: Path, guard_path: Path, *, actual_session_date: str) -> None:
-    """The real fix for the root cause this whole module exists to
-    close -- see module docstring. Identical pattern to
-    `run_control_arm_decision._stamp_last_processed_dates` (that
-    function's own docstring explains the full "why a second save"
-    reasoning; not repeated here, just reused): `run_daily_decision()`'s
-    own internal save never populates these fields, so a second,
-    separate read-modify-write after it returns is the only way they
-    ever become durable for the LIVE path -- which, unlike control-arm,
-    has never had ANY caller doing this until now."""
-    today = datetime.now(timezone.utc).date().isoformat()
-    runner_state = rdd.ps.load_position_state(state_path, guard_path=guard_path)
-    runner_state.last_processed_equity_date = today
-    runner_state.last_processed_crypto_date = today
-    runner_state.last_processed_equity_session_date = actual_session_date
-    runner_state.last_processed_equity_bar_timestamp = actual_session_date
-    rdd.ps.save_position_state(runner_state, state_path, guard_path=guard_path)
+# `_stamp_last_processed_dates` now lives in `scripts/run_daily_decision.py`
+# itself (moved there 2026-08-24, missing-session-replay cron-activation
+# finding #1) -- BOTH this module's own replay path AND the normal
+# 21:15 job's `main()` need the identical function, and this module
+# already imports `rdd`, so `rdd._stamp_last_processed_dates` is reused
+# directly below rather than kept as a second, duplicate copy here
+# (the reverse direction -- `rdd` importing this module -- would create
+# a circular import, since this module already imports `rdd`).
+
+
+def _cursor_is_current(trading_client: TradingClient, runner_state: Any) -> bool:
+    """Missing-session-replay cron-activation finding #2: the real,
+    self-verifying check behind the PASS gate (`session_replay_pass_gate.py`)
+    -- re-derives "is there anything left to catch up on" independently
+    from a fresh calendar call, rather than trusting which branch of
+    `run_missing_session_replay`'s own control flow happened to return.
+    `False` for every case that is NOT genuinely safe: no cursor at all
+    yet (nothing to verify against), or at least one real, settled
+    session still expected beyond the current cursor (a missing session
+    still awaiting data, or a missed window that was only cleared, never
+    actually caught up -- see `handle_missed_execution_window`'s own
+    docstring for why that path never advances the cursor). `True` only
+    when the cursor is the single, most-recently-settled session with
+    nothing newer expected."""
+    cursor = runner_state.last_processed_equity_session_date
+    if cursor is None:
+        return False
+    still_expected = detection.fetch_expected_equity_sessions(trading_client, since_date=cursor)
+    return not still_expected
 
 
 def _write_provenance_log(
@@ -445,10 +458,28 @@ def _finish(
     state_hash_before: str | None = None,
     state_hash_after: str | None = None,
     real_decision_log_path: str | None = None,
+    runner_state: Any | None = None,
+    trading_client: TradingClient | None = None,
+    pass_gate_directory: Path | None = None,
 ) -> OrchestratorResult:
     """Single funnel every successful return path goes through --
     always writes exactly one provenance record (finding #6), then
-    builds the matching `OrchestratorResult`."""
+    builds the matching `OrchestratorResult`.
+
+    `runner_state`/`trading_client`/`pass_gate_directory` (missing-
+    session-replay cron-activation finding #2, 2026-08-24): when BOTH
+    `runner_state` and `trading_client` are given, `_cursor_is_current`
+    re-verifies independently whether the session cursor is genuinely
+    caught up, and writes the dated PASS gate
+    (`session_replay_pass_gate.write_pass_gate`) only if so. Omitted
+    entirely (both left `None`) by call sites that have not yet loaded
+    real state/resolved a client at all (the STOP-flag short-circuit)
+    or that deliberately must never gate-pass (there is no prior cursor
+    to verify against yet) -- `_cursor_is_current` itself already
+    returns `False` for a `None` cursor, so passing both through
+    uniformly from every OTHER call site is safe and requires no
+    per-branch judgment call here: the self-verifying check decides,
+    not which code path happened to call `_finish`."""
     provenance_path = _write_provenance_log(
         directory=provenance_log_directory,
         processing_mode=processing_mode,
@@ -466,6 +497,13 @@ def _finish(
         real_decision_log_path=real_decision_log_path,
         account_number_masked=account_number_masked,
     )
+    if runner_state is not None and trading_client is not None and pass_gate_directory is not None:
+        if _cursor_is_current(trading_client, runner_state):
+            pass_gate.write_pass_gate(
+                pass_gate_directory,
+                last_processed_equity_session_date=runner_state.last_processed_equity_session_date,
+                account_number_masked=account_number_masked,
+            )
     return OrchestratorResult(
         outcome=outcome,
         detection=detection_result,
@@ -481,6 +519,7 @@ def run_missing_session_replay(
     decision_log_directory: Path = rdd.DEFAULT_DECISION_LOG_DIRECTORY,
     guard_path: Path = rdd.ps.HIGH_WATER_MARK_PATH,
     provenance_log_directory: Path = DEFAULT_PROVENANCE_LOG_DIRECTORY,
+    pass_gate_directory: Path = pass_gate.DEFAULT_PASS_GATE_DIRECTORY,
     trading_client: TradingClient | None = None,
     tickers: tuple[str, ...] = LIVE_CONTROLLED_TICKERS,
 ) -> OrchestratorResult:
@@ -564,6 +603,7 @@ def run_missing_session_replay(
             return _finish(
                 outcome="CLEAN_NO_OP", processing_mode=PROCESSING_MODE_NORMAL,
                 provenance_log_directory=provenance_log_directory, account_number_masked=account_number_masked,
+                runner_state=runner_state, trading_client=trading_client, pass_gate_directory=pass_gate_directory,
             )
 
         detection_result = detection.detect_missing_equity_sessions(
@@ -584,6 +624,7 @@ def run_missing_session_replay(
                 outcome="CLEAN_NO_OP", processing_mode=PROCESSING_MODE_NORMAL,
                 provenance_log_directory=provenance_log_directory, account_number_masked=account_number_masked,
                 detection_result=detection_result,
+                runner_state=runner_state, trading_client=trading_client, pass_gate_directory=pass_gate_directory,
             )
 
         if detection_result.unexpected_future_bars:
@@ -650,6 +691,7 @@ def run_missing_session_replay(
                 guard_path=Path(guard_path),
                 trading_client=trading_client,
                 provenance_log_directory=provenance_log_directory,
+                pass_gate_directory=pass_gate_directory,
                 last_processed_session_before=last_processed_session_before,
                 account_number_masked=account_number_masked,
             )
@@ -673,6 +715,7 @@ def run_missing_session_replay(
                 outcome="CLEAN_NO_OP", processing_mode=PROCESSING_MODE_NORMAL,
                 provenance_log_directory=provenance_log_directory, account_number_masked=account_number_masked,
                 detection_result=detection_result,
+                runner_state=runner_state, trading_client=trading_client, pass_gate_directory=pass_gate_directory,
             )
 
         # The missing session is not simply "hasn't arrived yet in a
@@ -695,6 +738,7 @@ def run_missing_session_replay(
             last_processed_session_before=last_processed_session_before,
             last_processed_session_after=runner_state.last_processed_equity_session_date,
             missing_tickers=detection_result.missing_by_session[missing_session],
+            runner_state=runner_state, trading_client=trading_client, pass_gate_directory=pass_gate_directory,
         )
 
 
@@ -707,6 +751,7 @@ def _replay_one_session(
     guard_path: Path,
     trading_client: TradingClient,
     provenance_log_directory: Path,
+    pass_gate_directory: Path,
     last_processed_session_before: str | None,
     account_number_masked: str | None,
 ) -> OrchestratorResult:
@@ -728,10 +773,13 @@ def _replay_one_session(
             # orchestrator (e.g. re-invoked after a clean exit before
             # the cursor's own next detection pass moved past it) --
             # never replay the same session twice.
+            already_replayed_runner_state = rdd.ps.load_position_state(state_path, guard_path=guard_path)
             return _finish(
                 outcome="CLEAN_NO_OP", processing_mode=PROCESSING_MODE_NORMAL,
                 provenance_log_directory=provenance_log_directory, account_number_masked=account_number_masked,
                 detection_result=detection_result,
+                runner_state=already_replayed_runner_state, trading_client=trading_client,
+                pass_gate_directory=pass_gate_directory,
             )
         # Independent audit round 3, finding #3b: a FAILED terminal
         # record for this EXACT session_id (same date + bar-set hash)
@@ -826,11 +874,16 @@ def _replay_one_session(
 
     session_journal.transition_session_intent(intent, session_journal.VERIFIED)
 
-    _stamp_last_processed_dates(state_path, guard_path, actual_session_date=actual_session)
+    rdd._stamp_last_processed_dates(state_path, guard_path, actual_session_date=actual_session)
 
     state_hash_after = _hash_state_file(state_path)
     session_journal.transition_session_intent(intent, session_journal.COMMITTED, state_hash_after=state_hash_after)
     session_journal.transition_session_intent(intent, session_journal.TERMINAL, outcome=session_journal.SUCCEEDED)
+
+    # Reload fresh from disk -- reflects the true persisted state after
+    # `_stamp_last_processed_dates`'s own save, for the PASS-gate check
+    # below (`_finish`'s own `runner_state`/`trading_client` params).
+    post_replay_runner_state = rdd.ps.load_position_state(state_path, guard_path=guard_path)
 
     return _finish(
         outcome="REPLAYED_ONE_SESSION", processing_mode=PROCESSING_MODE_DELAYED_SESSION,
@@ -843,4 +896,6 @@ def _replay_one_session(
         replay_sequence_index=1, replay_sequence_total=1, bar_set_sha256=bar_hash,
         state_hash_before=state_hash_before, state_hash_after=state_hash_after,
         real_decision_log_path=str(result["log_path"]),
+        runner_state=post_replay_runner_state, trading_client=trading_client,
+        pass_gate_directory=pass_gate_directory,
     )

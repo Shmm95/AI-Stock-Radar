@@ -36,6 +36,7 @@ import src.live.broker_reconciliation as broker_reconciliation
 import src.live.equity_session_detection as detection
 import src.live.equity_session_orchestrator as orchestrator
 import src.live.session_replay_journal as session_journal
+import src.live.session_replay_pass_gate as pass_gate
 import src.live.single_instance_lock as single_instance_lock_module
 from src.backtest.portfolio_backtest_engine import _MutablePosition, _PendingOrder
 from src.backtest.portfolio_backtest_models import PortfolioSignal
@@ -115,6 +116,7 @@ def _paths(tmp_path):
         "decision_log_directory": tmp_path / "decisions",
         "guard_path": tmp_path / "high_water_mark.json",
         "provenance_log_directory": tmp_path / "provenance",
+        "pass_gate_directory": tmp_path / "pass_gate",
     }
 
 
@@ -143,6 +145,7 @@ def _run(paths, *, trading_client=None):
         decision_log_directory=paths["decision_log_directory"],
         guard_path=paths["guard_path"],
         provenance_log_directory=paths["provenance_log_directory"],
+        pass_gate_directory=paths["pass_gate_directory"],
         trading_client=trading_client or _FakeClient(),
     )
 
@@ -661,6 +664,116 @@ def test_preflight_reconciliation_treats_live_positions_as_order_backed(tmp_path
     )
     _run(paths)
     assert captured == {"equity_orders_enabled": True, "crypto_orders_enabled": True}
+
+
+# --- missing-session-replay cron-activation finding #2: dated PASS gate ----
+
+
+def test_cursor_is_current_false_for_a_none_cursor():
+    state = SimpleNamespace(last_processed_equity_session_date=None)
+    assert orchestrator._cursor_is_current(_FakeClient(), state) is False
+
+
+def test_cursor_is_current_true_when_nothing_further_expected(monkeypatch):
+    state = SimpleNamespace(last_processed_equity_session_date="2026-08-20")
+    monkeypatch.setattr(orchestrator.detection, "fetch_expected_equity_sessions", lambda *a, **k: [])
+    assert orchestrator._cursor_is_current(_FakeClient(), state) is True
+
+
+def test_cursor_is_current_false_when_a_session_is_still_expected(monkeypatch):
+    state = SimpleNamespace(last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(orchestrator.detection, "fetch_expected_equity_sessions", lambda *a, **k: ["2026-08-20"])
+    assert orchestrator._cursor_is_current(_FakeClient(), state) is False
+
+
+def test_gate_is_written_when_no_expected_sessions_and_cursor_was_already_current(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=[]),
+    )
+    monkeypatch.setattr(orchestrator, "_cursor_is_current", lambda *a, **k: True)
+    result = _run(paths)
+    assert result.outcome == "CLEAN_NO_OP"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is True
+
+
+def test_gate_is_not_written_when_stop_flag_set(tmp_path, monkeypatch):
+    stop_flag = tmp_path / "STOP"
+    stop_flag.write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(orchestrator.rdd, "STOP_FLAG_PATH", stop_flag)
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+
+    result = _run(paths)
+    assert result.outcome == "CLEAN_NO_OP"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is False
+
+
+def test_gate_is_not_written_when_sole_expected_session_still_missing_data(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(
+            expected_sessions=["2026-08-20"], missing_by_session={"2026-08-20": ("AAPL",)}
+        ),
+    )
+    # `_cursor_is_current`'s own independent re-verification calls
+    # fetch_expected_equity_sessions directly (never trusts the
+    # detect_missing_equity_sessions mock above) -- mocked here to
+    # reflect the SAME real fact this scenario represents (a session is
+    # genuinely still expected beyond the stale cursor), so the
+    # self-verifying check correctly agrees rather than drifting from
+    # a fake calendar unrelated to this test's own scenario.
+    monkeypatch.setattr(orchestrator.detection, "fetch_expected_equity_sessions", lambda *a, **k: ["2026-08-20"])
+    result = _run(paths)
+    assert result.outcome == "CLEAN_NO_OP"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is False
+
+
+def test_gate_is_not_written_after_missed_window_handling(tmp_path, monkeypatch):
+    """MISSED_WINDOW_HANDLED clears stale signals but never advances the
+    cursor -- the underlying gap is still real, so the 21:15 job must
+    still refuse to proceed. `_cursor_is_current`'s own re-verification
+    naturally reflects this (the stale cursor still has something
+    expected beyond it), so no gate is written."""
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-18")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(
+            expected_sessions=["2026-08-19", "2026-08-20"],
+            missing_by_session={"2026-08-19": ("AAPL",)},
+        ),
+    )
+    # See the sibling test above for why fetch_expected_equity_sessions
+    # (not detect_missing_equity_sessions) is what _cursor_is_current
+    # actually calls -- mocked to agree with this scenario's own real
+    # fact (the cursor is stale, something is still expected beyond it).
+    monkeypatch.setattr(orchestrator.detection, "fetch_expected_equity_sessions", lambda *a, **k: ["2026-08-19"])
+    result = _run(paths)
+    assert result.outcome == "MISSED_WINDOW_HANDLED"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is False
+
+
+def test_gate_is_written_after_a_successful_replay(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    _save_runner_state(paths, last_processed_equity_session_date="2026-08-19")
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: _detection_result(expected_sessions=["2026-08-20"], raw_bars_by_ticker={}),
+    )
+    monkeypatch.setattr(
+        orchestrator.rdd, "run_daily_decision",
+        _fake_run_daily_decision_factory("2026-08-20", log_path=tmp_path / "decision.json"),
+    )
+    monkeypatch.setattr(orchestrator, "_cursor_is_current", lambda *a, **k: True)
+
+    result = _run(paths)
+    assert result.outcome == "REPLAYED_ONE_SESSION"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is True
 
 
 # --- scenario 11 / independent-audit-round-3 finding #2: session-cursor

@@ -40,6 +40,7 @@ from src.live.equity_session_orchestrator import (
     SessionReplayFailClosedError,
     run_missing_session_replay,
 )
+from src.live.session_replay_pass_gate import DEFAULT_PASS_GATE_DIRECTORY
 
 
 def _result_to_json_dict(result: OrchestratorResult) -> dict:
@@ -85,6 +86,14 @@ def main() -> None:
     parser.add_argument("--decision-log-directory", type=Path, default=rdd.DEFAULT_DECISION_LOG_DIRECTORY)
     parser.add_argument("--guard-path", type=Path, default=rdd.ps.HIGH_WATER_MARK_PATH)
     parser.add_argument("--provenance-log-directory", type=Path, default=DEFAULT_PROVENANCE_LOG_DIRECTORY)
+    parser.add_argument(
+        "--pass-gate-directory", type=Path, default=DEFAULT_PASS_GATE_DIRECTORY,
+        help=(
+            "Where the dated PASS gate is written when the session cursor is confirmed "
+            "genuinely caught up -- the real 21:15 job (run_daily_decision.py --enable-equity-"
+            "orders/--enable-crypto-orders) refuses to proceed without a same-day gate here."
+        ),
+    )
     arguments = parser.parse_args()
 
     if rdd.STOP_FLAG_PATH.exists():
@@ -103,6 +112,7 @@ def main() -> None:
             decision_log_directory=arguments.decision_log_directory,
             guard_path=arguments.guard_path,
             provenance_log_directory=arguments.provenance_log_directory,
+            pass_gate_directory=arguments.pass_gate_directory,
         )
     except Exception as error:
         # Same discipline as run_daily_decision.py's own main(): notify,
