@@ -32,6 +32,8 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+from src.live import position_state as ps  # noqa: E402
+
 # The drill module, as a MODULE-LEVEL side effect of merely being
 # imported (see that file's own "STEP 0" docstring section), (a)
 # neutralizes `dotenv.load_dotenv` GLOBALLY and (b) sets/pops several
@@ -422,3 +424,117 @@ def test_submitting_then_broker_acknowledged_crash_fails_closed_with_the_specifi
         if record.get("kind") == "ENTRY_MARKET_BUY"
     ]
     assert entry_actions == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGSTOP/ps -o state= are POSIX-only")
+def test_stray_intent_for_a_different_signal_is_not_resumed_and_recovers_deterministically(tmp_path):
+    """Independent-audit finding, 2026-08-24 -- the two follow-up gaps
+    found in the fix for finding #1, both closed here in one real,
+    subprocess-based scenario:
+
+    (a) `_stray_intent_matches_live_candidate`'s REAL bug: the original
+    version recomputed a stray intent's own `client_order_id` from its
+    OWN stored fields and compared it to its OWN stored `client_order_id`
+    -- tautological, always true given a same-ticker pending candidate,
+    regardless of whether that candidate was genuinely the SAME signal.
+    Reproduced here for real: between the crash and recovery, the
+    on-disk `pending_signal_metadata` for the armed candidate is
+    mutated to a DIFFERENT `target_execution_session_date` (simulating
+    "the pending signal changed underneath the crashed run" -- e.g. a
+    TTL re-evaluation or an operator action) -- recovery must NOT resume
+    the stray intent into this unrelated candidate.
+
+    (b) Because `_write_blind_prepared_intents` still needs to write a
+    fresh PREPARED intent for AA's own (still-pending, just different)
+    candidate under the SAME client_order_id (both dates are today's
+    real session), this run ALSO exercises the exact TERMINAL+PREPARED
+    duplicate-record scenario for real -- and a subsequent lookup inside
+    this SAME recovery run (the write-ahead-evidence check, right before
+    `rdd.run_daily_decision()`) must deterministically find the fresh
+    ACTIVE record, never the old TERMINAL one, for the run to complete.
+    """
+    case_dir = tmp_path / "case"
+    case_dir.mkdir()
+
+    barrier_payload = _arm_wait_for_stop_then_kill(
+        case_dir, barrier="AFTER_PREPARED", action="submit", broker_outcome="absent",
+    )
+    assert barrier_payload["intent"]["status"] == "PREPARED"
+    stale_client_order_id = barrier_payload["intent"]["client_order_id"]
+
+    # Simulate "the pending signal changed underneath the crashed run":
+    # mutate the on-disk pending_signal_metadata for AA|BUY to a
+    # DIFFERENT target_execution_session_date than the stray intent's
+    # own source_signal_timestamp -- a genuinely different signal
+    # instance, not the same one the crashed run was working on. This
+    # subprocess's own guard directory (order_intents, high_water_mark)
+    # lives under case_dir/guard -- see the module-level
+    # AI_STOCK_RADAR_GUARD_DIR isolation each drill subprocess sets up
+    # for itself (module docstring safety point (1)).
+    state_paths = drill._drill_paths(case_dir)
+    guard_path = case_dir / "guard" / "high_water_mark.json"
+    state = ps.load_position_state(state_paths["state_path"], guard_path=guard_path)
+    assert "AA|BUY" in state.pending_signal_metadata
+    # A FUTURE date, not a past one: `pending_signal_ttl.evaluate_pending_signals`
+    # leaves a signal completely untouched whenever
+    # `expected_session_date <= target_execution_session_date` (see that
+    # function's own docstring) -- a PAST date would instead get pruned
+    # as expired before `_write_blind_prepared_intents` ever runs, which
+    # tests TTL pruning, not this fix. A future date keeps AA's candidate
+    # genuinely live and pending today while still differing from the
+    # stray intent's own `source_signal_timestamp` (today), which is
+    # exactly the real-world shape of the bug: the SAME ticker has a
+    # different, still-valid signal instance than the one the crashed
+    # run was working on.
+    state.pending_signal_metadata["AA|BUY"]["target_execution_session_date"] = "2099-01-01"
+    ps.save_position_state(state, state_paths["state_path"], guard_path=guard_path)
+
+    recover = _run_drill_cli("--case-dir", str(case_dir), "--phase", "recover", "--broker-outcome", "absent", timeout=60.0)
+    report_path = case_dir / "recovery_report.json"
+    assert report_path.is_file(), f"recover stdout:\n{recover.stdout}\nstderr:\n{recover.stderr}"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    # (a) The mismatch must be honored: the confirmed-404 stray closes
+    # ABANDONED_NO_SUBMISSION (TERMINAL), never silently resumed into
+    # the now-different pending candidate. `stray_intents_after_recovery`
+    # only lists NON-terminal intents by construction, so its absence
+    # there is expected; read the real on-disk journal directly (this
+    # subprocess's own isolated guard dir, same filesystem) for the
+    # authoritative proof, including the TERMINAL+PREPARED duplicate
+    # pair bug #2's fix must now resolve correctly.
+    intent_directory = case_dir / "guard" / "order_intents"
+    on_disk_intents = [
+        json.loads(p.read_text(encoding="utf-8")) for p in sorted(intent_directory.glob("*.json"))
+    ]
+    matching_client_order_id = [i for i in on_disk_intents if i.get("client_order_id") == stale_client_order_id]
+    assert len(matching_client_order_id) == 2, (
+        f"expected exactly 2 on-disk records for {stale_client_order_id!r} (the abandoned original "
+        f"+ a fresh one for today's still-pending, now-different candidate), got: {matching_client_order_id}"
+    )
+    # Both end up TERMINAL by the end of a fully successful run -- the
+    # abandoned original AND the fresh record, which (bug #2's fix
+    # letting the write-ahead-evidence check find IT, not the stale
+    # one) went on to actually submit and fill for real. What matters
+    # is that they are two DIFFERENT records, closed for two DIFFERENT
+    # reasons -- never one masquerading as the other.
+    abandoned = [i for i in matching_client_order_id if "ABANDONED_NO_SUBMISSION" in (i.get("last_error") or "")]
+    filled = [i for i in matching_client_order_id if i.get("broker_status") == "filled"]
+    assert len(abandoned) == 1, f"expected exactly one ABANDONED_NO_SUBMISSION record: {matching_client_order_id}"
+    assert len(filled) == 1, f"expected exactly one genuinely-filled record: {matching_client_order_id}"
+    assert abandoned[0]["intent_id"] != filled[0]["intent_id"]
+
+    # (b) Recovery must still complete successfully -- proves the
+    # duplicate-record lookup (bug #2's fix) resolved to the fresh
+    # ACTIVE record, not the stale TERMINAL one, letting this run's own
+    # write-ahead-evidence check and run_daily_decision() proceed.
+    assert report["execute_raised"] is None, f"recovery raised: {report['execute_raised']}"
+    assert report["execute_outcome"] == "RUN_OK"
+    assert recover.returncode == 0
+
+    # Exactly ONE real broker submission -- never a duplicate caused by
+    # the TERMINAL+PREPARED pair sharing one client_order_id.
+    entry_actions = [
+        record for key, record in report["final_position_state"]["submitted_actions"].items()
+        if record.get("kind") == "ENTRY_MARKET_BUY"
+    ]
+    assert len(entry_actions) == 1

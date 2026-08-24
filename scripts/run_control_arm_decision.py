@@ -619,12 +619,13 @@ class StrayPreparedIntentConflictError(RuntimeError):
 def _stray_intent_matches_live_candidate(intent: order_intent.OrderIntent, runner_state) -> bool:
     """Reboot-drill finding #1 (2026-08-24): does THIS run still have a
     live, EXACTLY matching candidate for a stray submission intent --
-    ticker, action_kind, client_order_id, account_identity, and side ALL
-    agree with a currently-queued `pending_buys`/`pending_exits` entry.
-    Used by Phase 1.5 to decide whether a confirmed-404-from-PREPARED
-    stray should be left RESUMABLE (reused by `_write_blind_prepared_intents`
-    below, exactly as if this were a plain crash-before-`rdd.run_daily_decision()`
-    case) rather than closed `ABANDONED_NO_SUBMISSION` -- see
+    ticker, action_kind, account_identity, side, AND the specific real
+    signal instance behind today's `pending_buys`/`pending_exits` entry
+    ALL agree with the intent. Used by Phase 1.5 to decide whether a
+    confirmed-404-from-PREPARED stray should be left RESUMABLE (reused
+    by `_write_blind_prepared_intents` below, exactly as if this were a
+    plain crash-before-`rdd.run_daily_decision()` case) rather than
+    closed `ABANDONED_NO_SUBMISSION` -- see
     `order_intent_reconciliation.resolve_stray_order_submission_intent`'s
     own docstring for the full "why" this parameter exists.
 
@@ -634,21 +635,42 @@ def _stray_intent_matches_live_candidate(intent: order_intent.OrderIntent, runne
     pre-queued (see `_order_intent_hook_for_run`'s own docstring) --
     `False` immediately for anything else.
 
-    `client_order_id` is re-derived from `intent.ticker`/`intent.action_kind`/
-    `intent.source_signal_timestamp` and compared against the intent's
-    own STORED `client_order_id`, rather than trusted blindly -- this is
-    what makes the match "exact" with respect to session date too: if
-    the intent was originally prepared for a DIFFERENT session than
-    today's real `expected_session_date`, `_write_blind_prepared_intents`
-    would compute a different id entirely for today's own candidate and
-    would never even look this intent up by that id in the first place,
-    so an intentionally-stale intent can never spuriously match here."""
+    THE REAL BUG THIS CLOSES (independent-audit finding, 2026-08-24):
+    the ORIGINAL version of this check, after the ticker/account/side
+    checks above, recomputed `client_order_id` from the INTENT'S OWN
+    stored `ticker`/`action_kind`/`source_signal_timestamp` and compared
+    it to the intent's own stored `client_order_id` -- but that
+    `client_order_id` was itself originally computed by that exact same
+    formula from those exact same stored fields, so the comparison was
+    TAUTOLOGICAL: it always passed (given a same-ticker pending
+    candidate exists), regardless of whether that pending candidate was
+    actually the SAME signal the stray intent belongs to, or a
+    completely different, newer signal for the same ticker. Confirmed
+    with a real failing case: a stale intent from 2026-08-01 spuriously
+    matched an unrelated, genuinely new pending signal from 2026-08-17
+    for the same ticker.
+
+    THE FIX: cross-check against `pending_signal_metadata` (see
+    `pending_signal_ttl.py`'s own module docstring) -- the one
+    authoritative record of which real signal instance today's
+    `pending_buys`/`pending_exits` entry for this ticker actually is.
+    `target_execution_session_date` is fixed exactly once, per signal,
+    at the moment it was first queued (`next_equity_session_date`), and
+    is exactly the session `_write_blind_prepared_intents` stamps as a
+    fresh intent's own `source_signal_timestamp` when that signal is due
+    -- so comparing the two is a real cross-check against the pending
+    candidate's own identity, not the intent's own self-consistency.
+    Fail-closed (returns `False`, never assumes a match) whenever that
+    metadata is missing or incomplete -- an untracked pending candidate
+    is never treated as "proven same" by default."""
     if intent.action_kind == "ENTRY_MARKET_BUY":
         pending = runner_state.pending_buys.get(intent.ticker)
         expected_side = "BUY"
+        kind = pending_signal_ttl.KIND_BUY
     elif intent.action_kind == "SIGNAL_EXIT_MARKET_SELL":
         pending = runner_state.pending_exits.get(intent.ticker)
         expected_side = "SELL"
+        kind = pending_signal_ttl.KIND_EXIT
     else:
         return False
     if pending is None:
@@ -657,10 +679,13 @@ def _stray_intent_matches_live_candidate(intent: order_intent.OrderIntent, runne
         return False
     if intent.side != expected_side:
         return False
-    recomputed_client_order_id = rdd.client_order_id_for_action(
-        intent.ticker, intent.action_kind, str(intent.source_signal_timestamp)
-    )
-    return recomputed_client_order_id == intent.client_order_id
+    metadata = runner_state.pending_signal_metadata.get(f"{intent.ticker}|{kind}")
+    if not metadata:
+        return False
+    target_execution_session_date = metadata.get("target_execution_session_date")
+    if not target_execution_session_date:
+        return False
+    return str(target_execution_session_date) == str(intent.source_signal_timestamp)
 
 
 def _write_blind_prepared_intents(

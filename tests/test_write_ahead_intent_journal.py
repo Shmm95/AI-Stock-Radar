@@ -197,12 +197,38 @@ def test_b2_a_leftover_terminal_intent_is_ignored_not_raised_on(tmp_path):
     assert reloaded_old.last_error == "ABANDONED_NO_SUBMISSION: simulated prior-run abandonment"
 
 
-# --- _stray_intent_matches_live_candidate (reboot-drill finding #1, 2026-08-24) ---
+# --- _stray_intent_matches_live_candidate (reboot-drill finding #1, 2026-08-24; ---
+# --- signal-identity fix, independent-audit finding, 2026-08-24)              ---
+
+
+def _pending_signal_metadata_entry(target_execution_session_date: str) -> dict:
+    """A `pending_signal_metadata` record shaped like
+    `pending_signal_ttl.py`'s own real schema -- the authoritative
+    per-signal record `_stray_intent_matches_live_candidate` now
+    cross-checks against, rather than trusting a same-ticker
+    `pending_buys`/`pending_exits` entry alone."""
+    return {
+        "source_session_date": "2026-08-14",
+        "target_execution_session_date": target_execution_session_date,
+        "created_at_utc": "2026-08-14T00:00:00Z",
+        "signal_id": f"signal-{target_execution_session_date}",
+        "status": "pending",
+        "expire_reason": None,
+    }
 
 
 def test_matches_live_candidate_true_for_an_exact_match():
     runner_state = ps.LiveRunnerState()
     runner_state.pending_buys["MTCH"] = _pending_buy("MTCH")
+    runner_state.pending_signal_metadata["MTCH|BUY"] = _pending_signal_metadata_entry("2026-08-17")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is True
+
+
+def test_matches_live_candidate_true_for_an_exact_exit_match():
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_exits["MTCX"] = _pending_exit("MTCX")
+    runner_state.pending_signal_metadata["MTCX|EXIT"] = _pending_signal_metadata_entry("2026-08-17")
     intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
     assert carm._stray_intent_matches_live_candidate(intent, runner_state) is True
 
@@ -210,6 +236,7 @@ def test_matches_live_candidate_true_for_an_exact_match():
 def test_matches_live_candidate_false_when_candidate_no_longer_pending():
     runner_state = ps.LiveRunnerState()
     runner_state.pending_buys["GONE"] = _pending_buy("GONE")
+    runner_state.pending_signal_metadata["GONE|BUY"] = _pending_signal_metadata_entry("2026-08-17")
     intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
     del runner_state.pending_buys["GONE"]  # consumed/expired by something else this run
     assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
@@ -218,6 +245,7 @@ def test_matches_live_candidate_false_when_candidate_no_longer_pending():
 def test_matches_live_candidate_false_for_a_different_account_identity():
     runner_state = ps.LiveRunnerState()
     runner_state.pending_buys["ACCT"] = _pending_buy("ACCT")
+    runner_state.pending_signal_metadata["ACCT|BUY"] = _pending_signal_metadata_entry("2026-08-17")
     intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
     intent.account_identity = "some_other_account"
     assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
@@ -226,24 +254,59 @@ def test_matches_live_candidate_false_for_a_different_account_identity():
 def test_matches_live_candidate_false_for_a_mismatched_side():
     runner_state = ps.LiveRunnerState()
     runner_state.pending_buys["SIDE"] = _pending_buy("SIDE")
+    runner_state.pending_signal_metadata["SIDE|BUY"] = _pending_signal_metadata_entry("2026-08-17")
     intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
     intent.side = "SELL"  # should be BUY for an ENTRY_MARKET_BUY candidate
     assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
 
 
-def test_matches_live_candidate_false_for_a_different_session_date():
-    """A stale intent whose own client_order_id was computed for a
-    DIFFERENT session must never spuriously match today's candidate --
-    the recomputed client_order_id (using the intent's own stored
-    source_signal_timestamp) will legitimately differ from what a fresh
-    intent for TODAY's session would carry."""
+def test_matches_live_candidate_false_when_pending_signal_metadata_is_missing():
+    """Fail-closed default (independent-audit finding, 2026-08-24): an
+    untracked pending candidate -- no `pending_signal_metadata` record
+    at all -- must never be assumed to match. This is the REAL, common
+    shape of "metadata eksik" the audit asked for, not an edge case."""
     runner_state = ps.LiveRunnerState()
-    runner_state.pending_buys["OLDS"] = _pending_buy("OLDS")
-    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-01", pre_state_hash=None)[0]
-    # Simulate a stale intent from an EARLIER session's own client_order_id
-    # ending up compared against today's ("2026-08-17") differently-computed id.
-    intent.client_order_id = "OLDS-ENTRY-MARKET-BUY-2026-07-15"
+    runner_state.pending_buys["NOMD"] = _pending_buy("NOMD")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert runner_state.pending_signal_metadata == {}
     assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_when_pending_signal_metadata_has_no_target_date():
+    """Incomplete metadata (present but missing the one field this check
+    actually needs) is ALSO fail-closed, not "present so assume okay."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["INCM"] = _pending_buy("INCM")
+    runner_state.pending_signal_metadata["INCM|BUY"] = {"source_session_date": "2026-08-14"}
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
+
+
+def test_matches_live_candidate_false_for_a_genuinely_different_signal_same_ticker():
+    """THE REAL BUG independent-audit finding, 2026-08-24 reproduced and
+    closed: a stray intent from an OLD run (2026-08-01) and a
+    COMPLETELY DIFFERENT, newer pending signal for the SAME ticker
+    (target_execution_session_date 2026-08-17) must never spuriously
+    match just because `pending_buys["OLDS"]` happens to exist today --
+    the ORIGINAL version of `_stray_intent_matches_live_candidate` did
+    exactly this (tautologically recomputing the intent's own
+    client_order_id from its own stored fields, which can never
+    disagree with itself), and returned `True` here. The fix -- cross-
+    checking against the pending candidate's own REAL
+    `target_execution_session_date` via `pending_signal_metadata`,
+    never the intent's own self-reported fields -- correctly returns
+    `False`: this is not the same signal."""
+    runner_state = ps.LiveRunnerState()
+    stale_run_state = ps.LiveRunnerState()
+    stale_run_state.pending_buys["OLDS"] = _pending_buy("OLDS")
+    stale_intent = carm._write_blind_prepared_intents(stale_run_state, "2026-08-01", pre_state_hash=None)[0]
+
+    # Today: a genuinely NEW, unrelated pending BUY signal for the SAME
+    # ticker exists, with its own real target execution session.
+    runner_state.pending_buys["OLDS"] = _pending_buy("OLDS")
+    runner_state.pending_signal_metadata["OLDS|BUY"] = _pending_signal_metadata_entry("2026-08-17")
+
+    assert carm._stray_intent_matches_live_candidate(stale_intent, runner_state) is False
 
 
 def test_matches_live_candidate_false_for_protective_stop_and_cancel_action_kinds():
@@ -257,6 +320,116 @@ def test_matches_live_candidate_false_for_protective_stop_and_cancel_action_kind
     cancel_intent = SimpleNamespace(action_kind="CANCEL_PROTECTIVE_STOP")
     assert carm._stray_intent_matches_live_candidate(stop_intent, runner_state) is False
     assert carm._stray_intent_matches_live_candidate(cancel_intent, runner_state) is False
+
+
+# --- find_intent_by_client_order_id duplicate-record disambiguation    ---
+# --- (independent-audit finding, 2026-08-24, the second reboot-drill  ---
+# --- gap: TERMINAL + fresh PREPARED sharing one client_order_id)      ---
+
+
+def test_lookup_by_client_order_id_prefers_the_active_record_over_a_stale_terminal_one():
+    """THE REAL BUG reproduced and closed: once `_write_blind_prepared_intents`
+    ignores a leftover TERMINAL record and writes a fresh PREPARED one
+    for the SAME client_order_id (finding #1's own fix), TWO records
+    share that client_order_id on disk. A THIRD, later fresh-process
+    lookup (e.g. the write-ahead-evidence check, or another recovery
+    pass) must deterministically find the ACTIVE one -- never whichever
+    happens to sort first by intent_id (UUID)."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["DUPE"] = _pending_buy("DUPE")
+
+    first_run_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    old_intent = order_intent.transition_intent(
+        first_run_intents[0], order_intent.TERMINAL, last_error="ABANDONED_NO_SUBMISSION: simulated",
+    )
+    fresh_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    fresh_intent = fresh_intents[0]
+    assert fresh_intent.intent_id != old_intent.intent_id
+    assert fresh_intent.client_order_id == old_intent.client_order_id
+
+    # Two records now genuinely share one client_order_id on disk.
+    all_matches = [i for i in order_intent.list_intents() if i.client_order_id == old_intent.client_order_id]
+    assert len(all_matches) == 2
+
+    # A fresh-process lookup (simulated here in-process; the real E2E
+    # proof is in tests/test_run_control_arm_reboot_drill.py) must find
+    # the ACTIVE (PREPARED) one, never the stale TERMINAL one.
+    found = order_intent.find_intent_by_client_order_id(old_intent.client_order_id)
+    assert found.intent_id == fresh_intent.intent_id
+    assert found.status == order_intent.PREPARED
+
+
+def test_lookup_by_client_order_id_raises_when_two_records_are_both_active():
+    """A genuine anomaly (two live records for one client_order_id)
+    must fail closed, never silently pick one."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["AMBG"] = _pending_buy("AMBG")
+    intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    real_intent = intents[0]
+    # Force a second, independently-created record with the SAME
+    # client_order_id but still non-TERMINAL -- a structural anomaly
+    # this lookup must refuse to silently resolve.
+    order_intent.create_intent(
+        client_order_id=real_intent.client_order_id,
+        account_identity=real_intent.account_identity,
+        ticker=real_intent.ticker,
+        side=real_intent.side,
+        order_type=real_intent.order_type,
+        action_kind=real_intent.action_kind,
+        source_signal_timestamp=real_intent.source_signal_timestamp,
+        quantity=None,
+        notional=real_intent.notional,
+        stop_price=None,
+    )
+    with pytest.raises(order_intent.MultipleActiveIntentsForClientOrderIdError):
+        order_intent.find_intent_by_client_order_id(real_intent.client_order_id)
+
+
+def test_lookup_by_client_order_id_returns_the_newest_when_all_matches_are_terminal():
+    """The normal long-run end state: an abandoned client_order_id's
+    superseding record also eventually completes, leaving two TERMINAL
+    records for one client_order_id. Nothing here is "active", so this
+    is purely informational -- must not raise, must return one of them
+    deterministically."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["BOTHT"] = _pending_buy("BOTHT")
+    first_run_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    old_intent = order_intent.transition_intent(
+        first_run_intents[0], order_intent.TERMINAL, last_error="ABANDONED_NO_SUBMISSION: simulated",
+    )
+    fresh_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    order_intent.transition_intent(fresh_intents[0], order_intent.TERMINAL, last_error="COMMITTED: simulated fill")
+
+    found = order_intent.find_intent_by_client_order_id(old_intent.client_order_id)
+    assert found is not None
+    assert found.status == order_intent.TERMINAL
+
+
+def test_all_journal_records_invariant_at_most_one_active_record_per_client_order_id():
+    """A whole-journal assertion (independent-audit finding, 2026-08-24,
+    item 3d): scanning every on-disk intent, no `client_order_id` may
+    ever have more than one non-TERMINAL record -- this is exactly the
+    invariant `find_intent_by_client_order_id` fails closed on, restated
+    here as a standalone, journal-wide health check."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["INV1"] = _pending_buy("INV1")
+    runner_state.pending_buys["INV2"] = _pending_buy("INV2")
+    first_run_intents = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)
+    for intent in first_run_intents:
+        order_intent.transition_intent(intent, order_intent.TERMINAL, last_error="ABANDONED_NO_SUBMISSION: simulated")
+    carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)  # legitimately creates duplicates
+
+    by_client_order_id: dict[str, list[order_intent.OrderIntent]] = {}
+    for intent in order_intent.list_intents():
+        by_client_order_id.setdefault(intent.client_order_id, []).append(intent)
+
+    assert len(by_client_order_id) == 2  # INV1 and INV2, each with a TERMINAL + fresh PREPARED pair
+    for client_order_id, records in by_client_order_id.items():
+        non_terminal = [r for r in records if r.status != order_intent.TERMINAL]
+        assert len(non_terminal) <= 1, (
+            f"{client_order_id!r} has {len(non_terminal)} non-TERMINAL records: "
+            f"{[r.intent_id for r in non_terminal]} -- violates the at-most-one-active invariant"
+        )
 
 
 # --- (c) Rejected candidate: cap was full / candidate not actually  ---

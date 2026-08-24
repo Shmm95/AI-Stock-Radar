@@ -259,13 +259,52 @@ def list_intents() -> list[OrderIntent]:
     return intents
 
 
+class MultipleActiveIntentsForClientOrderIdError(RuntimeError):
+    """Raised by `find_intent_by_client_order_id` when MORE THAN ONE
+    non-TERMINAL intent shares a `client_order_id` -- independent-audit
+    finding, 2026-08-24 (the second reboot-drill gap): this should be
+    structurally impossible (one live candidate, one active record) and
+    signals real duplicate/divergent journal state. Fail-closed rather
+    than silently picking one and hiding the anomaly from the caller."""
+
+
 def find_intent_by_client_order_id(client_order_id: str) -> OrderIntent | None:
     """LOCAL lookup only -- searches every on-disk intent for a matching
-    `client_order_id`, returns the first match (`client_order_id` is
-    generated deterministically per ticker+action_kind+session-date, see
+    `client_order_id`. `client_order_id` is generated deterministically
+    per ticker+action_kind+session-date (see
     `run_control_arm_decision._compute_pending_signal_id`/
-    `_run_intent_protocol`, so in practice at most one intent should ever
-    match) or `None` if none do.
+    `_run_intent_protocol`), so in the common case at most one intent
+    ever matches -- but `intent_id` (a UUID), not `client_order_id`, is
+    this journal's real storage key, and `_write_blind_prepared_intents`
+    deliberately creates a fresh intent when a leftover record for the
+    same `client_order_id` is TERMINAL (reboot-drill finding #1's own
+    fix) rather than reusing or deleting it, as durable historical
+    evidence. So TWO records sharing one `client_order_id` -- one
+    TERMINAL, one live -- is an expected, legitimate state, not a bug.
+
+    Independent-audit finding, 2026-08-24 (the second reboot-drill gap):
+    the ORIGINAL version of this function returned the first match in
+    on-disk (UUID-sorted) order, silently assuming uniqueness. Once two
+    records could legitimately share a `client_order_id`, that could
+    return the WRONG one -- e.g. an old TERMINAL record instead of the
+    genuinely active one a caller like `_write_blind_prepared_intents`
+    or the write-ahead-evidence check needs. Reproduced for real before
+    this fix: a lookup for a client_order_id with one TERMINAL and one
+    fresh PREPARED record returned the TERMINAL one whenever its
+    `intent_id` happened to sort first.
+
+    Disambiguation rule, now explicit: among all matches,
+      - exactly one non-TERMINAL match -> return it (the one genuinely
+        active record; TERMINAL matches are dead ends, never confused
+        with it);
+      - more than one non-TERMINAL match -> `MultipleActiveIntentsForClientOrderIdError`,
+        fail-closed (a real anomaly: two live journal records for one
+        candidate should never happen);
+      - zero non-TERMINAL matches (every match is TERMINAL -- the
+        normal end state once a superseded client_order_id's newer
+        record also completes) -> the most recently created one,
+        purely informational since nothing here is "active" for a
+        caller to mistake for a live record.
 
     Added for reboot-recovery: after a real crash/restart, a caller who
     already knows a specific `client_order_id` (e.g. one just fetched
@@ -280,10 +319,21 @@ def find_intent_by_client_order_id(client_order_id: str) -> OrderIntent | None:
     documented scope (see module docstring: "Nothing here calls
     Alpaca") stays intact; correlating a broker-side lookup with this
     local one is the CALLER's job, not this function's."""
-    for intent in list_intents():
-        if intent.client_order_id == client_order_id:
-            return intent
-    return None
+    matches = [intent for intent in list_intents() if intent.client_order_id == client_order_id]
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    non_terminal = [intent for intent in matches if intent.status != TERMINAL]
+    if len(non_terminal) == 1:
+        return non_terminal[0]
+    if len(non_terminal) > 1:
+        raise MultipleActiveIntentsForClientOrderIdError(
+            f"client_order_id={client_order_id!r} has {len(non_terminal)} non-TERMINAL "
+            f"intents on disk: {[intent.intent_id for intent in non_terminal]} -- exactly "
+            f"one active record is expected. Fail-closed."
+        )
+    return max(matches, key=lambda intent: intent.created_at)
 
 
 def find_intent_by_operation_id(operation_id: str) -> OrderIntent | None:
