@@ -1,0 +1,37 @@
+# Safety subset -- independent-audit finding, 2026-08-24 (item 6).
+#
+# The curated set of test files covering this codebase's live-order
+# safety machinery: order-intent journaling and crash recovery, broker
+# reconciliation, authorization/preflight gating, session detection and
+# missing-session replay, and notification/decision-log correctness.
+# Run this subset first, on every change that touches
+# scripts/run_daily_decision.py, scripts/run_control_arm_decision.py,
+# src/live/*.py, or scripts/run_control_arm_reboot_drill.py -- before
+# paying for the full suite's runtime. This is a FLOOR, not a
+# substitute: a real change still needs the full regression run before
+# commit, per this repo's own established practice.
+#
+# One relative-to-repo-root pytest path per line; `#` starts a comment.
+# Append a line here when a new file becomes safety-critical -- do not
+# let this list silently drift stale relative to what actually guards
+# live-order correctness.
+
+tests/test_check_env_health.py
+tests/test_run_control_arm_decision_guards.py
+tests/test_live_equity_order_execution.py
+tests/test_live_crypto_order_execution.py
+tests/test_run_daily_decision_broker_reconciliation.py
+tests/test_equity_session_detection.py
+tests/test_missed_session_window_handling.py
+tests/test_session_replay_journal.py
+tests/test_daily_decision_notifications.py
+tests/test_daily_decision_bars_today.py
+tests/test_broker_reconciliation.py
+tests/test_order_intent_reconciliation.py
+tests/test_write_ahead_intent_journal.py
+tests/test_run_control_arm_reboot_drill.py
+tests/test_order_enabled_caller_inventory.py
+tests/test_missing_session_replay_cron_activation.py
+tests/test_equity_session_orchestrator.py
+tests/test_session_replay_pass_gate.py
+tests/test_authorized_execution_context.py

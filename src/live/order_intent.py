@@ -105,6 +105,28 @@ _VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     TERMINAL: frozenset(),
 }
 
+# The single, canonical definition of "not yet resolved" -- every status
+# except TERMINAL. Independent-audit finding (2026-08-24): two other
+# modules (`order_intent_reconciliation.py`,
+# `scripts/run_control_arm_decision.py`) each maintained their own
+# hand-copied non-terminal status set, and one omitted COMMITTED (the
+# narrow crash window between a COMMITTED write and the following
+# TERMINAL write -- see `_VALID_TRANSITIONS` above, COMMITTED's only
+# next state is TERMINAL). That specific omission never caused a bug
+# (nothing yet queried run_control_arm_decision.py's copy for a
+# COMMITTED intent), but two modules independently defining "unresolved
+# intent" is itself the defect: the next person to touch either copy
+# has no signal that a sibling definition exists to keep in sync. Both
+# callers now import `NON_TERMINAL_STATUSES`/`is_non_terminal` from here
+# instead of maintaining their own frozenset.
+NON_TERMINAL_STATUSES = frozenset({PREPARED, SUBMITTING, BROKER_ACKNOWLEDGED, COMMITTED, UNCERTAIN})
+
+
+def is_non_terminal(status: str) -> bool:
+    """True for any status other than TERMINAL. See `NON_TERMINAL_STATUSES`
+    above for why this is the one place that decision is made."""
+    return status in NON_TERMINAL_STATUSES
+
 
 class InvalidTransitionError(RuntimeError):
     """Raised when a transition is attempted that `_VALID_TRANSITIONS`

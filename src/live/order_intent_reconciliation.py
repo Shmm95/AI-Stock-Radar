@@ -94,22 +94,15 @@ from alpaca.trading.client import TradingClient
 from src.live import order_intent
 from src.live import order_submission
 
-_NON_TERMINAL_STATUSES = frozenset(
-    {
-        order_intent.PREPARED, order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED,
-        # COMMITTED (added independent-audit round 2, 2026-08-23): a
-        # crash in the narrow window AFTER the COMMITTED write lands but
-        # BEFORE the following TERMINAL write -- see
-        # `finalize_resolved_intent`'s own docstring -- left such an
-        # intent permanently invisible to this stray scan, since
-        # COMMITTED was (incorrectly) treated as "as good as done."
-        # order_intent.py's own `_VALID_TRANSITIONS` has always allowed
-        # COMMITTED -> TERMINAL; nothing was ever calling it for a
-        # leftover-from-a-prior-run COMMITTED intent.
-        order_intent.COMMITTED,
-        order_intent.UNCERTAIN,
-    }
-)
+# The canonical non-terminal status set now lives on order_intent.py
+# itself (`order_intent.NON_TERMINAL_STATUSES`/`is_non_terminal`) --
+# independent-audit finding, 2026-08-24: this module and
+# run_control_arm_decision.py each used to hand-copy their own frozenset,
+# and the latter's copy silently omitted COMMITTED (the narrow crash
+# window after a COMMITTED write but before the following TERMINAL write
+# -- see `finalize_resolved_intent`'s own docstring, and
+# independent-audit round 2, 2026-08-23, which is why COMMITTED belongs
+# in this set at all). Both callers now share the one definition.
 
 # Alpaca order statuses this module treats as "the target order is
 # still genuinely resting" -- i.e. not yet acted on. Mirrors
@@ -137,7 +130,7 @@ def find_stray_session_intents_from_prior_run() -> list[order_intent.OrderIntent
     candidate a PRIOR, interrupted run left behind. Local-only, makes no
     broker call itself; see `list_intents()`'s own docstring for why
     this is safe to call cheaply and often."""
-    return [intent for intent in order_intent.list_intents() if intent.status in _NON_TERMINAL_STATUSES]
+    return [intent for intent in order_intent.list_intents() if order_intent.is_non_terminal(intent.status)]
 
 
 def resolve_stray_order_submission_intent(

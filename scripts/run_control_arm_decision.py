@@ -1254,9 +1254,12 @@ _PENDING_SIGNAL_ACTION_KIND_FAMILIES: dict[str, tuple[str, ...]] = {
     pending_signal_ttl.KIND_BUY: ("QUEUED_ENTRY_SIGNAL", "ENTRY_MARKET_BUY"),
     pending_signal_ttl.KIND_EXIT: ("QUEUED_EXIT_SIGNAL", "SIGNAL_EXIT_MARKET_SELL"),
 }
-_INTENT_NON_TERMINAL_STATUSES = frozenset(
-    {order_intent.PREPARED, order_intent.SUBMITTING, order_intent.BROKER_ACKNOWLEDGED, order_intent.UNCERTAIN}
-)
+# See order_intent.NON_TERMINAL_STATUSES's own docstring (independent-
+# audit finding, 2026-08-24): this used to be a local frozenset here
+# that silently omitted COMMITTED; now shares the one canonical
+# definition with order_intent_reconciliation.py rather than
+# maintaining a second, divergent copy.
+_INTENT_NON_TERMINAL_STATUSES = order_intent.NON_TERMINAL_STATUSES
 
 
 def _compute_pending_signal_id(ticker: str, kind: str, source_session_date: str) -> str:

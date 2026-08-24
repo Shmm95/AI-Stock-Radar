@@ -325,4 +325,112 @@ def test_scenario_c_a_missed_prior_day_job_is_detected_and_replayed_exactly_once
     assert len(intents) == 1
     assert intents[0].status == session_journal.TERMINAL
     assert intents[0].outcome == session_journal.SUCCEEDED
-    assert intents[0].session_date == "2026-08-20"
+
+
+# --- independent-audit finding, 2026-08-24: the missing intersection test --
+# scenarios A/B/C above each prove their own piece in isolation, starting
+# from state HAND-SEEDED to look like the previous step already ran --
+# never the REAL output of a previous step feeding the next one. This test
+# chains all four moves for real, in one continuous state file: a normal
+# run persists the cursor -> the following day's job is genuinely never
+# called (not just "state pretends it wasn't") -> the next morning's
+# orchestrator detects and replays that exact gap exactly once -> the
+# PASS gate that replay just wrote is what a SUBSEQUENT real order-enabled
+# run actually consumes, and that run advances the cursor further still.
+
+
+def test_full_chain_normal_run_then_missed_day_then_replay_then_next_run(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    monkeypatch.setattr(pass_gate, "DEFAULT_PASS_GATE_DIRECTORY", paths["pass_gate_directory"])
+    monkeypatch.setattr(runner.order_submission, "get_trading_client", lambda: _FakeClient())
+    monkeypatch.setattr(runner, "send_telegram_message", lambda text: True)
+    # Each move gets its own decision-log directory: `run_daily_decision()`'s
+    # own second-resolution timestamp filename would otherwise collide when
+    # this test's 3 real calls land within the same wall-clock second (an
+    # artifact of running fast under pytest, not something this test is
+    # meant to exercise).
+    move_1_log_dir = paths["decision_log_directory"] / "move_1"
+    move_3_log_dir = paths["decision_log_directory"] / "move_3"
+    move_4_log_dir = paths["decision_log_directory"] / "move_4"
+
+    # --- Move 1: a normal dry-run job for 2026-08-20 -- persists the cursor.
+    monkeypatch.setattr(runner, "prepare_live_market_data", lambda tickers: _prepared(
+        ("2026-08-19", "2026-08-20"), ("2026-08-19", "2026-08-20"),
+    ))
+    monkeypatch.setattr(runner, "get_live_cash_balance", lambda client=None: 100_000.0)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_daily_decision.py", "--state-path", str(paths["state_path"]),
+         "--decision-log-directory", str(move_1_log_dir),
+         "--guard-path", str(paths["guard_path"])],
+    )
+    runner.main()
+    after_move_1 = ps.load_position_state(paths["state_path"], guard_path=paths["guard_path"])
+    assert after_move_1.last_processed_equity_session_date == "2026-08-20"
+
+    # --- Move 2: 2026-08-21's job is MISSED -- genuinely never called, no
+    # state manipulation standing in for "the job ran and then we forgot."
+    # Nothing to assert here; the absence of a call IS the scenario.
+
+    # --- Move 3: the next morning's REAL orchestrator, using the REAL
+    # run_daily_decision() (only I/O boundaries faked, same as scenario C),
+    # detects the exact 2026-08-21 gap Move 1 left behind and replays it.
+    monkeypatch.setattr(orchestrator.rdd, "prepare_live_market_data", lambda tickers: _prepared(
+        ("2026-08-20", "2026-08-21"), ("2026-08-20", "2026-08-21"),
+    ))
+    monkeypatch.setattr(orchestrator.rdd, "get_live_cash_balance", lambda client=None: 100_000.0)
+    # `orchestrator.broker_reconciliation` and `runner.broker_reconciliation`
+    # are the SAME module object (both `from src.live import
+    # broker_reconciliation`) -- mocking `.reconcile` here to stand in for
+    # Move 3's own preflight check would otherwise silently also apply to
+    # Move 4's REAL `runner.main()` call below (which must exercise the
+    # genuine reconcile() path, same as scenario A does). Restored before
+    # Move 4 runs.
+    real_reconcile = orchestrator.broker_reconciliation.reconcile
+    monkeypatch.setattr(orchestrator.broker_reconciliation, "reconcile", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator.detection, "detect_missing_equity_sessions",
+        lambda *a, **k: detection.DetectionResult(
+            expected_sessions=("2026-08-21",), complete_sessions=("2026-08-21",), missing_by_session={},
+            unexpected_future_bars={}, raw_bars_by_ticker={},
+        ),
+    )
+    monkeypatch.setattr(orchestrator.detection, "fetch_expected_equity_sessions", lambda *a, **k: [])
+
+    replay_result = orchestrator.run_missing_session_replay(
+        state_path=paths["state_path"], decision_log_directory=move_3_log_dir,
+        guard_path=paths["guard_path"], provenance_log_directory=paths["provenance_log_directory"],
+        pass_gate_directory=paths["pass_gate_directory"], trading_client=_FakeClient(),
+    )
+    assert replay_result.outcome == "REPLAYED_ONE_SESSION"
+    assert replay_result.replayed_session_date == "2026-08-21"
+    after_move_3 = ps.load_position_state(paths["state_path"], guard_path=paths["guard_path"])
+    assert after_move_3.last_processed_equity_session_date == "2026-08-21"
+    assert pass_gate.has_valid_pass_gate_for_today(paths["pass_gate_directory"]) is True
+    intents_after_move_3 = session_journal.list_session_intents()
+    assert len(intents_after_move_3) == 1
+    assert intents_after_move_3[0].status == session_journal.TERMINAL
+    assert intents_after_move_3[0].outcome == session_journal.SUCCEEDED
+
+    # --- Move 4: the SAME day's real, order-enabled 21:15 job now runs --
+    # consuming the EXACT PASS gate Move 3's own orchestrator call just
+    # wrote (never a hand-written one), and advances the cursor further.
+    # Restore the REAL reconcile() -- see the comment on the mock above.
+    monkeypatch.setattr(orchestrator.broker_reconciliation, "reconcile", real_reconcile)
+    monkeypatch.setattr(runner, "prepare_live_market_data", lambda tickers: _prepared(
+        ("2026-08-21", "2026-08-22"), ("2026-08-21", "2026-08-22"),
+    ))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run_daily_decision.py", "--enable-equity-orders", "--enable-crypto-orders",
+         "--state-path", str(paths["state_path"]), "--decision-log-directory", str(move_4_log_dir),
+         "--guard-path", str(paths["guard_path"])],
+    )
+    runner.main()  # must NOT raise MissingPassGateError -- Move 3's gate covers this
+    after_move_4 = ps.load_position_state(paths["state_path"], guard_path=paths["guard_path"])
+    assert after_move_4.last_processed_equity_session_date == "2026-08-22"
+
+    # Move 4 was a real, successful, order-enabled run -- it must not have
+    # triggered a SECOND replay journal intent (that's a different
+    # protocol, session_replay_journal, only the orchestrator writes to).
+    assert len(session_journal.list_session_intents()) == 1

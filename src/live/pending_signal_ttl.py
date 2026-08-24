@@ -46,7 +46,8 @@ being ticker-keyed, at most one of each per ticker at a time). Fields:
 `source_session_date`, `target_execution_session_date`, `created_at_utc`,
 `signal_id`, `status` (`pending`/`expired`/`reconfirmed`/`canceled`, plus
 the transient `reconfirming` used only mid-run between
-`evaluate_pending_signals` and `finalize_after_run`), `expire_reason`.
+`evaluate_pending_signals` and `run_control_arm_decision._finalize_pending_signals_after_run`),
+`expire_reason`.
 
 Same "second, deliberate save" caveat as Phase 1's `last_processed_*`
 fields: `run_daily_decision()`'s own internal `save_position_state()` call
@@ -54,7 +55,14 @@ builds a fresh `LiveRunnerState` that knows nothing about
 `pending_signal_metadata` and wipes it to `{}` on every run. The caller
 (`run_control_arm_decision.py`) is responsible for reloading, re-applying,
 and re-saving this module's records AFTER `run_daily_decision()` returns
--- see `finalize_after_run`.
+-- see that file's own `_finalize_pending_signals_after_run` (independent-
+audit finding, 2026-08-24: this docstring used to name a bare
+`finalize_after_run`, which has never existed as a function in EITHER
+module under that name -- corrected to the real one, and now covered by
+a real end-to-end test, `tests/test_run_control_arm_decision_guards.py::
+test_pending_signal_metadata_survives_the_real_run_daily_decision_core_save`,
+that proves the round-trip against the genuine `run_daily_decision()`
+rather than trusting this docstring's own claim).
 
 SIGNAL_ID / JOURNAL CORRELATION: `signal_id` is never a fresh random id --
 it is computed with the SAME deterministic formula
@@ -98,7 +106,7 @@ STATUS_PENDING = "pending"
 STATUS_EXPIRED = "expired"
 STATUS_RECONFIRMED = "reconfirmed"
 STATUS_CANCELED = "canceled"
-_STATUS_RECONFIRMING = "reconfirming"  # transient, mid-run only -- never left on disk after finalize_after_run
+_STATUS_RECONFIRMING = "reconfirming"  # transient, mid-run only -- never left on disk after _finalize_pending_signals_after_run
 
 REASON_STOP_MISSED_SESSION = "stop_missed_session"
 REASON_FREEZE_MISSED_SESSION = "freeze_missed_session"
@@ -168,8 +176,9 @@ def _find_stuck_reconfirming_records(runner_state: Any) -> list[tuple[str, dict]
     `reconfirming` status (see `_STATUS_RECONFIRMING`) from a PRIOR,
     interrupted run -- normally this status only exists for the
     duration of a single run, between `evaluate_pending_signals` marking
-    it and `stamp_new_pending_signals`/`finalize_after_run` (called from
-    `run_control_arm_decision.py`) resolving it to `reconfirmed` or
+    it and `stamp_new_pending_signals` (called from
+    `run_control_arm_decision._finalize_pending_signals_after_run`)
+    resolving it to `reconfirmed` or
     `expired`/`expired_after_reconfirmation` moments later in that SAME
     run. If the run crashes or fails anywhere in between, the record is
     left on disk in `reconfirming` -- and because the corresponding
@@ -237,7 +246,7 @@ def evaluate_pending_signals(
       unmodified `_queue_close_based_exits` step re-evaluates the exit
       condition fresh, against the CURRENT Close, later in this exact
       same run) and the metadata record is marked `reconfirming`
-      (transient) pending `finalize_after_run`'s outcome check.
+      (transient) pending `_finalize_pending_signals_after_run`'s outcome check.
 
     Raises `PendingSignalReconciliationRequiredError` immediately on the
     first ambiguous EXIT found -- the caller's own exception handling

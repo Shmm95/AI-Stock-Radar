@@ -333,6 +333,13 @@ def test_arm_then_kill_then_recover_end_to_end(tmp_path):
     assert len(report["stray_intents_before_recovery"]) == 1
     assert report["stray_intents_before_recovery"][0]["status"] == "PREPARED"
 
+    # The CLI's own exit code -- independent-audit finding, 2026-08-24:
+    # `--phase recover` used to always exit 0 regardless of whether
+    # recovery actually raised, so a human/CI gate checking only the exit
+    # code (not parsing recovery_report.json by hand) would see a false
+    # PASS. A clean recovery must exit 0.
+    assert recover.returncode == 0, f"recover stdout:\n{recover.stdout}\nstderr:\n{recover.stderr}"
+
     # RECOVERY ACTUALLY SUCCEEDED -- the acceptance test's own real
     # criteria, not just "a stray was found":
     assert report["execute_raised"] is None, (
@@ -390,6 +397,16 @@ def test_submitting_then_broker_acknowledged_crash_fails_closed_with_the_specifi
     assert "UnknownBrokerOrderError" not in report["execute_raised"].split(":")[0]
     assert report["execute_outcome"] is None
 
+    # The CLI's own exit code must reflect this halt too -- independent-
+    # audit finding, 2026-08-24 (see the sibling success test's own
+    # comment): before the fix, `--phase recover` exited 0 even here,
+    # which would have let a human/CI gate checking only the exit code
+    # falsely believe recovery from THIS exact dangerous window succeeded.
+    assert recover.returncode != 0, (
+        f"recover exited 0 despite execute_raised being set -- exit code must reflect the halt. "
+        f"stdout:\n{recover.stdout}\nstderr:\n{recover.stderr}"
+    )
+
     # The journal must be left HONESTLY at BROKER_ACKNOWLEDGED, never
     # prematurely claimed TERMINAL -- the real bug finding #2 closes.
     stray_after = report["stray_intents_after_recovery"]
@@ -397,7 +414,9 @@ def test_submitting_then_broker_acknowledged_crash_fails_closed_with_the_specifi
     assert stray_after[0]["status"] == "BROKER_ACKNOWLEDGED"
     assert stray_after[0]["broker_order_id"] is not None
 
-    # And local state must NOT have been fabricated to paper over the gap.
+    # And local state must NOT have been fabricated to paper over the gap
+    # -- zero submitted_actions entries recorded for this run's own
+    # candidate, matching the honestly-still-open journal above.
     entry_actions = [
         record for key, record in report["final_position_state"]["submitted_actions"].items()
         if record.get("kind") == "ENTRY_MARKET_BUY"

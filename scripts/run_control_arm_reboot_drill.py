@@ -762,7 +762,23 @@ def _apply_broker_outcome_override(*, case_dir: Path, broker_outcome: str) -> No
     print(f"[DRILL] Applied --broker-outcome={broker_outcome!r} to the fake ledger for barrier {barrier!r}.")
 
 
-def _run_recover(*, case_dir: Path, broker_outcome: str) -> None:
+def _run_recover(*, case_dir: Path, broker_outcome: str) -> bool:
+    """Returns whether recovery completed cleanly (`execute_raised is
+    None` in the written report) -- the caller's own exit-code signal.
+    Independent-audit finding, 2026-08-24: this function used to always
+    return `None` and `main()` never checked anything, so `--phase
+    recover` exited 0 REGARDLESS of whether `_execute()` raised
+    internally -- including the exact fail-closed halt reboot-drill
+    finding #2 exists to prove happens (SUBMITTING -> broker-acknowledged
+    crash). A human or CI gate that only checks this script's own exit
+    code (rather than parsing `recovery_report.json` by hand) would have
+    seen a false PASS on precisely the scenario this drill exists to
+    catch. Now returns real success/failure so `main()` can exit non-zero
+    on anything `execute_raised` -- whether that is a genuine bug (like
+    finding #1's deadlock, before its own fix) or an intentional
+    fail-closed halt (finding #2's own scenario): either way, "did NOT
+    complete recovery cleanly" is the operationally meaningful signal a
+    drill run needs to surface via its exit code."""
     paths = _drill_paths(case_dir)
     if not paths["barrier_path"].is_file():
         raise RuntimeError(
@@ -821,6 +837,7 @@ def _run_recover(*, case_dir: Path, broker_outcome: str) -> None:
     paths["report_path"].write_text(json.dumps(report, indent=2, sort_keys=True, default=str), encoding="utf-8")
     print(f"[DRILL] recover: report written to {paths['report_path']}")
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return recovery_error is None
 
 
 def _stray_intents_snapshot():
@@ -923,7 +940,13 @@ def main() -> None:
             parser.error("--action is required for --phase arm")
         _run_arm(case_dir=case_dir, barrier=arguments.barrier, action=arguments.action, broker_outcome=arguments.broker_outcome)
     else:
-        _run_recover(case_dir=case_dir, broker_outcome=arguments.broker_outcome)
+        recovered_cleanly = _run_recover(case_dir=case_dir, broker_outcome=arguments.broker_outcome)
+        if not recovered_cleanly:
+            # See _run_recover's own docstring (independent-audit finding,
+            # 2026-08-24) -- non-zero exit is the real signal a human or
+            # CI gate checking only this script's own exit code needs;
+            # the full detail is always in recovery_report.json regardless.
+            sys.exit(1)
 
 
 if __name__ == "__main__":
