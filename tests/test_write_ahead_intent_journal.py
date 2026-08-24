@@ -28,9 +28,11 @@ import pytest
 
 import scripts.run_control_arm_decision as carm
 import src.live.order_intent as order_intent
+import src.live.order_intent_reconciliation as reconciliation
 import src.live.position_state as ps
 from src.backtest.portfolio_backtest_engine import _PendingOrder
 from src.backtest.portfolio_backtest_models import PortfolioSignal
+from src.live import order_submission
 
 
 @pytest.fixture(autouse=True)
@@ -320,6 +322,106 @@ def test_matches_live_candidate_false_for_protective_stop_and_cancel_action_kind
     cancel_intent = SimpleNamespace(action_kind="CANCEL_PROTECTIVE_STOP")
     assert carm._stray_intent_matches_live_candidate(stop_intent, runner_state) is False
     assert carm._stray_intent_matches_live_candidate(cancel_intent, runner_state) is False
+
+
+# --- independent-audit's own EXACT acceptance scenario, 2026-08-24, for  ---
+# --- Bulgu #1: ticker=CEG, ENTRY_MARKET_BUY, every field identical      ---
+# --- except session date/signal_id -- negative, positive, and          ---
+# --- missing-metadata cases, each asserting the full required chain.   ---
+
+
+def test_bulgu1_acceptance_negative_ceg_old_2026_08_14_vs_new_2026_08_17(monkeypatch):
+    """All fields identical (ticker=CEG, ENTRY_MARKET_BUY, side=BUY,
+    account=control_arm_v1) -- ONLY the session date/signal_id differs:
+    an old intent genuinely written for 2026-08-14, and a genuinely
+    different NEW pending candidate due 2026-08-17. No subprocess: this
+    is data-matching logic, not process-crash recovery."""
+    # Old intent, as if written by a run on 2026-08-14.
+    old_run_state = ps.LiveRunnerState()
+    old_run_state.pending_buys["CEG"] = _pending_buy("CEG")
+    old_run_state.pending_signal_metadata["CEG|BUY"] = _pending_signal_metadata_entry("2026-08-14")
+    old_intent = carm._write_blind_prepared_intents(old_run_state, "2026-08-14", pre_state_hash=None)[0]
+    old_client_order_id = old_intent.client_order_id
+    assert old_client_order_id == "CEG-ENTRY-MARKET-BUY-2026-08-14"
+
+    # Today: CEG has a genuinely NEW, different pending BUY signal, due 2026-08-17.
+    today_state = ps.LiveRunnerState()
+    today_state.pending_buys["CEG"] = _pending_buy("CEG")
+    today_state.pending_signal_metadata["CEG|BUY"] = _pending_signal_metadata_entry("2026-08-17")
+
+    # 1. _stray_intent_matches_live_candidate(...) -> False
+    matches = carm._stray_intent_matches_live_candidate(old_intent, today_state)
+    assert matches is False
+
+    # 2/3/6. The old intent is correctly NOT resumable -- resolves to
+    # ABANDONED_NO_SUBMISSION/TERMINAL, and this path makes ZERO broker
+    # submission calls (asserted via a fake that raises if ever called;
+    # get_order_by_client_order_id simulates the confirmed-404 broker
+    # truth already established for this stray intent -- a pure query,
+    # resolve_stray_order_submission_intent's own documented contract).
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)
+    monkeypatch.setattr(
+        order_submission, "submit_equity_market_order",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must never submit for an abandoned intent")),
+    )
+    resolved_old = reconciliation.resolve_stray_order_submission_intent(
+        client=object(), intent=old_intent, matches_live_candidate=matches,
+    )
+    assert resolved_old.status == order_intent.TERMINAL
+    assert "ABANDONED_NO_SUBMISSION" in resolved_old.last_error
+
+    # 4/5. The NEW candidate gets its OWN, separate PREPARED intent, with
+    # its own correct (2026-08-17) client_order_id -- the old
+    # client-order identity is NOT reused/resumed for it. Mirrors what
+    # _execute()'s own Phase 1.5 -> write-ahead sequence does for real.
+    fresh_intent = carm._write_blind_prepared_intents(today_state, "2026-08-17", pre_state_hash=None)[0]
+    assert fresh_intent.status == order_intent.PREPARED
+    assert fresh_intent.client_order_id == "CEG-ENTRY-MARKET-BUY-2026-08-17"
+    assert fresh_intent.client_order_id != old_client_order_id
+    assert fresh_intent.intent_id != old_intent.intent_id
+
+
+def test_bulgu1_acceptance_positive_control_ceg_same_signal_stays_resumable(monkeypatch):
+    """Required POSITIVE control: same ticker, same REAL signal (both
+    2026-08-17) -> True, the existing intent is preserved as
+    RESUMABLE_PREPARED (never closed), and no second record is created
+    for the same candidate."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG")
+    runner_state.pending_signal_metadata["CEG|BUY"] = _pending_signal_metadata_entry("2026-08-17")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+
+    matches = carm._stray_intent_matches_live_candidate(intent, runner_state)
+    assert matches is True
+
+    monkeypatch.setattr(order_submission, "get_order_by_client_order_id", lambda *a, **k: None)  # confirmed 404
+    monkeypatch.setattr(
+        order_submission, "submit_equity_market_order",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must never submit from this resolver")),
+    )
+    resolved = reconciliation.resolve_stray_order_submission_intent(
+        client=object(), intent=intent, matches_live_candidate=matches,
+    )
+    assert resolved.status == order_intent.PREPARED  # RESUMABLE_PREPARED: unchanged, never closed
+    assert resolved.intent_id == intent.intent_id
+
+    # No second record: the SAME still-pending candidate, resumed via the
+    # normal write-ahead idempotent path, reuses this SAME intent_id.
+    resumed = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert resumed.intent_id == intent.intent_id
+    all_on_disk = [i for i in order_intent.list_intents() if i.client_order_id == intent.client_order_id]
+    assert len(all_on_disk) == 1
+
+
+def test_bulgu1_acceptance_missing_metadata_never_defaults_to_true():
+    """Required missing-metadata case: no signal_id/session identity
+    recorded at all for CEG's pending candidate -> the function must
+    NEVER assume a match."""
+    runner_state = ps.LiveRunnerState()
+    runner_state.pending_buys["CEG"] = _pending_buy("CEG")
+    intent = carm._write_blind_prepared_intents(runner_state, "2026-08-17", pre_state_hash=None)[0]
+    assert runner_state.pending_signal_metadata == {}
+    assert carm._stray_intent_matches_live_candidate(intent, runner_state) is False
 
 
 # --- find_intent_by_client_order_id duplicate-record disambiguation    ---
