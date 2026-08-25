@@ -186,6 +186,119 @@ def test_build_status_text_reports_unreadable_decision_log(
     assert "decision_bad.json" in text
 
 
+class _FakeAccount:
+    def __init__(self, *, cash: str = "100000.00", equity: str = "100000.00", last_equity: str = "100000.00") -> None:
+        self.cash = cash
+        self.equity = equity
+        self.last_equity = last_equity
+
+
+class _FakePosition:
+    def __init__(
+        self, *, symbol: str, side: str = "long", qty: str, avg_entry_price: str, current_price: str,
+        market_value: str, unrealized_pl: str, unrealized_plpc: str, asset_class: str = "us_equity",
+    ) -> None:
+        self.symbol = symbol
+        self.side = side
+        self.qty = qty
+        self.avg_entry_price = avg_entry_price
+        self.current_price = current_price
+        self.market_value = market_value
+        self.unrealized_pl = unrealized_pl
+        self.unrealized_plpc = unrealized_plpc
+        self.asset_class = asset_class
+
+
+class _FakePnlClient:
+    """No submit/cancel/replace method at all -- see
+    test_read_only_portfolio_snapshot.py's identical fake for why that
+    absence is itself part of the read-only proof."""
+
+    def __init__(self, *, account: _FakeAccount, positions: list, orders: list | None = None) -> None:
+        self._account = account
+        self._positions = positions
+        self._orders = orders or []
+
+    def get_account(self):
+        return self._account
+
+    def get_all_positions(self):
+        return list(self._positions)
+
+    def get_orders(self, *, filter=None):
+        return list(self._orders)
+
+
+def test_build_status_text_includes_pnl_snapshot_when_broker_reads_succeed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setattr(status, "get_live_cash_balance", lambda: 100_000.0)
+    monkeypatch.setattr(status, "load_position_state", lambda path: LiveRunnerState(positions={}))
+    fake_client = _FakePnlClient(
+        account=_FakeAccount(cash="50000.00", equity="102500.00", last_equity="100000.00"),
+        positions=[
+            _FakePosition(
+                symbol="AAPL", qty="10", avg_entry_price="150.00", current_price="160.00",
+                market_value="1600.00", unrealized_pl="100.00", unrealized_plpc="0.0667",
+            ),
+        ],
+    )
+    monkeypatch.setattr(status.order_submission, "get_trading_client", lambda: fake_client)
+
+    text = status.build_status_text(
+        state_path=tmp_path / "position_state.json", decision_log_directory=tmp_path / "decisions",
+    )
+
+    assert "P&L snapshot (broker, live):" in text
+    assert "Portfolio value: $102,500.00" in text
+    assert "Cash: $50,000.00" in text
+    assert "Day P&L: +2,500.00" in text
+    assert "AAPL (long): qty 10" in text
+    assert "unrealized +100.00" in text
+    assert "Realized closed-trade P&L: +0.00" in text
+    assert "Broker unrealized P&L: +100.00" in text
+    assert "Strategy fill-based P&L (realized + broker unrealized): +100.00" in text
+    # The pre-existing, independent cash-balance source is untouched.
+    assert "Cash balance: $100,000.00" in text
+
+
+def test_build_status_text_degrades_gracefully_when_pnl_snapshot_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setattr(status, "get_live_cash_balance", lambda: 1.0)
+    monkeypatch.setattr(status, "load_position_state", lambda path: LiveRunnerState(positions={}))
+
+    def broken_client():
+        raise RuntimeError("ALPACA_API_KEY not set")
+
+    monkeypatch.setattr(status.order_submission, "get_trading_client", broken_client)
+
+    text = status.build_status_text(
+        state_path=tmp_path / "position_state.json", decision_log_directory=tmp_path / "decisions",
+    )
+
+    assert "P&L snapshot: unavailable (RuntimeError)" in text
+    assert "ALPACA_API_KEY not set" not in text, "must never leak the raw exception message"
+    # Every other independent source still reports normally.
+    assert "Cash balance: $1.00" in text
+    assert "Açık pozisyon yok." in text
+
+
+def test_build_status_text_pnl_snapshot_reports_no_broker_positions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    monkeypatch.setattr(status, "get_live_cash_balance", lambda: 1.0)
+    monkeypatch.setattr(status, "load_position_state", lambda path: LiveRunnerState(positions={}))
+    fake_client = _FakePnlClient(account=_FakeAccount(), positions=[])
+    monkeypatch.setattr(status.order_submission, "get_trading_client", lambda: fake_client)
+
+    text = status.build_status_text(
+        state_path=tmp_path / "position_state.json", decision_log_directory=tmp_path / "decisions",
+    )
+
+    assert "No broker positions open." in text
+
+
 def test_notify_safe_reports_success_and_failure(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(status, "send_telegram_message", lambda text: True)
     assert status._notify_safe("hello") is True

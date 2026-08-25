@@ -10,11 +10,20 @@ the module's own report for the exact lines (not added to cron here).
 Fully read-only, like generate_performance_report.py: no order is placed,
 modified, or cancelled, and neither run_daily_decision.py's nor
 crypto_stop_monitor.py's own notification logic is touched or imported.
-Every external call (Alpaca cash balance, local position-state file, local
-decision log) is individually wrapped so a single failure degrades that one
-line of the message to "unavailable" rather than crashing the whole script
--- the message that gets sent is the point, so this must never itself
-become the silent failure it exists to catch.
+Every external call (Alpaca cash balance, the broker P&L snapshot below,
+local position-state file, local decision log) is individually wrapped so
+a single failure degrades that one line of the message to "unavailable"
+rather than crashing the whole script -- the message that gets sent is the
+point, so this must never itself become the silent failure it exists to
+catch.
+
+P&L snapshot (added 2026-08-24): a live, broker-truth portfolio summary
+via `src.live.read_only_portfolio_snapshot.fetch_portfolio_pnl` -- see
+that module's own docstring for what it computes and why. Folded into
+this SAME 4x/day cron (no new schedule needed) rather than
+`send_performance_report.py`'s separate once-daily cadence, since a
+quiet-day heartbeat and an open-position P&L check are naturally the
+same audience/timing here.
 """
 
 from __future__ import annotations
@@ -28,6 +37,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.backtest.portfolio_backtest_engine import _MutablePosition
+from src.live import order_submission
+from src.live import read_only_portfolio_snapshot as ros
 from src.live.account_state import get_live_cash_balance
 from src.live.position_state import DEFAULT_STATE_PATH, LiveRunnerState, load_position_state
 from src.notify.telegram_notifier import send_telegram_message
@@ -64,6 +75,49 @@ def _safe_position_state(state_path: Path) -> tuple[LiveRunnerState | None, str 
         return load_position_state(state_path), None
     except Exception as error:
         return None, type(error).__name__
+
+
+def _safe_portfolio_pnl() -> tuple[ros.ReadOnlyPortfolioPnl | None, str | None]:
+    """One TradingClient, built here and passed straight through to
+    `fetch_portfolio_pnl` -- which itself uses that SAME client for its
+    own `get_account`/`get_all_positions`/`get_orders` reads (see that
+    module's own docstring). A separate connection from whatever
+    `get_live_cash_balance()` above builds for the pre-existing cash
+    line -- that line is left untouched (own independent source, own
+    existing tests) rather than folded into this new one, matching this
+    function's own "one failure degrades only this source" contract."""
+    try:
+        client = order_submission.get_trading_client()
+        return ros.fetch_portfolio_pnl(client), None
+    except Exception as error:
+        return None, type(error).__name__
+
+
+def _format_pnl_lines(pnl: ros.ReadOnlyPortfolioPnl) -> list[str]:
+    lines = [
+        "P&L snapshot (broker, live):",
+        f"  Portfolio value: ${pnl.portfolio_value:,.2f}",
+        f"  Cash: ${pnl.cash:,.2f}",
+        f"  Day P&L: {pnl.day_pnl:+,.2f}",
+    ]
+    if pnl.positions:
+        for position in sorted(pnl.positions, key=lambda item: item.ticker):
+            lines.append(
+                f"  {position.ticker} ({position.side}): qty {position.quantity:g} "
+                f"entry {position.avg_entry_price:,.2f} current {position.current_price:,.2f} "
+                f"unrealized {position.broker_unrealized_pnl:+,.2f} "
+                f"({position.broker_unrealized_pnl_pct * 100:+.2f}%)"
+            )
+    else:
+        lines.append("  No broker positions open.")
+    realized_note = (
+        "" if pnl.realized_history_complete
+        else " (order history capped at the lookback limit -- may be incomplete)"
+    )
+    lines.append(f"  Realized closed-trade P&L: {pnl.realized_closed_trade_pnl:+,.2f}{realized_note}")
+    lines.append(f"  Broker unrealized P&L: {pnl.broker_unrealized_pnl_total:+,.2f}")
+    lines.append(f"  {pnl.combined_strategy_pnl_label}: {pnl.combined_strategy_pnl:+,.2f}")
+    return lines
 
 
 def _latest_decision_log(decision_log_directory: Path) -> Path | None:
@@ -133,6 +187,12 @@ def build_status_text(
         lines.append(f"Cash balance: ${cash:,.2f}")
     else:
         lines.append(f"Cash balance: unavailable ({cash_error})")
+
+    pnl, pnl_error = _safe_portfolio_pnl()
+    if pnl_error is None:
+        lines.extend(_format_pnl_lines(pnl))
+    else:
+        lines.append(f"P&L snapshot: unavailable ({pnl_error})")
 
     runner_state, state_error = _safe_position_state(state_path)
     if state_error is None:
