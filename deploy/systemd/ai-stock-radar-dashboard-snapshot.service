@@ -1,0 +1,35 @@
+[Unit]
+Description=AI-Stock-Radar dashboard snapshot producer (one-shot)
+# Never enable/start manually for real trading impact -- this unit is
+# read-only against the broker (see scripts/generate_dashboard_snapshot.py's
+# own module docstring) but does hold real Alpaca credentials via
+# EnvironmentFile below. Runs as ai-dashboard-producer, NEVER as
+# ai-dashboard (see docs/DASHBOARD_V1_RUNBOOK.md for the full user split).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ai-dashboard-producer
+Group=ai-dashboard-producer
+WorkingDirectory=/root/AI-Stock-Radar
+EnvironmentFile=/root/AI-Stock-Radar/.env
+Environment=AI_STOCK_RADAR_GUARD_DIR=/root/.ai_stock_radar_guard
+ExecStart=/root/AI-Stock-Radar/.venv/bin/python scripts/generate_dashboard_snapshot.py
+
+# Hardening -- this unit still needs real credentials and read access
+# to data/live/ + the .guard directory, so it cannot be as locked down
+# as the HTTP unit (see ai-stock-radar-dashboard.service), but every
+# restriction that does not conflict with that need is still applied.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ai-stock-radar-dashboard /root/AI-Stock-Radar/data/live /root/.ai_stock_radar_guard
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# A stuck/hung broker call must not block the next scheduled run
+# forever -- the timer's own OnUnitActiveSec spacing already prevents
+# overlapping runs from queuing up, this is defense in depth.
+TimeoutStartSec=120

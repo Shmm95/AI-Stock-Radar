@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI-Stock-Radar Dashboard</title>
+<style>/*__DASHBOARD_CSS__*/</style>
+</head>
+<body>
+<header class="top-bar">
+  <h1>AI-Stock-Radar</h1>
+  <div id="staleness" class="badge badge-unknown">Loading…</div>
+</header>
+
+<main id="app">
+  <section class="card" id="account-card">
+    <h2>Account</h2>
+    <div class="grid" id="account-grid">&hellip;</div>
+  </section>
+
+  <section class="card" id="pnl-card">
+    <h2>P&amp;L</h2>
+    <div class="grid" id="pnl-grid">&hellip;</div>
+  </section>
+
+  <section class="card" id="positions-card">
+    <h2>Positions</h2>
+    <div id="positions-list">&hellip;</div>
+  </section>
+
+  <section class="card" id="system-card">
+    <h2>System</h2>
+    <div class="grid" id="system-grid">&hellip;</div>
+  </section>
+
+  <section class="card" id="trades-card">
+    <h2>Recent trades</h2>
+    <div id="trades-list">&hellip;</div>
+  </section>
+
+  <section class="card" id="errors-card" hidden>
+    <h2>Snapshot warnings</h2>
+    <div id="errors-list"></div>
+  </section>
+</main>
+
+<footer class="foot-note">
+  <span id="generated-at"></span>
+</footer>
+
+<script>/*__DASHBOARD_JS__*/</script>
+</body>
+</html>

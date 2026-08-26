@@ -1,0 +1,45 @@
+[Unit]
+Description=AI-Stock-Radar dashboard HTTP service (read-only, GET-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-dashboard
+Group=ai-dashboard
+WorkingDirectory=/root/AI-Stock-Radar
+Environment=DASHBOARD_SNAPSHOT_PATH=/var/lib/ai-stock-radar-dashboard/dashboard_snapshot_v1.json
+ExecStart=/root/AI-Stock-Radar/.venv/bin/uvicorn src.dashboard.http_app:app --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+
+# Hardening -- owner's own explicit requirements, 2026-08-25. This
+# process never sees Alpaca credentials, never reads the .guard
+# directory, and never writes anything -- so it can be locked down far
+# harder than the snapshot producer above.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Loopback-only, both at the bind-address level (see ExecStart above)
+# AND at the network-ACL level -- deliberately NOT PrivateNetwork=true,
+# which would put this unit in its own network namespace and cut
+# cloudflared (a SEPARATE process/unit) off from ever reaching
+# 127.0.0.1:8765 at all. IPAddressAllow/Deny below achieve the real
+# isolation goal (nothing but loopback traffic) without that side
+# effect -- see docs/DASHBOARD_V1_RUNBOOK.md for the full "why."
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

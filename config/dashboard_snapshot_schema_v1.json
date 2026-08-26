@@ -1,0 +1,134 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "dashboard_snapshot_schema_v1",
+  "title": "AI-Stock-Radar Dashboard Snapshot v1",
+  "description": "Contract for dashboard_snapshot_v1.json, written atomically by scripts/generate_dashboard_snapshot.py and read only by src/dashboard/http_app.py. additionalProperties is false at every level -- an unexpected field anywhere is a schema violation, not silently tolerated.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at_utc", "collection_status", "source_account_suffix_masked", "account", "positions", "pnl", "recent_trades", "system", "source_provenance", "errors"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_utc": { "type": "string" },
+    "collection_status": { "type": "string", "enum": ["OK", "PARTIAL", "ERROR"] },
+    "source_account_suffix_masked": { "type": ["string", "null"] },
+    "account": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["cash", "equity", "portfolio_value", "buying_power", "last_equity", "day_pnl"],
+      "properties": {
+        "cash": { "type": "string" },
+        "equity": { "type": "string" },
+        "portfolio_value": { "type": "string" },
+        "buying_power": { "type": "string" },
+        "last_equity": { "type": "string" },
+        "day_pnl": { "type": "string" }
+      }
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "asset_class", "side", "quantity", "available_quantity", "avg_entry_price", "current_price", "cost_basis", "market_value", "unrealized_pnl_usd", "unrealized_pnl_percent"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "asset_class": { "type": "string" },
+          "side": { "type": "string", "enum": ["long", "short"] },
+          "quantity": { "type": "string" },
+          "available_quantity": { "type": "string" },
+          "avg_entry_price": { "type": "string" },
+          "current_price": { "type": "string" },
+          "cost_basis": { "type": "string" },
+          "market_value": { "type": "string" },
+          "unrealized_pnl_usd": { "type": "string" },
+          "unrealized_pnl_percent": { "type": "string" }
+        }
+      }
+    },
+    "pnl": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["realized_closed_trade_pnl_usd", "unrealized_pnl_usd", "combined_strategy_pnl_usd", "realized_history_complete", "combined_strategy_pnl_label"],
+      "properties": {
+        "realized_closed_trade_pnl_usd": { "type": "string" },
+        "unrealized_pnl_usd": { "type": "string" },
+        "combined_strategy_pnl_usd": { "type": "string" },
+        "realized_history_complete": { "type": "boolean" },
+        "combined_strategy_pnl_label": { "type": "string" }
+      }
+    },
+    "recent_trades": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "asset_class", "entry_price", "exit_price", "quantity", "entry_time", "exit_time", "pnl_usd"],
+        "properties": {
+          "symbol": { "type": "string" },
+          "asset_class": { "type": "string" },
+          "entry_price": { "type": "string" },
+          "exit_price": { "type": "string" },
+          "quantity": { "type": "string" },
+          "entry_time": { "type": "string" },
+          "exit_time": { "type": "string" },
+          "pnl_usd": { "type": "string" }
+        }
+      }
+    },
+    "system": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["stop_present", "freeze_present", "broker_account_status", "broker_restrictions", "local_position_count", "broker_position_count", "local_broker_symbol_diff", "last_decision_generated_at", "last_decision_stale", "needs_manual_review_count", "replay_gate_present_today", "last_processed_equity_session_date", "settled_sessions_behind", "intent_summary"],
+      "properties": {
+        "stop_present": { "type": "boolean" },
+        "freeze_present": { "type": "boolean" },
+        "broker_account_status": { "type": ["string", "null"] },
+        "broker_restrictions": { "type": "array", "items": { "type": "string" } },
+        "local_position_count": { "type": "integer", "minimum": 0 },
+        "broker_position_count": { "type": "integer", "minimum": 0 },
+        "local_broker_symbol_diff": { "type": "array", "items": { "type": "string" } },
+        "last_decision_generated_at": { "type": ["string", "null"] },
+        "last_decision_stale": { "type": ["boolean", "null"] },
+        "needs_manual_review_count": { "type": ["integer", "null"], "minimum": 0 },
+        "replay_gate_present_today": { "type": "boolean" },
+        "last_processed_equity_session_date": { "type": ["string", "null"] },
+        "settled_sessions_behind": { "type": ["integer", "null"], "minimum": 0 },
+        "intent_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["summary_status", "non_terminal_count", "prepared_count", "submitting_count", "broker_acknowledged_count", "committed_count", "uncertain_count", "stale_non_terminal_count", "oldest_non_terminal_age_bucket", "parse_error_count", "source_available", "checked_at_utc"],
+          "properties": {
+            "summary_status": { "type": "string", "enum": ["OK", "IN_FLIGHT", "ATTENTION", "UNKNOWN"] },
+            "non_terminal_count": { "type": "integer", "minimum": 0 },
+            "prepared_count": { "type": "integer", "minimum": 0 },
+            "submitting_count": { "type": "integer", "minimum": 0 },
+            "broker_acknowledged_count": { "type": "integer", "minimum": 0 },
+            "committed_count": { "type": "integer", "minimum": 0 },
+            "uncertain_count": { "type": "integer", "minimum": 0 },
+            "stale_non_terminal_count": { "type": "integer", "minimum": 0 },
+            "oldest_non_terminal_age_bucket": { "type": "string", "enum": ["NONE", "LT_5M", "5M_TO_1H", "GT_1H"] },
+            "parse_error_count": { "type": "integer", "minimum": 0 },
+            "source_available": { "type": "boolean" },
+            "checked_at_utc": { "type": "string" }
+          }
+        }
+      }
+    },
+    "source_provenance": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["section", "error_type"],
+        "properties": {
+          "section": { "type": "string" },
+          "error_type": { "type": "string" }
+        }
+      }
+    }
+  }
+}
