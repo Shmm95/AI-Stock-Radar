@@ -8,7 +8,10 @@ must exit non-zero when that happens.
 from __future__ import annotations
 
 import json
+import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -74,6 +77,47 @@ def test_successful_run_writes_a_real_atomic_schema_valid_file(tmp_path, monkeyp
     # No leftover temp file from the atomic-write dance.
     leftovers = list(output_path.parent.glob(f".{output_path.name}.*.tmp"))
     assert leftovers == []
+    # Independent-audit finding, 2026-08-26: _atomic_write_text's own
+    # tempfile.mkstemp() default (0600, owner-only) would leave the
+    # unprivileged ai-dashboard HTTP-service user unable to read this
+    # file at all -- the producer must explicitly widen it to 0640
+    # (group-readable) after the atomic write completes.
+    actual_mode = stat.S_IMODE(output_path.stat().st_mode)
+    assert actual_mode == 0o640, f"expected mode 0640, got {oct(actual_mode)}"
+
+
+def test_snapshot_file_permissions_are_widened_past_mkstemps_own_default(tmp_path, monkeypatch):
+    """A more direct proof than the end-to-end test above: confirms the
+    file is NOT left at mkstemp's real 0600 default -- i.e. that the
+    explicit chmod call actually ran and actually changed the mode, not
+    that 0640 merely happened to already be the umask-derived result."""
+    monkeypatch.setattr(sb, "_build_trading_client", lambda: _FakeClient())
+    monkeypatch.setenv("AI_STOCK_RADAR_GUARD_DIR", str(tmp_path / "guard"))
+    output_path = tmp_path / "output" / "dashboard_snapshot_v1.json"
+
+    # Confirm the assumption itself: a bare mkstemp() in this same
+    # directory really does default to 0600 in this environment (i.e.
+    # this test isn't trivially passing because of an unusual umask).
+    output_path.parent.mkdir(parents=True)
+    probe_fd, probe_name = tempfile.mkstemp(dir=output_path.parent)
+    os.close(probe_fd)
+    probe_mode = stat.S_IMODE(Path(probe_name).stat().st_mode)
+    Path(probe_name).unlink()
+    assert probe_mode == 0o600, f"test environment's own mkstemp default isn't 0600 ({oct(probe_mode)}) -- re-check this test's premise"
+
+    _run_main(
+        monkeypatch,
+        argv=[
+            "generate_dashboard_snapshot.py",
+            "--output-path", str(output_path),
+            "--state-path", str(tmp_path / "position_state.json"),
+            "--guard-path", str(tmp_path / "hwm.json"),
+        ],
+    )
+
+    actual_mode = stat.S_IMODE(output_path.stat().st_mode)
+    assert actual_mode == gds.SNAPSHOT_FILE_MODE == 0o640
+    assert actual_mode != 0o600
 
 
 def test_core_failure_does_not_overwrite_existing_snapshot_and_exits_nonzero(tmp_path, monkeypatch):

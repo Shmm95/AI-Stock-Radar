@@ -40,6 +40,11 @@ from src.live import position_state as ps  # noqa: E402
 from src.live import session_replay_pass_gate  # noqa: E402
 from src.live.position_state import _atomic_write_text  # noqa: E402
 
+# Owner rw, group r, other none -- see the chmod call below for the
+# full "why." Requires the snapshot directory's group to actually be
+# `ai-dashboard` (docs/DASHBOARD_V1_RUNBOOK.md's own setup steps).
+SNAPSHOT_FILE_MODE = 0o640
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -72,6 +77,19 @@ def main() -> None:
     payload = json.dumps(snapshot.to_dict(), indent=2, sort_keys=True) + "\n"
     arguments.output_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(arguments.output_path, payload)
+    # Independent-audit finding, 2026-08-26: _atomic_write_text's own
+    # tempfile.mkstemp() creates (and os.replace preserves) mode 0600 --
+    # owner (ai-dashboard-producer) read/write only. The UNPRIVILEGED
+    # ai-dashboard user (a different Unix user, running the HTTP
+    # service -- see deploy/systemd/) could never read that file. 0640
+    # (owner rw, GROUP r) lets ai-dashboard read it via the shared
+    # group set up in docs/DASHBOARD_V1_RUNBOOK.md's own `chown ...:
+    # ai-dashboard` + setgid step -- explicitly set here rather than
+    # relying on mkstemp's own default, which is correct/tight for
+    # every OTHER caller of _atomic_write_text (the real guard
+    # directory, order_intent.py's journal) but wrong for a file that
+    # is deliberately meant to be read by a second, unprivileged user.
+    arguments.output_path.chmod(SNAPSHOT_FILE_MODE)
     print(f"Dashboard snapshot written to {arguments.output_path} (collection_status={snapshot.collection_status}).")
 
 

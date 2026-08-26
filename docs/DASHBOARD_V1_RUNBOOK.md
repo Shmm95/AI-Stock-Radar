@@ -41,16 +41,30 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin ai-dashboard
 sudo mkdir -p /var/lib/ai-stock-radar-dashboard
 sudo chown ai-dashboard-producer:ai-dashboard /var/lib/ai-stock-radar-dashboard
 sudo chmod 750 /var/lib/ai-stock-radar-dashboard
+# setgid: every NEW file the producer creates in this directory
+# inherits its GROUP (ai-dashboard) automatically, regardless of the
+# producer process's own primary group -- without this, a file's group
+# would default to ai-dashboard-producer's own primary group, and the
+# 0640 permission scripts/generate_dashboard_snapshot.py sets on the
+# snapshot file (independent-audit finding, 2026-08-26) would not
+# actually grant ai-dashboard read access.
+sudo chmod g+s /var/lib/ai-stock-radar-dashboard
 ```
 
 `ai-dashboard-producer` writes into that directory; `ai-dashboard`
-(added to the same group) only needs read access to the one file
-inside it, never write.
+only needs read access to the one file inside it, never write. The
+snapshot file itself is written 0640 (owner rw, group r) by the
+producer script itself, not left at `mkstemp`'s own default 0600 —
+see that script's own comment for why the default would have silently
+locked `ai-dashboard` out.
 
-Grant `ai-dashboard-producer` read access to `data/live/` and the real
-`.guard` directory (`~/.ai_stock_radar_guard` or wherever
+Grant `ai-dashboard-producer` READ-ONLY access to `data/live/` and the
+real `.guard` directory (`~/.ai_stock_radar_guard` or wherever
 `AI_STOCK_RADAR_GUARD_DIR` points on this host) via normal Unix group
-permissions — it never needs write access to either.
+permissions — it never needs write access to either (the snapshot
+producer's own systemd unit no longer grants `ReadWritePaths` for
+them either, independent-audit finding, 2026-08-26 — only the
+snapshot output directory above is writable).
 
 ## Install
 

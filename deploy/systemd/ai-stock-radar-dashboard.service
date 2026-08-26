@@ -19,7 +19,15 @@ RestartSec=5
 # harder than the snapshot producer above.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+# ProtectHome=true (NOT read-only) HIDES /root entirely -- since this
+# unit's own code, venv, and ExecStart binary all live under
+# /root/AI-Stock-Radar, that setting made the service unable to even
+# start (independent-audit finding, 2026-08-26). ProtectSystem=strict
+# above already makes the whole filesystem read-only outside
+# ReadWritePaths=; ProtectHome=read-only adds a second, redundant-but-
+# harmless read-only guarantee specifically for /home,/root,/run/user
+# without hiding them.
+ProtectHome=read-only
 PrivateTmp=true
 CapabilityBoundingSet=
 RestrictSUIDSGID=true

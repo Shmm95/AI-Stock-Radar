@@ -17,15 +17,26 @@ EnvironmentFile=/root/AI-Stock-Radar/.env
 Environment=AI_STOCK_RADAR_GUARD_DIR=/root/.ai_stock_radar_guard
 ExecStart=/root/AI-Stock-Radar/.venv/bin/python scripts/generate_dashboard_snapshot.py
 
-# Hardening -- this unit still needs real credentials and read access
+# Hardening -- this unit still needs real credentials and READ access
 # to data/live/ + the .guard directory, so it cannot be as locked down
 # as the HTTP unit (see ai-stock-radar-dashboard.service), but every
 # restriction that does not conflict with that need is still applied.
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
+# Same fix as the HTTP unit (independent-audit finding, 2026-08-26):
+# ProtectHome=true would hide /root/AI-Stock-Radar (this unit's own
+# code/venv) entirely, not just data/live/.guard within it.
+ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=/var/lib/ai-stock-radar-dashboard /root/AI-Stock-Radar/data/live /root/.ai_stock_radar_guard
+# Independent-audit finding, 2026-08-26: this unit is READ-ONLY against
+# data/live/ and the .guard directory (see scripts/generate_dashboard_snapshot.py's
+# own module docstring -- it only ever reads position_state.json, the
+# decision log, and order_intents/*.json) -- the ORIGINAL version of
+# this line granted write access to both, violating the least-privilege
+# principle this whole subsystem is built around. ProtectSystem=strict
+# above already makes them read-only by default; only the snapshot
+# OUTPUT directory needs to be writable.
+ReadWritePaths=/var/lib/ai-stock-radar-dashboard
 RestrictSUIDSGID=true
 LockPersonality=true
 
