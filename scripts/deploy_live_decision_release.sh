@@ -200,6 +200,28 @@ RELEASE_DIR="${RELEASES_DIR}/${FULL_COMMIT}"
 CURRENT_LINK="${DEPLOY_ROOT}/current"
 ROOT_MANIFEST="${RUNTIME_ROOT}/DEPLOYED_VERSION.txt"
 
+# LIVE_GUARD_DIRECTORY -- NOT under RUNTIME_ROOT (2026-08-29 correction).
+# src/live/position_state.py's own _GUARD_DIRECTORY resolves
+# $AI_STOCK_RADAR_GUARD_DIR if set, else Path.home()/".ai_stock_radar_guard".
+# The MAIN live system's crontab/.env sets no such variable (confirmed:
+# `grep guard .env` on the real host is empty), so the real, running
+# code falls back to root's home directory -- /root/.ai_stock_radar_guard
+# -- never /root/AI-Stock-Radar/.guard. Direct, decisive confirmation
+# this repo's own docs/control_arm_crontab_v3.draft (lines 147-155):
+# control-arm's OWN crontab explicitly sets
+# AI_STOCK_RADAR_GUARD_DIR=/root/AI-Stock-Radar-Control/.guard
+# specifically "without this it would default to
+# $HOME/.ai_stock_radar_guard/ and silently collide with the live
+# deployment's own guard file, since both run as root on the same
+# server" -- i.e. control-arm had to move ITS OWN guard dir aside
+# precisely because the main live system already occupies the default,
+# untouched, out-of-repo location. Deliberately outside RUNTIME_ROOT
+# entirely (position_state.py's own docstring: "A location the deploy
+# mechanism never touches is the only way this guard can do its job" --
+# an rsync/deploy that could reach this path could also clobber the
+# rollback high-water-mark it exists to protect).
+LIVE_GUARD_DIRECTORY="/root/.ai_stock_radar_guard"
+
 case "$FULL_COMMIT" in
     *[!0-9a-f]*|'') die "Invalid commit hash" ;;
 esac
@@ -226,8 +248,19 @@ test -f "${RUNTIME_ROOT}/.env" || die "Live .env is missing"
 test -x "${RUNTIME_ROOT}/.venv/bin/python3" || die "Live virtualenv is missing"
 test -d "${RUNTIME_ROOT}/data/live" || die "Persistent data/live directory is missing"
 test -d "${RUNTIME_ROOT}/logs" || die "Persistent logs directory is missing"
-test -d "${RUNTIME_ROOT}/.guard" || die "Persistent guard directory is missing"
 test -f "$REMOTE_PARTIAL" || die "Transferred artifact is missing"
+
+# LIVE_GUARD_DIRECTORY is deliberately NOT a fail-closed `test -d || die`
+# check like the ones above -- position_state.py's own docstring states
+# "a fresh server needs no special setup (the file is created on first
+# successful save)". Self-heal (create only the empty directory scaffold,
+# 0700, matching this script's own umask) if missing; NEVER touch/create
+# the high_water_mark.json or lock file inside it either way -- an
+# existing guard file's content must survive completely untouched by a
+# deploy, per that same module's own explicit design rationale.
+if [ ! -d "$LIVE_GUARD_DIRECTORY" ]; then
+    install -d -m 0700 "$LIVE_GUARD_DIRECTORY"
+fi
 
 REMOTE_ARTIFACT_SHA="$(sha256sum "$REMOTE_PARTIAL" | awk '{print $1}')"
 [ "$REMOTE_ARTIFACT_SHA" = "$EXPECTED_ARTIFACT_SHA" ] \
@@ -365,7 +398,16 @@ else
     mkdir -p "${APP_DIR}/data"
     ln -s "${RUNTIME_ROOT}/.env" "${APP_DIR}/.env"
     ln -s "${RUNTIME_ROOT}/.venv" "${APP_DIR}/.venv"
-    ln -s "${RUNTIME_ROOT}/.guard" "${APP_DIR}/.guard"
+    # Convenience symlink only -- none of the 5 real crontab entry
+    # points read a relative `.guard` path; position_state.py resolves
+    # $AI_STOCK_RADAR_GUARD_DIR/$HOME directly via the Python process's
+    # own environment, never through this app directory. Points at the
+    # REAL location (LIVE_GUARD_DIRECTORY, see its own definition above)
+    # so a future relative-path consumer run from here (e.g. a dashboard
+    # snapshot builder, per src/dashboard/snapshot_builder.py's own
+    # `.guard/order_intents/*.json` read pattern, if ever deployed here)
+    # resolves to the SAME directory the live code actually writes to.
+    ln -s "$LIVE_GUARD_DIRECTORY" "${APP_DIR}/.guard"
     ln -s "${RUNTIME_ROOT}/logs" "${APP_DIR}/logs"
     ln -s "${RUNTIME_ROOT}/data/live" "${APP_DIR}/data/live"
 
