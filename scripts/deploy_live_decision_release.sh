@@ -24,16 +24,23 @@
 #     a full-tree sha256 manifest built locally from the SAME approved
 #     artifact, via `sha256sum -c` -- not a curated subset, and not
 #     something that trusts DEPLOYED_VERSION.txt's own field values
-#     alone. Runs before the deploy is ever declared VERIFIED. Note
-#     this checks RELEASE_DIR (deploy/releases/<commit>, what
-#     deploy/current actually resolves to) specifically -- never
-#     RUNTIME_ROOT's own top level, which this script has never
-#     written to and which also holds persistent, non-release things
-#     (.env, .venv, logs, data/live) no git tree was ever going to
-#     match. A path read directly under RUNTIME_ROOT rather than
-#     through deploy/current is, by construction, outside anything
-#     this script manages or can vouch for.
+#     alone. Runs before the deploy is ever declared VERIFIED.
+#   - RUNTIME_ROOT code sync (2026-08-29 addition, owner-approved --
+#     supersedes the note that used to be here): the REAL crontab (raw
+#     `crontab -l`, confirmed directly by the owner) executes from
+#     RUNTIME_ROOT's own top level, `cd /root/AI-Stock-Radar && ...
+#     scripts/...`, NEVER through deploy/current -- this predates
+#     every deploy script built this session. So, strictly AFTER the
+#     byte-for-byte RELEASE_DIR check above passes, this script now
+#     ALSO rsyncs (`-a --delete`) exactly scripts/, src/, config/ (and
+#     nothing else -- never docs/, tests/, or any persistent path) from
+#     RELEASE_DIR into RUNTIME_ROOT, then re-verifies THAT sync
+#     byte-for-byte too, before ever declaring VERIFIED. The
+#     deploy/releases/<commit> + deploy/current symlink structure is
+#     kept regardless -- this sync is additive, for the audit trail
+#     and rollback capability, never a replacement for it.
 #
+
 # NOT LOCATED: a previously-used "deploy_method=git-archive-rsync-
 # checksum-v2" script was searched for across all four sibling
 # worktrees (workspace-a, workspace-b, workspace-c, the main
@@ -540,6 +547,71 @@ fi
 
 printf 'Byte-for-byte verification passed: every file in %s matches the approved release tree.\n' "$RELEASE_DIR"
 
+# --- Sync verified release CODE into RUNTIME_ROOT's own top level ---
+# (2026-08-29, owner-approved -- the fourth incident this session in
+# the "release content vs what cron actually executes" category, this
+# one root-caused conclusively: the REAL crontab, raw `crontab -l`
+# output provided directly by the owner, does `cd /root/AI-Stock-Radar
+# && ... scripts/...` -- RUNTIME_ROOT's own top level, NEVER
+# deploy/current. This predates every deploy script built this
+# session (run_daily_decision.py has been executing successfully from
+# there for months, including the real CEG-incident fixes); whatever
+# mechanism used to keep it in sync is not part of this repository.
+#
+# Rather than change the crontab (a standing-configuration change
+# needing its own separate, explicit owner sign-off -- not something
+# to fold into a deploy script's own unilateral behavior) or abandon
+# the immutable-release/rollback/byte-for-byte-checksum properties
+# built up over the three prior incidents tonight, this step syncs the
+# ALREADY byte-for-byte-verified RELEASE_DIR's own code into
+# RUNTIME_ROOT, strictly ON TOP of every guarantee already established
+# above -- this is the LAST step before activation, never a substitute
+# for any earlier check.
+#
+# Scope is deliberately narrow: scripts/, src/, config/ ONLY -- the
+# exact directories derive_required_files_from_crontab.py's own real
+# crontab-derived trace ever reaches (this repo's own docs/, tests/,
+# README.md etc. are never referenced by any real cron entry point, so
+# they are never synced -- RUNTIME_ROOT's top level does not need to be
+# a full mirror of the release, only the parts cron actually imports).
+# `.env`/`.env.control`/`.venv`/`data/`/`data/live/`/`logs/`/`.guard/`
+# are NEVER in this list and NEVER will be -- the exact same persistent-
+# state discipline the archive-exclusion checks above already enforce
+# for the release tree itself, now extended to this sync step too.
+command -v rsync >/dev/null 2>&1 \
+    || die "rsync is required for the RUNTIME_ROOT code sync step but is not installed on this host"
+
+for SYNC_DIR in scripts src config; do
+    test -d "${RELEASE_DIR}/${SYNC_DIR}" \
+        || die "Verified release is missing its own ${SYNC_DIR}/ directory -- cannot sync what does not exist"
+    rsync -a --delete -- "${RELEASE_DIR}/${SYNC_DIR}/" "${RUNTIME_ROOT}/${SYNC_DIR}/" \
+        || die "rsync failed while syncing ${SYNC_DIR}/ into RUNTIME_ROOT -- RUNTIME_ROOT may now be in a PARTIAL state; investigate before retrying, do not assume the prior deploy is still intact"
+done
+sync "$RUNTIME_ROOT"
+
+# Final check: RUNTIME_ROOT's own scripts/, src/, config/ now
+# byte-for-byte match the verified release -- reuses the SAME
+# full-tree manifest already built and verified against RELEASE_DIR
+# above (filtered to just these three prefixes), never a separate,
+# independent trust point. This is what directly answers "does
+# RUNTIME_ROOT/scripts/send_status_update.py (or any other synced
+# file) really match the new release" -- not by spot-checking one
+# named file, but by checking every synced file the same way
+# RELEASE_DIR itself was checked.
+RUNTIME_SYNC_MANIFEST="${RUNTIME_ROOT}/.sync_verify_manifest.$$.sha256"
+grep -E '^[^[:space:]]+  \./(scripts|src|config)/' "$TREE_MANIFEST_PATH" > "$RUNTIME_SYNC_MANIFEST" || true
+[ -s "$RUNTIME_SYNC_MANIFEST" ] \
+    || die "Scoped sync-verification manifest is empty -- no scripts/src/config entries found in the full-tree manifest, which should be impossible given the required-file checklist. Refusing to declare the sync verified."
+
+(
+    cd "$RUNTIME_ROOT" || die "Could not enter $RUNTIME_ROOT for sync verification"
+    sha256sum --quiet -c "$RUNTIME_SYNC_MANIFEST"
+) || die "RUNTIME_ROOT's synced scripts/, src/, config/ do NOT byte-for-byte match the verified release -- see the sha256sum output above for which file(s) diverged. RUNTIME_ROOT may be in a partial/inconsistent state -- investigate before retrying."
+
+RUNTIME_SYNC_FILE_COUNT="$(grep -cE '^[^[:space:]]+  \./(scripts|src|config)/' "$TREE_MANIFEST_PATH")"
+rm -f -- "$RUNTIME_SYNC_MANIFEST"
+printf 'RUNTIME_ROOT sync verified: %s file(s) in scripts/, src/, config/ byte-for-byte match the release.\n' "$RUNTIME_SYNC_FILE_COUNT"
+
 CURRENT_TMP="${DEPLOY_ROOT}/.current.$$"
 [ ! -e "$CURRENT_TMP" ] && [ ! -L "$CURRENT_TMP" ] \
     || die "Temporary current link already exists"
@@ -584,5 +656,7 @@ FINAL_ARTIFACT_SHA="$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
 printf '\nDEPLOY VERIFIED\n'
 printf 'Active release: %s\n' "$ACTIVE_RELEASE"
 printf 'Byte-for-byte verified against: %s (every tracked file, not a spot check)\n' "$TREE_MANIFEST_PATH"
+printf 'RUNTIME_ROOT sync (scripts/, src/, config/): VERIFIED, %s file(s) byte-for-byte match (what the real crontab actually executes)\n' \
+    "$RUNTIME_SYNC_FILE_COUNT"
 cat "$ROOT_MANIFEST"
 REMOTE_BASH
