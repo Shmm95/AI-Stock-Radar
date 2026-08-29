@@ -587,6 +587,28 @@ for SYNC_DIR in scripts src config; do
     rsync -a --delete -- "${RELEASE_DIR}/${SYNC_DIR}/" "${RUNTIME_ROOT}/${SYNC_DIR}/" \
         || die "rsync failed while syncing ${SYNC_DIR}/ into RUNTIME_ROOT -- RUNTIME_ROOT may now be in a PARTIAL state; investigate before retrying, do not assume the prior deploy is still intact"
 done
+
+# Explicit go+rX (independent-audit finding, 2026-08-29): this script's
+# own `umask 077` at the top -- deliberate, and correct, for the
+# SENSITIVE artifacts it also creates (DEPLOYED_VERSION.txt, the guard
+# scaffold, etc.) -- ALSO silently applies to this sync, confirmed the
+# hard way: git tracks every one of these files as 100644 (world-
+# readable), but a real local test (tar --extract then rsync -a, both
+# under umask 077) produced -rw------- (600, owner-only) on disk,
+# regardless of git's own recorded mode. Unprivileged systemd units
+# (ai-dashboard, ai-dashboard-producer -- see deploy/systemd/*.service)
+# need to read (and, for directories, traverse) these files; without
+# this, fixing ONLY the /root and /root/AI-Stock-Radar traversal ACLs
+# (a separate, one-time HOST-level fix -- see docs/DASHBOARD_V1_RUNBOOK.md)
+# would still leave the files themselves unreadable underneath. `go+rX`
+# adds read for group+other on every file, and execute for group+other
+# ONLY on directories/already-executable files (capital X -- never
+# makes a plain data file spuriously executable) -- applied on every
+# deploy, automatically, rather than a manual server-side step that
+# could be forgotten on the next release.
+chmod -R go+rX "${RUNTIME_ROOT}/scripts" "${RUNTIME_ROOT}/src" "${RUNTIME_ROOT}/config" \
+    || die "Failed to make the synced scripts/src/config world-readable -- unprivileged services (dashboard) would not be able to read their own code"
+
 sync "$RUNTIME_ROOT"
 
 # Final check: RUNTIME_ROOT's own scripts/, src/, config/ now
