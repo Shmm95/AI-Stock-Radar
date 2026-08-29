@@ -19,6 +19,20 @@
 #   - idempotent: re-running with the same commit reuses the existing
 #     release directory (verified against its own manifest) rather
 #     than re-extracting
+#   - BYTE-FOR-BYTE verified (2026-08-29 addition): after extraction
+#     (or reuse), every tracked file in RELEASE_DIR is checked against
+#     a full-tree sha256 manifest built locally from the SAME approved
+#     artifact, via `sha256sum -c` -- not a curated subset, and not
+#     something that trusts DEPLOYED_VERSION.txt's own field values
+#     alone. Runs before the deploy is ever declared VERIFIED. Note
+#     this checks RELEASE_DIR (deploy/releases/<commit>, what
+#     deploy/current actually resolves to) specifically -- never
+#     RUNTIME_ROOT's own top level, which this script has never
+#     written to and which also holds persistent, non-release things
+#     (.env, .venv, logs, data/live) no git tree was ever going to
+#     match. A path read directly under RUNTIME_ROOT rather than
+#     through deploy/current is, by construction, outside anything
+#     this script manages or can vouch for.
 #
 # NOT LOCATED: a previously-used "deploy_method=git-archive-rsync-
 # checksum-v2" script was searched for across all four sibling
@@ -151,6 +165,46 @@ REQUIRED_FILES_COUNT="$(wc -l < "$LOCAL_REQUIRED_FILES" | tr -d ' ')"
 printf 'Required-file list derived from the real remote crontab: %s file(s), sha256=%s\n' \
     "$REQUIRED_FILES_COUNT" "$REQUIRED_FILES_SHA256"
 
+# FULL-TREE manifest (independent-audit finding, 2026-08-29): the
+# required-file list above is a SPOT CHECK (does this specific subset
+# exist), never a guarantee every file in the release tree is byte-
+# correct -- and a real incident already showed why that distinction
+# matters: a file at RUNTIME_ROOT's own top level (a path this script
+# has never written to, ever -- see RELEASE_DIR/CURRENT_LINK below,
+# both firmly under RUNTIME_ROOT/deploy/) was found stale, and the
+# spot-check alone gave no way to prove or disprove whether the ACTUAL
+# release tree (RELEASE_DIR, what deploy/current really points at) was
+# itself fully, correctly extracted. This manifest covers EVERY
+# tracked file in the release, not a curated subset, and is verified
+# against RELEASE_DIR specifically (the one tree this script actually
+# manages) further down -- never RUNTIME_ROOT's own top level, which
+# by design also holds persistent, non-release things (.env, .venv,
+# logs, data/live) a git tree was never going to match anyway.
+#
+# Built by re-extracting the SAME already-verified local artifact (not
+# the working tree) into a throwaway directory and hashing every real
+# file inside it -- sha256sum's own `<hash>  <path>` format, so the
+# remote side can verify it with the standard `sha256sum -c` rather
+# than hand-rolled comparison logic.
+LOCAL_VERIFY_EXTRACT_DIR="${LOCAL_TMP_DIR}/verify-extract"
+mkdir -p "$LOCAL_VERIFY_EXTRACT_DIR"
+tar --extract --file="$LOCAL_ARTIFACT" --directory="$LOCAL_VERIFY_EXTRACT_DIR"
+
+LOCAL_TREE_MANIFEST="${LOCAL_TMP_DIR}/full_tree_manifest.txt"
+(
+    cd "${LOCAL_VERIFY_EXTRACT_DIR}/app" \
+        || die "Could not enter the local verification-extract directory"
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256
+) > "$LOCAL_TREE_MANIFEST"
+
+[ -s "$LOCAL_TREE_MANIFEST" ] \
+    || die "Full-tree manifest is empty -- refusing to proceed with a byte-for-byte check that would verify nothing."
+
+TREE_MANIFEST_SHA256="$(shasum -a 256 "$LOCAL_TREE_MANIFEST" | awk '{print $1}')"
+TREE_MANIFEST_FILE_COUNT="$(wc -l < "$LOCAL_TREE_MANIFEST" | tr -d ' ')"
+printf 'Full-tree manifest built for byte-for-byte verification: %s file(s), sha256=%s\n' \
+    "$TREE_MANIFEST_FILE_COUNT" "$TREE_MANIFEST_SHA256"
+
 ARTIFACT_SHA256="$(
     shasum -a 256 "$LOCAL_ARTIFACT" | awk '{print $1}'
 )"
@@ -163,6 +217,8 @@ printf '  Commit time:         %s\n' "$COMMIT_TIME"
 printf '  Artifact SHA256:     %s\n' "$ARTIFACT_SHA256"
 printf '  Required files:      %s file(s), sha256=%s (derived from the real remote crontab)\n' \
     "$REQUIRED_FILES_COUNT" "$REQUIRED_FILES_SHA256"
+printf '  Full-tree manifest:  %s file(s), sha256=%s (byte-for-byte check of RELEASE_DIR)\n' \
+    "$TREE_MANIFEST_FILE_COUNT" "$TREE_MANIFEST_SHA256"
 printf '  Runtime root:        %s\n' "$RUNTIME_ROOT"
 printf '  Worktree clean:      %s\n\n' "$SOURCE_WORKTREE_CLEAN"
 
@@ -175,6 +231,7 @@ IFS= read -r CONFIRMED_COMMIT
 UPLOAD_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 REMOTE_PARTIAL="${DEPLOY_ROOT}/incoming/${FULL_COMMIT}.${UPLOAD_TOKEN}.tar.part"
 REMOTE_REQUIRED_FILES_PARTIAL="${DEPLOY_ROOT}/incoming/${FULL_COMMIT}.${UPLOAD_TOKEN}.required_files.txt.part"
+REMOTE_TREE_MANIFEST_PARTIAL="${DEPLOY_ROOT}/incoming/${FULL_COMMIT}.${UPLOAD_TOKEN}.full_tree_manifest.txt.part"
 
 ssh "$DEPLOY_HOST" "
     set -eu
@@ -187,6 +244,7 @@ ssh "$DEPLOY_HOST" "
 
 scp "$LOCAL_ARTIFACT" "${DEPLOY_HOST}:${REMOTE_PARTIAL}"
 scp "$LOCAL_REQUIRED_FILES" "${DEPLOY_HOST}:${REMOTE_REQUIRED_FILES_PARTIAL}"
+scp "$LOCAL_TREE_MANIFEST" "${DEPLOY_HOST}:${REMOTE_TREE_MANIFEST_PARTIAL}"
 
 ssh "$DEPLOY_HOST" bash -s -- \
     "$FULL_COMMIT" \
@@ -198,7 +256,9 @@ ssh "$DEPLOY_HOST" bash -s -- \
     "$DEPLOYED_BY" \
     "$REMOTE_PARTIAL" \
     "$REMOTE_REQUIRED_FILES_PARTIAL" \
-    "$REQUIRED_FILES_SHA256" <<'REMOTE_BASH'
+    "$REQUIRED_FILES_SHA256" \
+    "$REMOTE_TREE_MANIFEST_PARTIAL" \
+    "$TREE_MANIFEST_SHA256" <<'REMOTE_BASH'
 set -Eeuo pipefail
 umask 077
 
@@ -217,6 +277,8 @@ DEPLOYED_BY="$7"
 REMOTE_PARTIAL="$8"
 REMOTE_REQUIRED_FILES_PARTIAL="$9"
 EXPECTED_REQUIRED_FILES_SHA="${10}"
+REMOTE_TREE_MANIFEST_PARTIAL="${11}"
+EXPECTED_TREE_MANIFEST_SHA="${12}"
 
 RUNTIME_ROOT="/root/AI-Stock-Radar"
 DEPLOY_ROOT="${RUNTIME_ROOT}/deploy"
@@ -281,6 +343,17 @@ esac
 [ "${#EXPECTED_REQUIRED_FILES_SHA}" -eq 64 ] \
     || die "Required-files SHA-256 must contain 64 hexadecimal characters"
 
+case "$REMOTE_TREE_MANIFEST_PARTIAL" in
+    "${INCOMING_DIR}/"*.full_tree_manifest.txt.part) ;;
+    *) die "Unexpected incoming full-tree manifest path: $REMOTE_TREE_MANIFEST_PARTIAL" ;;
+esac
+
+case "$EXPECTED_TREE_MANIFEST_SHA" in
+    *[!0-9a-f]*|'') die "Invalid full-tree manifest SHA-256" ;;
+esac
+[ "${#EXPECTED_TREE_MANIFEST_SHA}" -eq 64 ] \
+    || die "Full-tree manifest SHA-256 must contain 64 hexadecimal characters"
+
 test "$(id -u)" = 0 || die "Remote deploy must run as root"
 test -f "${RUNTIME_ROOT}/.env" || die "Live .env is missing"
 test -x "${RUNTIME_ROOT}/.venv/bin/python3" || die "Live virtualenv is missing"
@@ -288,12 +361,19 @@ test -d "${RUNTIME_ROOT}/data/live" || die "Persistent data/live directory is mi
 test -d "${RUNTIME_ROOT}/logs" || die "Persistent logs directory is missing"
 test -f "$REMOTE_PARTIAL" || die "Transferred artifact is missing"
 test -f "$REMOTE_REQUIRED_FILES_PARTIAL" || die "Transferred required-files list is missing"
+test -f "$REMOTE_TREE_MANIFEST_PARTIAL" || die "Transferred full-tree manifest is missing"
 
 REMOTE_REQUIRED_FILES_SHA="$(sha256sum "$REMOTE_REQUIRED_FILES_PARTIAL" | awk '{print $1}')"
 [ "$REMOTE_REQUIRED_FILES_SHA" = "$EXPECTED_REQUIRED_FILES_SHA" ] \
     || die "Transferred required-files list SHA-256 mismatch"
 [ -s "$REMOTE_REQUIRED_FILES_PARTIAL" ] \
     || die "Transferred required-files list is empty -- refusing to proceed with a checklist that would verify nothing"
+
+REMOTE_TREE_MANIFEST_SHA="$(sha256sum "$REMOTE_TREE_MANIFEST_PARTIAL" | awk '{print $1}')"
+[ "$REMOTE_TREE_MANIFEST_SHA" = "$EXPECTED_TREE_MANIFEST_SHA" ] \
+    || die "Transferred full-tree manifest SHA-256 mismatch"
+[ -s "$REMOTE_TREE_MANIFEST_PARTIAL" ] \
+    || die "Transferred full-tree manifest is empty -- refusing to proceed with a byte-for-byte check that would verify nothing"
 
 # LIVE_GUARD_DIRECTORY is deliberately NOT a fail-closed `test -d || die`
 # check like the ones above -- position_state.py's own docstring states
@@ -430,6 +510,36 @@ else
     sync "$RELEASES_DIR"
 fi
 
+# BYTE-FOR-BYTE verification of RELEASE_DIR against the full-tree
+# manifest (independent-audit finding, 2026-08-29) -- runs for BOTH
+# branches above (fresh extraction AND idempotent reuse of an existing
+# release directory). This is deliberately NOT folded into either
+# branch alone: an earlier, partially-failed deploy attempt could in
+# principle leave a RELEASE_DIR whose own DEPLOYED_VERSION.txt fields
+# happen to already match (commit/tree/artifact SHA all correct) while
+# its actual file CONTENTS do not -- the required-file spot-check a
+# few lines above this block would not catch that (it only proves a
+# curated subset of paths exist, never that their content, or every
+# OTHER file's content, is byte-correct). This is the check that
+# closes that gap, for every tracked file, not a subset -- the same
+# category of gap already seen once this session (a stale file
+# discovered at a path this script has never written to at all,
+# RUNTIME_ROOT's own top level -- a different bug from this one, but
+# the same root worry: "does what's on disk really match what was
+# approved").
+TREE_MANIFEST_PATH="${RELEASE_DIR}/FULL_TREE_MANIFEST.sha256"
+if [ ! -f "$TREE_MANIFEST_PATH" ]; then
+    cp -- "$REMOTE_TREE_MANIFEST_PARTIAL" "$TREE_MANIFEST_PATH"
+    chmod 0444 "$TREE_MANIFEST_PATH"
+fi
+
+(
+    cd "$RELEASE_DIR" || die "Could not enter $RELEASE_DIR for byte-for-byte verification"
+    sha256sum --quiet -c "$TREE_MANIFEST_PATH"
+) || die "RELEASE_DIR ($RELEASE_DIR) does not byte-for-byte match the approved release's own git tree -- see the sha256sum output above for which file(s) diverged. Refusing to activate this release."
+
+printf 'Byte-for-byte verification passed: every file in %s matches the approved release tree.\n' "$RELEASE_DIR"
+
 CURRENT_TMP="${DEPLOY_ROOT}/.current.$$"
 [ ! -e "$CURRENT_TMP" ] && [ ! -L "$CURRENT_TMP" ] \
     || die "Temporary current link already exists"
@@ -473,5 +583,6 @@ FINAL_ARTIFACT_SHA="$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')"
 
 printf '\nDEPLOY VERIFIED\n'
 printf 'Active release: %s\n' "$ACTIVE_RELEASE"
+printf 'Byte-for-byte verified against: %s (every tracked file, not a spot check)\n' "$TREE_MANIFEST_PATH"
 cat "$ROOT_MANIFEST"
 REMOTE_BASH
