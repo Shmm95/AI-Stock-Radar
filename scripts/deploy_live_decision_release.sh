@@ -31,34 +31,29 @@
 # below for the same reason, not v2, since that is the mechanism this
 # script actually implements.
 #
-# REQUIRED-FILE CHECKLIST -- evidence-based, not a best-effort guess
-# (2026-08-29 revision): the real crontab was provided, naming exactly
-# 5 entry points --
-#   scripts/run_daily_decision.py (--enable-equity-orders --enable-crypto-orders)
-#   scripts/run_crypto_stop_monitor.py
-#   scripts/send_status_update.py
-#   scripts/send_performance_report.py
-#   scripts/run_pipeline_canary.py
-# Every file below was found by statically parsing (Python `ast`, not
-# grep) the IMPORT STATEMENTS of these 5 scripts, at the exact release
-# commit's own git tree (`git show <commit>:<path>`, never the current
-# working tree/HEAD -- an earlier draft of this list was traced
-# against HEAD and would have wrongly flagged
-# src/live/read_only_portfolio_snapshot.py as required, a module
-# scripts/send_status_update.py does not import as of the actual
-# release commit; that import was only added later, by a commit not
-# yet part of this release), and transitively through every
-# src/live/*, src/backtest/*, src/data/*, src/notify/*, src/analysis/*
-# module those imports themselves pull in, until no new module was
-# discovered. Checked directly for the target commit: no dynamic
-# imports (`importlib`/`__import__`) and no relative imports (`from .`)
-# anywhere in this reachable set, so static import parsing is a
-# complete method here, not merely a sample. src/data/*, src/notify/*,
-# src/analysis/* are included below even though outside the literal
-# src/live/+src/backtest/ scope requested, because they are equally
-# real, equally load-bearing dependencies of these same 5 scripts
-# (e.g. src/notify/telegram_notifier.py is imported by all 5) --
-# missing any one of them would break at least one real cron job.
+# REQUIRED-FILE CHECKLIST -- auto-derived from the REAL remote crontab,
+# never hand-maintained (2026-08-29 revision, independent-audit
+# finding). A hand-built list is exactly the kind of thing that
+# silently drifts out of sync: an earlier draft of this checklist was
+# traced once, by hand, against one specific commit, and was already
+# wrong for THIS release the moment a cherry-picked commit changed
+# send_status_update.py's own import chain (it started importing
+# src/live/read_only_portfolio_snapshot.py, which the old hand-built
+# list never re-traced to pick up). Rather than re-trace by hand every
+# time code changes, this script now calls
+# scripts/derive_required_files_from_crontab.py, which:
+#   1. fetches the REAL crontab from the deploy target itself
+#      (`ssh $DEPLOY_HOST crontab -l`) -- the actual, authoritative
+#      list of entry points, never a copy that can go stale,
+#   2. statically parses (Python `ast`, never grep/regex-on-code) every
+#      entry point's own import statements, transitively, at the EXACT
+#      release commit's own git tree (`git show <commit>:<path>`, never
+#      the working tree) until no new project module is discovered.
+# The resulting list is transferred to the remote host alongside the
+# release artifact and is what the remote extraction step below
+# actually checks -- see REQUIRED_FILES_PARTIAL/REQUIRED_FILES_SHA256
+# below for the transfer, and the remote `while read -r REQUIRED_FILE`
+# loop for the check itself.
 set -Eeuo pipefail
 umask 077
 
@@ -132,18 +127,44 @@ ARCHIVE_COMMIT="$(git get-tar-commit-id < "$LOCAL_ARTIFACT")"
 [ "$ARCHIVE_COMMIT" = "$FULL_COMMIT" ] \
     || die "git archive commit header does not match approved commit"
 
+# Required-file checklist, derived from the REAL remote crontab -- see
+# this script's own top-of-file comment for the full "why". Fetched
+# and computed HERE, locally, before anything is uploaded: a failure
+# to reach the remote crontab, or a crontab-referenced script this
+# release commit doesn't actually contain, must stop the deploy before
+# any artifact transfer, not be discovered partway through the remote
+# extraction step.
+LOCAL_CRONTAB_FILE="${LOCAL_TMP_DIR}/remote_crontab.txt"
+ssh "$DEPLOY_HOST" crontab -l > "$LOCAL_CRONTAB_FILE" \
+    || die "Could not fetch the remote crontab from $DEPLOY_HOST -- the required-file list cannot be derived without it."
+
+LOCAL_REQUIRED_FILES="${LOCAL_TMP_DIR}/required_files.txt"
+python3 "$(dirname "$0")/derive_required_files_from_crontab.py" \
+    --commit "$FULL_COMMIT" --crontab-file "$LOCAL_CRONTAB_FILE" > "$LOCAL_REQUIRED_FILES" \
+    || die "Failed to derive the required-file list from the remote crontab -- see the error above."
+
+[ -s "$LOCAL_REQUIRED_FILES" ] \
+    || die "Derived required-file list is empty -- refusing to proceed with a checklist that would verify nothing."
+
+REQUIRED_FILES_SHA256="$(shasum -a 256 "$LOCAL_REQUIRED_FILES" | awk '{print $1}')"
+REQUIRED_FILES_COUNT="$(wc -l < "$LOCAL_REQUIRED_FILES" | tr -d ' ')"
+printf 'Required-file list derived from the real remote crontab: %s file(s), sha256=%s\n' \
+    "$REQUIRED_FILES_COUNT" "$REQUIRED_FILES_SHA256"
+
 ARTIFACT_SHA256="$(
     shasum -a 256 "$LOCAL_ARTIFACT" | awk '{print $1}'
 )"
 
 printf '\nLive-decision release approval\n'
-printf '  Branch:          %s\n' "$SOURCE_BRANCH"
-printf '  Commit:          %s\n' "$FULL_COMMIT"
-printf '  Tree:            %s\n' "$TREE_SHA"
-printf '  Commit time:     %s\n' "$COMMIT_TIME"
-printf '  Artifact SHA256: %s\n' "$ARTIFACT_SHA256"
-printf '  Runtime root:    %s\n' "$RUNTIME_ROOT"
-printf '  Worktree clean:  %s\n\n' "$SOURCE_WORKTREE_CLEAN"
+printf '  Branch:              %s\n' "$SOURCE_BRANCH"
+printf '  Commit:              %s\n' "$FULL_COMMIT"
+printf '  Tree:                %s\n' "$TREE_SHA"
+printf '  Commit time:         %s\n' "$COMMIT_TIME"
+printf '  Artifact SHA256:     %s\n' "$ARTIFACT_SHA256"
+printf '  Required files:      %s file(s), sha256=%s (derived from the real remote crontab)\n' \
+    "$REQUIRED_FILES_COUNT" "$REQUIRED_FILES_SHA256"
+printf '  Runtime root:        %s\n' "$RUNTIME_ROOT"
+printf '  Worktree clean:      %s\n\n' "$SOURCE_WORKTREE_CLEAN"
 
 printf 'Type the FULL commit hash to approve this deployment: '
 IFS= read -r CONFIRMED_COMMIT
@@ -153,6 +174,7 @@ IFS= read -r CONFIRMED_COMMIT
 
 UPLOAD_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 REMOTE_PARTIAL="${DEPLOY_ROOT}/incoming/${FULL_COMMIT}.${UPLOAD_TOKEN}.tar.part"
+REMOTE_REQUIRED_FILES_PARTIAL="${DEPLOY_ROOT}/incoming/${FULL_COMMIT}.${UPLOAD_TOKEN}.required_files.txt.part"
 
 ssh "$DEPLOY_HOST" "
     set -eu
@@ -164,6 +186,7 @@ ssh "$DEPLOY_HOST" "
 "
 
 scp "$LOCAL_ARTIFACT" "${DEPLOY_HOST}:${REMOTE_PARTIAL}"
+scp "$LOCAL_REQUIRED_FILES" "${DEPLOY_HOST}:${REMOTE_REQUIRED_FILES_PARTIAL}"
 
 ssh "$DEPLOY_HOST" bash -s -- \
     "$FULL_COMMIT" \
@@ -173,7 +196,9 @@ ssh "$DEPLOY_HOST" bash -s -- \
     "$COMMIT_TIME" \
     "$SOURCE_WORKTREE_CLEAN" \
     "$DEPLOYED_BY" \
-    "$REMOTE_PARTIAL" <<'REMOTE_BASH'
+    "$REMOTE_PARTIAL" \
+    "$REMOTE_REQUIRED_FILES_PARTIAL" \
+    "$REQUIRED_FILES_SHA256" <<'REMOTE_BASH'
 set -Eeuo pipefail
 umask 077
 
@@ -190,6 +215,8 @@ COMMIT_TIME="$5"
 SOURCE_WORKTREE_CLEAN="$6"
 DEPLOYED_BY="$7"
 REMOTE_PARTIAL="$8"
+REMOTE_REQUIRED_FILES_PARTIAL="$9"
+EXPECTED_REQUIRED_FILES_SHA="${10}"
 
 RUNTIME_ROOT="/root/AI-Stock-Radar"
 DEPLOY_ROOT="${RUNTIME_ROOT}/deploy"
@@ -243,12 +270,30 @@ case "$REMOTE_PARTIAL" in
     *) die "Unexpected incoming artifact path: $REMOTE_PARTIAL" ;;
 esac
 
+case "$REMOTE_REQUIRED_FILES_PARTIAL" in
+    "${INCOMING_DIR}/"*.required_files.txt.part) ;;
+    *) die "Unexpected incoming required-files list path: $REMOTE_REQUIRED_FILES_PARTIAL" ;;
+esac
+
+case "$EXPECTED_REQUIRED_FILES_SHA" in
+    *[!0-9a-f]*|'') die "Invalid required-files SHA-256" ;;
+esac
+[ "${#EXPECTED_REQUIRED_FILES_SHA}" -eq 64 ] \
+    || die "Required-files SHA-256 must contain 64 hexadecimal characters"
+
 test "$(id -u)" = 0 || die "Remote deploy must run as root"
 test -f "${RUNTIME_ROOT}/.env" || die "Live .env is missing"
 test -x "${RUNTIME_ROOT}/.venv/bin/python3" || die "Live virtualenv is missing"
 test -d "${RUNTIME_ROOT}/data/live" || die "Persistent data/live directory is missing"
 test -d "${RUNTIME_ROOT}/logs" || die "Persistent logs directory is missing"
 test -f "$REMOTE_PARTIAL" || die "Transferred artifact is missing"
+test -f "$REMOTE_REQUIRED_FILES_PARTIAL" || die "Transferred required-files list is missing"
+
+REMOTE_REQUIRED_FILES_SHA="$(sha256sum "$REMOTE_REQUIRED_FILES_PARTIAL" | awk '{print $1}')"
+[ "$REMOTE_REQUIRED_FILES_SHA" = "$EXPECTED_REQUIRED_FILES_SHA" ] \
+    || die "Transferred required-files list SHA-256 mismatch"
+[ -s "$REMOTE_REQUIRED_FILES_PARTIAL" ] \
+    || die "Transferred required-files list is empty -- refusing to proceed with a checklist that would verify nothing"
 
 # LIVE_GUARD_DIRECTORY is deliberately NOT a fail-closed `test -d || die`
 # check like the ones above -- position_state.py's own docstring states
@@ -307,79 +352,20 @@ else
 
     APP_DIR="${STAGING_DIR}/app"
 
-    # 5 real crontab entry points.
-    test -f "${APP_DIR}/scripts/run_daily_decision.py" \
-        || die "Entry point missing from archive: scripts/run_daily_decision.py"
-    test -f "${APP_DIR}/scripts/run_crypto_stop_monitor.py" \
-        || die "Entry point missing from archive: scripts/run_crypto_stop_monitor.py"
-    test -f "${APP_DIR}/scripts/send_status_update.py" \
-        || die "Entry point missing from archive: scripts/send_status_update.py"
-    test -f "${APP_DIR}/scripts/send_performance_report.py" \
-        || die "Entry point missing from archive: scripts/send_performance_report.py"
-    test -f "${APP_DIR}/scripts/run_pipeline_canary.py" \
-        || die "Entry point missing from archive: scripts/run_pipeline_canary.py"
-
-    # src/backtest/* -- every module reachable from the 5 entry points'
-    # own import chains, traced at the release commit itself.
-    test -f "${APP_DIR}/src/backtest/backtest_engine.py" \
-        || die "Module missing from archive: src/backtest/backtest_engine.py"
-    test -f "${APP_DIR}/src/backtest/backtest_models.py" \
-        || die "Module missing from archive: src/backtest/backtest_models.py"
-    test -f "${APP_DIR}/src/backtest/benchmark.py" \
-        || die "Module missing from archive: src/backtest/benchmark.py"
-    test -f "${APP_DIR}/src/backtest/portfolio_backtest_engine.py" \
-        || die "Module missing from archive: src/backtest/portfolio_backtest_engine.py"
-    test -f "${APP_DIR}/src/backtest/portfolio_backtest_models.py" \
-        || die "Module missing from archive: src/backtest/portfolio_backtest_models.py"
-    test -f "${APP_DIR}/src/backtest/run_backtest.py" \
-        || die "Module missing from archive: src/backtest/run_backtest.py"
-    test -f "${APP_DIR}/src/backtest/run_exit_ablation.py" \
-        || die "Module missing from archive: src/backtest/run_exit_ablation.py"
-    test -f "${APP_DIR}/src/backtest/run_portfolio_backtest.py" \
-        || die "Module missing from archive: src/backtest/run_portfolio_backtest.py"
-    test -f "${APP_DIR}/src/backtest/run_regime_ablation.py" \
-        || die "Module missing from archive: src/backtest/run_regime_ablation.py"
-
-    # src/live/* -- same, transitively traced at the release commit.
-    test -f "${APP_DIR}/src/live/__init__.py" \
-        || die "Module missing from archive: src/live/__init__.py"
-    test -f "${APP_DIR}/src/live/account_state.py" \
-        || die "Module missing from archive: src/live/account_state.py"
-    test -f "${APP_DIR}/src/live/authorized_execution_context.py" \
-        || die "Module missing from archive: src/live/authorized_execution_context.py"
-    test -f "${APP_DIR}/src/live/broker_reconciliation.py" \
-        || die "Module missing from archive: src/live/broker_reconciliation.py"
-    test -f "${APP_DIR}/src/live/crypto_stop_monitor.py" \
-        || die "Module missing from archive: src/live/crypto_stop_monitor.py"
-    test -f "${APP_DIR}/src/live/data_preparer.py" \
-        || die "Module missing from archive: src/live/data_preparer.py"
-    test -f "${APP_DIR}/src/live/live_universe.py" \
-        || die "Module missing from archive: src/live/live_universe.py"
-    test -f "${APP_DIR}/src/live/order_intent.py" \
-        || die "Module missing from archive: src/live/order_intent.py"
-    test -f "${APP_DIR}/src/live/order_submission.py" \
-        || die "Module missing from archive: src/live/order_submission.py"
-    test -f "${APP_DIR}/src/live/position_state.py" \
-        || die "Module missing from archive: src/live/position_state.py"
-    test -f "${APP_DIR}/src/live/session_replay_pass_gate.py" \
-        || die "Module missing from archive: src/live/session_replay_pass_gate.py"
-    test -f "${APP_DIR}/src/live/single_instance_lock.py" \
-        || die "Module missing from archive: src/live/single_instance_lock.py"
-
-    # src/data/*, src/notify/*, src/analysis/* -- outside the literal
-    # src/live/+src/backtest/ scope, but equally real dependencies of
-    # the same 5 entry points (e.g. telegram_notifier is imported by
-    # all 5) -- included for the same reason the ones above are.
-    test -f "${APP_DIR}/src/data/__init__.py" \
-        || die "Module missing from archive: src/data/__init__.py"
-    test -f "${APP_DIR}/src/data/alpaca_market_data.py" \
-        || die "Module missing from archive: src/data/alpaca_market_data.py"
-    test -f "${APP_DIR}/src/data/download_stock.py" \
-        || die "Module missing from archive: src/data/download_stock.py"
-    test -f "${APP_DIR}/src/notify/telegram_notifier.py" \
-        || die "Module missing from archive: src/notify/telegram_notifier.py"
-    test -f "${APP_DIR}/src/analysis/technical_indicators.py" \
-        || die "Module missing from archive: src/analysis/technical_indicators.py"
+    # Required-file checklist, read from the crontab-derived list
+    # transferred and SHA-256-verified above (REMOTE_REQUIRED_FILES_PARTIAL)
+    # -- never a hand-maintained list here. Each line is the exact
+    # `src/*`/`scripts/*` relative path
+    # scripts/derive_required_files_from_crontab.py discovered by
+    # tracing every real crontab entry point's own import chain at this
+    # exact release commit. A blank line (a trailing newline in the
+    # transferred file) is skipped rather than treated as a bogus
+    # zero-length required path.
+    while IFS= read -r REQUIRED_FILE || [ -n "$REQUIRED_FILE" ]; do
+        [ -n "$REQUIRED_FILE" ] || continue
+        test -f "${APP_DIR}/${REQUIRED_FILE}" \
+            || die "Module missing from archive (crontab-derived required-file list): ${REQUIRED_FILE}"
+    done < "$REMOTE_REQUIRED_FILES_PARTIAL"
 
     for RUNTIME_ENTRY in .env .venv .guard logs; do
         if [ -e "${APP_DIR}/${RUNTIME_ENTRY}" ] || [ -L "${APP_DIR}/${RUNTIME_ENTRY}" ]; then
