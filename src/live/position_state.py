@@ -316,11 +316,26 @@ def _atomic_write_text(path: Path, content: str) -> None:
             os.unlink(temp_name)
 
 
+# Owner rw, group r, other none. _atomic_write_text's own tempfile.mkstemp()
+# always produces mode 0600 (owner-only) -- correct/tight for every OTHER
+# caller (order_intent.py's journal, issuer_identity_preflight.py,
+# session_replay_journal.py/pass_gate.py) but wrong for the two files the
+# unprivileged dashboard snapshot producer must read: position_state.json
+# and this guard file (snapshot_builder.build_snapshot reads both via
+# load_position_state(state_path, guard_path)). Set explicitly at each of
+# those two call sites only -- never inside _atomic_write_text itself, so
+# every other caller keeps the tight 0600 default. Mirrors the identical
+# fix already applied to the dashboard's own snapshot output file, see
+# scripts/generate_dashboard_snapshot.py's SNAPSHOT_FILE_MODE.
+DASHBOARD_READABLE_FILE_MODE = 0o640
+
+
 def _write_high_water_mark(value: int, path: Path = HIGH_WATER_MARK_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f"{path.name}.lock"
     with _guard_write_lock(lock_path):
         _atomic_write_text(path, json.dumps({"portfolio_bar_index": int(value)}, indent=2) + "\n")
+        path.chmod(DASHBOARD_READABLE_FILE_MODE)
 
 SCHEMA_VERSION = 2
 DEFAULT_STATE_PATH = Path("data/live/position_state.json")
@@ -608,6 +623,7 @@ def save_position_state(
         },
     }
     _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    path.chmod(DASHBOARD_READABLE_FILE_MODE)
 
     # Advance the rollback guard on every successful save -- never move it
     # backward, even if this run's own bar_index is (legitimately) unchanged
