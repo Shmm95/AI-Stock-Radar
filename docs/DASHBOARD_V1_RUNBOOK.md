@@ -66,6 +66,67 @@ producer's own systemd unit no longer grants `ReadWritePaths` for
 them either, independent-audit finding, 2026-08-26 — only the
 snapshot output directory above is writable).
 
+### Group-based access to `/root/AI-Stock-Radar` (not ACLs)
+
+2026-08-29 incident: this host's root filesystem is ext4 mounted
+*without* the `acl` mount option. `setfacl` still "succeeds" and
+`getfacl` still shows the grant, but the kernel never consults ACL
+xattrs for permission checks on this mount at all — every ACL grant
+tried was silently inert. Do not use ACLs on this host for this
+purpose; use a dedicated Unix group instead (works on any POSIX
+filesystem, mount options irrelevant):
+
+```bash
+sudo groupadd ai-stock-radar-readers
+sudo usermod -aG ai-stock-radar-readers ai-dashboard-producer
+sudo usermod -aG ai-stock-radar-readers ai-dashboard
+
+# Traverse-only on the app directory itself -- group still cannot list
+# or read its contents, only cd/open into paths it already knows,
+# which is what lets the producer's own code/venv under here run at
+# all. Deliberately NOT applied to /root itself -- tried once during
+# this incident and reverted, turned out not to be needed (see the
+# ProtectHome note below).
+sudo chgrp ai-stock-radar-readers /root/AI-Stock-Radar
+sudo chmod g+rx /root/AI-Stock-Radar
+
+# setgid on both directories the producer reads from: every NEW file
+# root creates inside them (position_state.json, high_water_mark.json,
+# order_intents/*.json) automatically inherits group
+# ai-stock-radar-readers, regardless of the creating process's own
+# primary group -- the same pattern already used above for
+# /var/lib/ai-stock-radar-dashboard, applied here to the two source
+# directories instead of the snapshot output directory.
+sudo chgrp ai-stock-radar-readers /root/AI-Stock-Radar/data/live
+sudo chmod g+rxs /root/AI-Stock-Radar/data/live
+sudo chgrp ai-stock-radar-readers /root/.ai_stock_radar_guard
+sudo chmod g+rxs /root/.ai_stock_radar_guard
+```
+
+setgid on the directory only fixes the *group ownership* of files
+created after it's set — it does not retroactively fix existing files
+or grant group-*read* on the file's own mode bits. `position_state.json`
+and `high_water_mark.json` get their group-read bit (`0640`) from
+`src/live/position_state.py`'s own `DASHBOARD_READABLE_FILE_MODE`,
+applied explicitly after every write; `order_intents/*.json`
+deliberately keeps the tight `0600` default and is never readable by
+either dashboard user — it is never read by the dashboard.
+
+### Known-bad configuration — do not add `ProtectHome=tmpfs` + `BindReadOnlyPaths`
+
+Also tried and reverted during the 2026-08-29 incident, on both
+systemd units. The exact interaction is not fully understood (likely a
+kernel/systemd version-specific behavior on this host), but empirically
+it blocked `WorkingDirectory=/root/AI-Stock-Radar`'s own `chdir()` at
+service start with "Changing to the requested working directory
+failed: Permission denied" — the same error the group-permission gap
+above also produces, which made the two issues easy to conflate while
+debugging. The shipped units' `ProtectHome=read-only` (see the comments
+in `deploy/systemd/ai-stock-radar-dashboard.service` and
+`ai-stock-radar-dashboard-snapshot.service`) is the known-good setting;
+do not "upgrade" it to `tmpfs` + a `BindReadOnlyPaths` re-mount as a
+troubleshooting step on this host.
+
 ## Install
 
 ```bash
