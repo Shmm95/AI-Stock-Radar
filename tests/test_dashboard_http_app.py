@@ -8,6 +8,7 @@ snapshot is too old.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,8 +39,36 @@ def test_index_serves_html_with_inlined_css_and_js(client):
     assert response.headers["content-type"].startswith("text/html")
     assert "__DASHBOARD_CSS__" not in response.text
     assert "__DASHBOARD_JS__" not in response.text
-    assert "<style>" in response.text and "</style>" in response.text
-    assert "<script>" in response.text and "</script>" in response.text
+    assert "__DASHBOARD_NONCE__" not in response.text
+    assert "<style nonce=" in response.text and "</style>" in response.text
+    assert "<script nonce=" in response.text and "</script>" in response.text
+
+
+def test_index_inline_tags_carry_a_nonce_matching_the_csp_header(client):
+    """2026-08-30 incident: index.html's <style>/<script> were plain
+    inline tags with no nonce and no style-src/script-src CSP override
+    -- the browser's own default-src 'self' fallback (correctly, no
+    'unsafe-inline' anywhere) refused to run either one, so the page
+    never rendered past "Loading...". This is the fix's own contract:
+    the CSP header's nonce and the two tags' nonce attribute must be
+    the SAME value, and must change on every request (never a fixed,
+    guessable value -- that would defeat the point of a nonce)."""
+    test_client, snapshot_path = client
+    first = test_client.get("/")
+    second = test_client.get("/")
+    for response in (first, second):
+        csp = response.headers["content-security-policy"]
+        assert "'unsafe-inline'" not in csp
+        assert "default-src 'self'" in csp
+        match = re.search(r"style-src 'self' 'nonce-([^']+)'", csp)
+        assert match, csp
+        nonce = match.group(1)
+        assert f'<style nonce="{nonce}">' in response.text
+        assert f'<script nonce="{nonce}">' in response.text
+        assert f"'nonce-{nonce}'" in csp.split("script-src")[1]
+    assert re.search(r"nonce-([^']+)", first.headers["content-security-policy"]).group(1) != re.search(
+        r"nonce-([^']+)", second.headers["content-security-policy"]
+    ).group(1)
 
 
 def test_healthz_returns_ok_without_reading_the_snapshot(client):

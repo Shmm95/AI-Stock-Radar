@@ -17,7 +17,12 @@ wrote, never calls into the builder or the broker directly.
 ROUTES -- exactly three, GET (+ the implicit HEAD Starlette derives
 from each GET handler), nothing else:
     GET /                 -- the single-page frontend (index.html with
-                             its CSS/JS inlined at request time)
+                             its CSS/JS inlined at request time, each
+                             wrapped with a fresh per-request CSP nonce
+                             -- see index()'s own comment for why: kept
+                             CSS/JS as literal inline content rather
+                             than adding /static/* routes, which would
+                             break the "exactly three routes" contract)
     GET /api/v1/snapshot  -- the current snapshot JSON, or 503 if it is
                              missing/corrupt/unreadable
     GET /healthz          -- a trivial liveness probe, no snapshot read
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -44,6 +50,10 @@ _STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
+    # index() overrides this value with a per-request nonce'd style-src/
+    # script-src -- this base CSP (no inline anything) is what /healthz
+    # and /api/v1/snapshot actually get, and what / gets before index()'s
+    # override; kept here rather than duplicated so both stay in sync.
     "Content-Security-Policy": "default-src 'self'; connect-src 'self'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -64,17 +74,32 @@ def _with_security_headers(response: Response) -> Response:
     return response
 
 
-def _render_index_html() -> str:
+def _render_index_html(nonce: str) -> str:
     html = (_STATIC_DIRECTORY / "index.html").read_text(encoding="utf-8")
     css = (_STATIC_DIRECTORY / "dashboard.css").read_text(encoding="utf-8")
     js = (_STATIC_DIRECTORY / "dashboard.js").read_text(encoding="utf-8")
     html = html.replace("/*__DASHBOARD_CSS__*/", css)
     html = html.replace("/*__DASHBOARD_JS__*/", js)
+    html = html.replace("__DASHBOARD_NONCE__", nonce)
     return html
 
 
 async def index(request: Request) -> Response:
-    return _with_security_headers(HTMLResponse(_render_index_html()))
+    # A fresh nonce per request (never 'unsafe-inline') is what lets the
+    # inlined <style>/<script> tags run under a CSP that still has no
+    # style-src/script-src wildcard -- browsers only execute inline
+    # content whose tag-attribute nonce matches the header's nonce for
+    # THIS specific response. index.html's two tags carry the same
+    # placeholder, substituted here, never a fixed/predictable value.
+    nonce = secrets.token_urlsafe(18)
+    response = _with_security_headers(HTMLResponse(_render_index_html(nonce)))
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        f"style-src 'self' 'nonce-{nonce}'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "connect-src 'self'; frame-ancestors 'none'"
+    )
+    return response
 
 
 async def healthz(request: Request) -> Response:
