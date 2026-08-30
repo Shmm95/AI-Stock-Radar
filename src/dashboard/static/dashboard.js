@@ -216,6 +216,69 @@
     }
   }
 
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgEl(tag, attrs) {
+    var node = document.createElementNS(SVG_NS, tag);
+    for (var key in attrs) {
+      if (Object.prototype.hasOwnProperty.call(attrs, key)) {
+        node.setAttribute(key, attrs[key]);
+      }
+    }
+    return node;
+  }
+
+  // Read-only, inline-SVG-only line chart -- no chart library, nothing
+  // loaded from a CDN (the page's own CSP has no script-src/style-src
+  // allowance for one anyway). Fed only by /api/v1/snapshot's own
+  // `equity_curve` field -- see http_app.py's `_read_equity_curve` for
+  // where that comes from and why a missing/corrupt source file never
+  // reaches this function as anything but `null`.
+  function renderEquityCurve(equityCurve) {
+    var card = el("equity-curve-card");
+    var container = el("equity-curve-chart");
+    if (!equityCurve || !equityCurve.points || equityCurve.points.length < 2) {
+      card.hidden = true;
+      return;
+    }
+    card.hidden = false;
+    container.innerHTML = "";
+
+    var points = equityCurve.points;
+    var values = points.map(function (p) { return Number(p.equity_usd); });
+    var minValue = Math.min.apply(null, values);
+    var maxValue = Math.max.apply(null, values);
+    var range = maxValue - minValue || 1;
+
+    var width = 600, height = 140, padX = 8, padY = 10;
+    var innerWidth = width - padX * 2, innerHeight = height - padY * 2;
+
+    var coords = points.map(function (p, i) {
+      var x = padX + (points.length === 1 ? 0 : (i / (points.length - 1)) * innerWidth);
+      var y = padY + innerHeight - ((Number(p.equity_usd) - minValue) / range) * innerHeight;
+      return x.toFixed(1) + "," + y.toFixed(1);
+    });
+
+    var svg = svgEl("svg", {
+      viewBox: "0 0 " + width + " " + height,
+      class: "equity-curve-svg",
+      role: "img",
+      "aria-label": "Portfolio equity curve, " + points[0].date + " to " + points[points.length - 1].date,
+    });
+    svg.appendChild(svgEl("polyline", { class: "line", points: coords.join(" ") }));
+    container.appendChild(svg);
+
+    var meta = document.createElement("div");
+    meta.className = "equity-curve-meta";
+    var startEl = document.createElement("span");
+    startEl.textContent = points[0].date + "  " + fmtUsd(points[0].equity_usd);
+    var endEl = document.createElement("span");
+    endEl.textContent = points[points.length - 1].date + "  " + fmtUsd(points[points.length - 1].equity_usd);
+    meta.appendChild(startEl);
+    meta.appendChild(endEl);
+    container.appendChild(meta);
+  }
+
   function renderErrors(errors) {
     var card = el("errors-card");
     var list = el("errors-list");
@@ -263,6 +326,7 @@
     renderStaleness(snapshot);
     renderAccount(snapshot.account);
     renderPnl(snapshot.pnl);
+    renderEquityCurve(snapshot.equity_curve);
     renderPositions(snapshot.positions);
     renderSystem(snapshot.system);
     renderTrades(snapshot.recent_trades);

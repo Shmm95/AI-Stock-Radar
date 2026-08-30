@@ -24,7 +24,11 @@ from each GET handler), nothing else:
                              than adding /static/* routes, which would
                              break the "exactly three routes" contract)
     GET /api/v1/snapshot  -- the current snapshot JSON, or 503 if it is
-                             missing/corrupt/unreadable
+                             missing/corrupt/unreadable. Also merges in
+                             an `equity_curve` field read from a SECOND,
+                             independently-produced file (see
+                             `_TIMESERIES_PATH`'s own comment) -- still
+                             exactly one route, no new import.
     GET /healthz          -- a trivial liveness probe, no snapshot read
 Any other method on these paths, or any other path at all, is a 404/405
 -- no other route is ever registered.
@@ -37,6 +41,7 @@ import os
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -44,6 +49,22 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 DEFAULT_SNAPSHOT_PATH = Path("/var/lib/ai-stock-radar-dashboard/dashboard_snapshot_v1.json")
+# Owner request, 2026-08-30: a minimal equity-curve widget, fed from
+# Dashboard V2 Phase 1's OWN public, already-sanitized export -- never
+# from the private SQLite store (`/var/lib/ai-stock-radar-dashboard/
+# private/`, mode 0700, `ai-dashboard-producer`-only -- this process,
+# `ai-dashboard`, has no access to it and must never gain one). This
+# file lives in the SAME already-`ai-dashboard`-readable directory as
+# the V1 snapshot, written by a separate producer
+# (`scripts/collect_dashboard_history.py`), and is read here as PLAIN
+# JSON -- no import of any `src.dashboard.history_*` module, matching
+# this module's own existing rule of never importing the producer's
+# own code, only ever reading a file a trusted producer already wrote.
+# Missing/corrupt is never a 503 for the whole route -- Phase 1's own
+# collector may not have run yet, or may be mid-backfill; the primary
+# V1 snapshot data must never be held hostage by this optional,
+# additive section.
+DEFAULT_TIMESERIES_PATH = Path("/var/lib/ai-stock-radar-dashboard/dashboard_timeseries_v2.json")
 STALE_AFTER_MINUTES = 10.0
 
 _STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
@@ -66,6 +87,37 @@ def _snapshot_path() -> Path:
     only test-injection seam this module has; production never sets
     it, so production always reads the real, fixed path."""
     return Path(os.environ.get("DASHBOARD_SNAPSHOT_PATH", str(DEFAULT_SNAPSHOT_PATH)))
+
+
+def _timeseries_path() -> Path:
+    """Same env-var-override-for-tests pattern as `_snapshot_path`."""
+    return Path(os.environ.get("DASHBOARD_TIMESERIES_PATH", str(DEFAULT_TIMESERIES_PATH)))
+
+
+def _read_equity_curve() -> dict[str, Any] | None:
+    """`None` on ANY problem (file missing, unreadable, corrupt JSON,
+    unexpected shape) -- this section is optional and additive; a
+    problem here must never affect the primary snapshot response.
+    Deliberately extracts only `valuation_date`/`equity_usd` per point
+    -- the widget only ever draws a line, so nothing else from the
+    (already public and sanitized) v2 export needs to cross into this
+    payload."""
+    try:
+        payload = json.loads(_timeseries_path().read_text(encoding="utf-8"))
+        points = [
+            {"date": point["valuation_date"], "equity_usd": point["equity_usd"]}
+            for point in payload.get("portfolio_series", [])
+            if isinstance(point, dict) and "valuation_date" in point and "equity_usd" in point
+        ]
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    if not points:
+        return None
+    return {
+        "generated_at_utc": payload.get("generated_at_utc"),
+        "collection_status": payload.get("collection_status"),
+        "points": points,
+    }
 
 
 def _with_security_headers(response: Response) -> Response:
@@ -130,6 +182,7 @@ async def snapshot(request: Request) -> Response:
 
     body = dict(payload)
     body["_dashboard_stale"] = is_stale
+    body["equity_curve"] = _read_equity_curve()
     return _with_security_headers(JSONResponse(body, status_code=200))
 
 

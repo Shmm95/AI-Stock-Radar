@@ -144,6 +144,35 @@ main {
   padding: 0.2rem 0;
 }
 
+.equity-curve-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.equity-curve-svg .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.equity-curve-svg .axis-label {
+  fill: var(--muted);
+  font-size: 9px;
+}
+
+.equity-curve-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.4rem;
+}
+
+.dashboard-signature { font-size: 0.7rem; font-style: italic; opacity: 0.55; text-align: right; padding: 4px 12px; }
+
 @media (min-width: 700px) {
   body { font-size: 16px; }
 }
